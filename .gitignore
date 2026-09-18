@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────
+# 本仓库只收录「自己写的代码 + 文档」。
+# 第三方大文件、生成物、运行日志都不入库（见根 README「外部依赖」）。
+# ─────────────────────────────────────────────────────────────
+
+# ① 第三方资源：体积大 / 各自有独立仓库，需要时自行下载
+Datasets/
+Synria-Robot-Descriptions-main/
+example-robot-data-master/
+kinova_description/
+bin/
+include/
+lib/
+simulate/
+model/
+sample/
+alicia_teleop/_official_reference/
+
+# ② MuJoCo 发行包自带的文件（不随本仓库分发；
+#    若你想给本仓库加一个自己的许可证，删掉下面两行再放 LICENSE 即可）
+LICENSE
+THIRD_PARTY_NOTICES.txt
+
+# ③ 生成物 / 缓存（都能由脚本重新生成）
+alicia_libero/mesh_cache/
+alicia_libero/scenes/
+alicia_libero/preview/
+__pycache__/
+*.py[cod]
+
+# ④ 运行日志 / 临时文件
+logs/
+MUJOCO_LOG.TXT
+*.log
+_tmp_*.py
+_*.txt
+_app_out.txt
+_app_err.txt
+
+# ⑤ 编辑器与本机配置
+.vscode/
