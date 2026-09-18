@@ -70,8 +70,8 @@ class SimSession:
                  spawn_seed: int | None = None) -> None:
         """``render=False`` 时不建 MuJoCo 离屏渲染器（无头批量试验用，快很多）。
 
-        ``spawn_seed``：带 ``spawn_region`` 的任务（当前是 t1）随机安放抓取物用的种子；
-        给同一个种子就复现同一串随机位置（基准脚本用它保证可复现），``None`` = 真随机。
+        ``spawn_seed``：带 ``spawn_region`` 的任务（当前是 t1）随机安放**抓取物和目标物**
+        用的种子；给同一个种子就复现同一串随机位置（基准脚本用它保证可复现），``None`` = 真随机。
         """
         self.task = task
         self.catalog = catalog

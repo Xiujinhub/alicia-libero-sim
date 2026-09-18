@@ -15,6 +15,9 @@
 ``success = {"xy": [x, y], "xy_tol": r, "z_ref": "table"|"target_top", "z_band": [lo, hi]}``
 
 * ``xy``/``xy_tol``：目标区域中心 + 抓取物 AABB 中心的水平容差（米）
+* ``xy_ref``      ：可选。``"target"`` = 目标物**也被随机安放**（t1 的篮子）→
+  目标 xy 取目标物**当前实际中心**（``xy`` 只当标称值/回退用），
+  否则一律用写死的 ``xy``
 * ``z_ref``        ：高度基准 = 桌面 或 目标物顶面
 * ``z_band``       ：抓取物**底面**相对基准的高度区间，用来区分"放好了"与"还举在半空"
 
@@ -47,15 +50,25 @@ TASKS: list[dict] = [
             # 篮子单独配重：素材默认 density=100（泡沫级，仅 136g），机械臂经过时会被撞走
             {"key": "stable_scanned_objects/basket", "xy": [0.22, 0.10], "yaw": 0.0, "density": 1500},
         ],
-        # 任务多样化：抓取物每次随机安放（立着、朝向不变），只在机械臂工作范围内的小矩形里抽。
-        # 这是**运行时**行为（SimSession 抽完后写进物体的自由关节）；场景 XML 里仍写上面那个标称位置，
-        # 以便 build_all_scenes / render_preview 产出的图固定可比。区域怎么定的见 README §8.9。
-        # 上沿取到 -0.10（而不是 -0.06）：网格实测 (0.00,-0.06) 这个"离底座只有 277mm"的角点
+        # 任务多样化：抓取物**和篮子**每次随机安放（都立着、朝向不变），只在机械臂工作范围内的小
+        # 矩形里抽。这是**运行时**行为（SimSession 抽完后写进物体的自由关节）；场景 XML 里仍写上面
+        # 那两个标称位置，以便 build_all_scenes / render_preview 产出的图固定可比。
+        # 区域怎么定的见 README §8.9。
+        # 抓取物上沿取到 -0.10（而不是 -0.06）：网格实测 (0.00,-0.06) 这个"离底座只有 277mm"的角点
         # 会让手指把瓶子碰倒（实时宽度 37→122mm、连续 4 档都夹空），其余 19 个格点全过。
-        "spawn_region": {"ketchup": {"x": [0.00, 0.18], "y": [-0.24, -0.10]}},
+        # 篮子区域：离底座 0.42~0.58m（`set_ee_target` 的舒适半径 0.62m 之内），且与抓取物区域
+        # 保持"两个外接圆 + 25mm 间隙"的余量（33.6 + 115.6 + 25 ≈ 174mm）；4×4 网格 + 角点组合
+        # 实测全过（判分水平偏差最大 37mm / 容差 55mm）。
+        "spawn_region": {
+            "ketchup": {"x": [0.00, 0.18], "y": [-0.24, -0.10]},
+            "basket": {"x": [0.14, 0.28], "y": [0.02, 0.20]},
+        },
         "grasp_object": "ketchup",
         "target_object": "basket",
-        "success": {"xy": [0.22, 0.10], "xy_tol": 0.055, "z_ref": "table", "z_band": [0.0, 0.06]},
+        # ``xy_ref="target"``：目标篮子是随机安放的 → 判分的目标 xy 取**篮子当前实际中心**
+        # （而不是写死的 0.22/0.10），跟 place_object"对准目标当前位置"保持一致。
+        "success": {"xy": [0.22, 0.10], "xy_ref": "target", "xy_tol": 0.055,
+                    "z_ref": "table", "z_band": [0.0, 0.06]},
     },
     {
         "id": "t2_butter_onto_plate",
@@ -222,7 +235,7 @@ def footprint_radius(key: str, yaw_deg: float, catalog: dict) -> float:
 
 
 def sample_spawn(task: dict, rng=None, catalog: dict | None = None) -> dict:
-    """按 ``task["spawn_region"]`` 随机抽抓取物的初始 XY，返回 ``{物体名: (x, y)}``。
+    """按 ``task["spawn_region"]`` 随机抽物体的初始 XY，返回 ``{物体名: (x, y)}``。
 
     只改 XY：物体在 XML 里的 **z 与朝向不动**（所以瓶子还是立着的、还是那个偏航角，
     夹爪的闭合方向不受影响）。抽到的位置要同时满足
@@ -230,6 +243,10 @@ def sample_spawn(task: dict, rng=None, catalog: dict | None = None) -> dict:
     1. 落在任务里写的小矩形内（该矩形是按"抓取成功率"实测选出来的，见 README §8.9）；
     2. 与**其它物体占地**（外接圆 + ``SPAWN_CLEARANCE``）不重叠；
     3. 距桌沿留 ``SPAWN_TABLE_MARGIN``（区域被桌沿裁掉时自动收紧）。
+
+    ``spawn_region`` 里有多个物体时（t1：番茄酱 + 篮子）**按书写顺序依次抽**，
+    后面的物体避让前面**已经抽到的实际位置**（而不是标称位置）—— 否则两个随机物
+    会按标称位置算避让、实际却可能叠在一起。
 
     拒绝采样最多 ``SPAWN_TRIES`` 次；实在抽不到就退回任务里写死的 ``xy``（不会抛异常）。
     没有 ``spawn_region`` 的任务直接返回空字典 —— 完全不影响其它任务。
@@ -246,13 +263,14 @@ def sample_spawn(task: dict, rng=None, catalog: dict | None = None) -> dict:
         key, yaw = item["key"], float(item.get("yaw", 0.0))
         nominal = np.asarray(item.get("xy", (0.2, 0.0)), dtype=float)
         r_self = footprint_radius(key, yaw, catalog)
-        # 其它物体按任务里写死的位置算占地（random 的只有 region 里列出的那些）
+        # 其它物体：若它也在 region 里且已经抽过 → 用抽到的实际位置；否则用任务里写死的位置
         blocked = []
         for other_name, other in items.items():
             if other_name == name:
                 continue
             r_other = footprint_radius(other["key"], float(other.get("yaw", 0.0)), catalog)
-            blocked.append((np.asarray(other.get("xy", (0.2, 0.0)), dtype=float), r_other))
+            other_xy = out.get(other_name, other.get("xy", (0.2, 0.0)))
+            blocked.append((np.asarray(other_xy, dtype=float), r_other))
         lo = np.maximum(np.array([box["x"][0], box["y"][0]], dtype=float),
                         -TABLE_HALF + SPAWN_TABLE_MARGIN)
         hi = np.minimum(np.array([box["x"][1], box["y"][1]], dtype=float),
@@ -289,11 +307,15 @@ def build_task_scene(task: dict, builder: SceneBuilder | None = None, catalog: d
     """
     catalog = catalog or load_catalog()
     builder = builder or SceneBuilder(catalog=catalog)
+    # 目标物**也被随机安放**的任务（``xy_ref="target"``，如 t1 的篮子）不画固定圆盘：
+    # 那个圈只会停在 XML 里的标称位置，跟实际随机的目标对不上，反而误导操作者
+    # （篮子本身就是最好的目标标记）。其它任务的场景与图片完全不变。
+    show_region = task["kind"] in ("region", "stack", "into") and (
+        task["success"].get("xy_ref") != "target")
     layout = {
         "name": task["id"],
         "objects": task["objects"],
-        "extra_geoms": ([target_region_geom(task["success"])]
-                        if task["kind"] in ("region", "stack", "into") else []),
+        "extra_geoms": [target_region_geom(task["success"])] if show_region else [],
     }
     return builder.build(layout), builder
 
@@ -320,7 +342,14 @@ def check_success(task: dict, model, data, catalog: dict | None = None) -> tuple
     spec = task["success"]
     lo, hi = object_world_aabb(model, data, catalog, task["grasp_object"])
     center_xy = (lo + hi)[:2] / 2.0
-    error_xy = float(np.linalg.norm(center_xy - np.asarray(spec["xy"], dtype=float)))
+    # 目标 xy：默认用任务里写死的；``xy_ref="target"``（目标物也被随机安放，如 t1 的篮子）
+    # 改用**目标物当前实际中心** —— 与 place_object 的"对准目标当前位置"保持一致。
+    target_xy = np.asarray(spec["xy"], dtype=float)
+    live_target = spec.get("xy_ref") == "target" and task.get("target_object")
+    if live_target:
+        tlo, thi = object_world_aabb(model, data, catalog, task["target_object"])
+        target_xy = (tlo + thi)[:2] / 2.0
+    error_xy = float(np.linalg.norm(center_xy - target_xy))
 
     if spec["z_ref"] == "target_top":
         target = catalog_object(catalog, task["target_object"])
@@ -335,4 +364,6 @@ def check_success(task: dict, model, data, catalog: dict | None = None) -> tuple
     message = (f"水平偏差 {error_xy * 1000:.0f}mm / 允许 {spec['xy_tol'] * 1000:.0f}mm；"
                f"底面相对基准 {bottom * 1000:+.0f}mm / 要求 "
                f"[{spec['z_band'][0] * 1000:+.0f}, {spec['z_band'][1] * 1000:+.0f}]mm")
+    if live_target:
+        message += f"（目标={task['target_object']}当前位置）"
     return bool(ok_xy and ok_z), message

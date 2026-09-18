@@ -20,6 +20,7 @@ def _hook(exc_type, exc, tb):
 sys.excepthook = _hook
 
 import alicia_libero_app as app_mod  # noqa: E402
+import libero_tasks as tasks_mod  # noqa: E402  （算"随机安放的占地间隙"用）
 
 results = []
 
@@ -156,15 +157,21 @@ def main() -> int:
               f"status={window.auto.status}")
         window.auto.stop()
 
-    # 10) t1 抓取物随机安放（任务多样化：每次复位换一局新摆位）
+    # 10) t1 抓取物 + 篮子随机安放（任务多样化：每次复位换一局新摆位）
     def s10():
         window.task_combo.setCurrentIndex(0)          # 回到 t1
-        region = window.session.task.get("spawn_region", {}).get("ketchup")
+        regions = window.session.task.get("spawn_region", {})
+        region = regions.get("ketchup")
         check("t1 抓取物带随机安放区域", region is not None,
               f"x={region['x']} y={region['y']}" if region else "没有 spawn_region")
+        check("t1 篮子也带随机安放区域（目标物随机）",
+              regions.get("basket") is not None,
+              f"x={regions['basket']['x']} y={regions['basket']['y']}"
+              if regions.get("basket") else "篮子没有 spawn_region")
         if region is None:
             return
         seen, bad = set(), []
+        seen_basket = set()
         for _ in range(4):
             window.callback_reset()                   # 复位 = 换一局新摆位
             sess = window.session
@@ -179,10 +186,34 @@ def main() -> int:
                 bad.append(f"物体没落到抽到的位置（qpos x={q[0]:.4f}，应为 {x + off[0]:.4f}）")
             if abs(q[2] - q0[2]) > 1e-9 or not np.allclose(q[3:7], q0[3:7], atol=1e-9):
                 bad.append("z 或姿态被改了（瓶子不再立着）")
+            # 篮子：同样要落进它自己的区域、真写进仿真、不歪；并与抓取物保持占地间隙
+            box = regions.get("basket")
+            if box is None:
+                continue
+            bx, by = sess.spawn["basket"]
+            seen_basket.add((round(bx, 4), round(by, 4)))
+            if not (box["x"][0] <= bx <= box["x"][1] and box["y"][0] <= by <= box["y"][1]):
+                bad.append(f"篮子 ({bx:.3f},{by:.3f}) 抽到了区域外")
+            badr = sess.model.jnt_qposadr[sess.model.joint("basket_joint").id]
+            boff = sess.spawn_offset["basket"]
+            bq, bq0 = sess.data.qpos[badr:badr + 7], sess.model.qpos0[badr:badr + 7]
+            if abs(bq[0] - boff[0] - bx) > 1e-6 or abs(bq[1] - boff[1] - by) > 1e-6:
+                bad.append("篮子没落到抽到的位置")
+            if abs(bq[2] - bq0[2]) > 1e-9 or not np.allclose(bq[3:7], bq0[3:7], atol=1e-9):
+                bad.append("篮子的 z 或姿态被改了")
+            need = (tasks_mod.footprint_radius("ketchup", 0.0, sess.catalog)
+                    + tasks_mod.footprint_radius("basket", 0.0, sess.catalog)
+                    + tasks_mod.SPAWN_CLEARANCE)
+            gap = float(np.hypot(bx - x, by - y))
+            if gap < need - 1e-9:
+                bad.append(f"抓取物与篮子间距 {gap * 1000:.0f}mm < 需要的 {need * 1000:.0f}mm")
         check("复位会重新随机摆位（多次复位位置不同）", len(seen) >= 3,
               f"{len(seen)} 种：" + " ".join(f"({px * 1000:+.0f},{py * 1000:+.0f})"
                                             for px, py in sorted(seen)))
-        check("随机摆位在区域内 / 真写进仿真 / 瓶子仍立着", not bad,
+        check("篮子复位也会重新随机摆位", len(seen_basket) >= 3,
+              f"{len(seen_basket)} 种：" + " ".join(f"({px * 1000:+.0f},{py * 1000:+.0f})"
+                                                   for px, py in sorted(seen_basket)))
+        check("随机摆位都在区域内 / 真写进仿真 / 姿态不变 / 两者不重叠", not bad,
               "；".join(bad) if bad else "4 局都合规")
 
     # 11) 让主循环再跑一会，统计 FPS 并报告
