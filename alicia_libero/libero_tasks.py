@@ -134,7 +134,9 @@ TASKS: list[dict] = [
         "kind": "stack",
         "difficulty": "★★★",
         "task_text": "把巧克力布丁盒稳稳叠到番茄酱罐的顶面上。",
-        "hint": "罐顶面 62×76mm、离桌面 62mm——先把布丁盒对准罐口再轻轻落下。",
+        "hint": "罐顶面 62×62mm、离桌面 76mm（比布丁盒 27.4×46.3×80.2mm 还矮）——关键是"
+                "**夹住布丁的 27mm 薄边**：实测闭合轴一旦偏掉就会夹到对角线，布丁会在爪子里转、"
+                "抬起来就歪；夹正之后再对准罐口轻轻落下。",
         "objects": [
             {"key": "stable_hope_objects/chocolate_pudding", "xy": [0.03, -0.13], "yaw": 0.0},
             {"key": "stable_hope_objects/tomato_sauce", "xy": [0.21, 0.08], "yaw": 0.0},
