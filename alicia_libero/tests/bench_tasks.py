@@ -51,18 +51,25 @@ def jitter_scene(sess: SimSession, rng: np.random.Generator, amp: float) -> None
 
 
 def run_once(task: dict, catalog: dict, rng, jitter: float, verbose: bool = False):
-    """跑一轮，返回 (是否完成, 帧数, 每步明细, 失败原因)。"""
+    """跑一轮，返回 (是否完成, 总帧数, 任务本体帧数, 耗时, 失败原因)。
+
+    "任务本体帧数" = 进入**回程**之前的帧数（判分已完成）——技能库在判分后会追加
+    ``回程``（``skills.return_home``），把它和任务本体分开统计，各关耗时才能继续横向对比。
+    """
     sess = SimSession(task, catalog, render=False)
     sess.reset()
     jitter_scene(sess, rng, jitter)
     runner = skills.SkillRunner(sess)
     runner.start()
     frames = 0
+    task_frames = None
     t0 = time.perf_counter()
     while runner.active and frames < MAX_FRAMES:
         runner.step()
         sess.step(8)
         frames += 1
+        if task_frames is None and runner.status.startswith("回程"):
+            task_frames = frames - 1
     wall = time.perf_counter() - t0
     ok, msg = check_success(task, sess.model, sess.data, sess.catalog)
     detail = runner.summary()
@@ -70,7 +77,7 @@ def run_once(task: dict, catalog: dict, rng, jitter: float, verbose: bool = Fals
         print(detail)
     sess.renderer = None
     reason = "" if ok else (runner.error or msg)
-    return ok, frames, wall, reason
+    return ok, frames, (frames if task_frames is None else task_frames), wall, reason
 
 
 def main(argv: list[str]) -> int:
@@ -93,18 +100,20 @@ def main(argv: list[str]) -> int:
         rng = np.random.default_rng(20260918 + idx)
         results = []
         for run in range(repeats):
-            ok, frames, wall, reason = run_once(task, catalog, rng, jitter, verbose)
-            results.append((ok, frames, wall, reason))
+            ok, frames, task_frames, wall, reason = run_once(task, catalog, rng, jitter, verbose)
+            results.append((ok, frames, task_frames, wall, reason))
             mark = "✅" if ok else "❌"
             print(f"  {mark} {task['id']} 第 {run + 1}/{repeats} 次："
-                  f"{frames} 帧 / {wall:.1f}s" + (f"  ← {reason}" if reason else ""))
+                  f"{task_frames} 帧 + 回程 {frames - task_frames} 帧 / {wall:.1f}s"
+                  + (f"  ← {reason}" if reason else ""))
             if verbose:
                 print()
         ok_n = sum(1 for r in results if r[0])
         total_ok += ok_n
         total_run += repeats
         print(f"→ {task['id']}（{task['kind']}，难度 {task['difficulty']}）"
-              f" 成功率 {ok_n}/{repeats}，平均 {np.mean([r[1] for r in results]):.0f} 帧"
+              f" 成功率 {ok_n}/{repeats}，平均 {np.mean([r[2] for r in results]):.0f} 帧"
+              f"（+ 回程 {np.mean([r[1] - r[2] for r in results]):.0f} 帧）"
               f"（抖动 ±{jitter * 1000:.0f}mm）\n")
     print(f"===== 合计 {total_ok}/{total_run} =====")
     if strict and total_ok != total_run:

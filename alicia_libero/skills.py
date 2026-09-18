@@ -98,6 +98,16 @@ PUSH_TARGET_SHIFT_TOL = 0.012
 """推滑过程中目标物体被推走的允许上限（12mm）；超了直接报失败，
 免得"书到了判据点、盘子却被顶跑了"这种情况被当成通过。"""
 
+HOME_LIFT_EXTRA = 0.060
+"""回程第一步"原地抬到安全高度"的余量：抬到**当前场景所有物体的最高点**之上 60mm。
+
+与开局 ``抬臂准备`` 用同一个判据（那里的 0.06 是排除被抓物来算的，这里算上全部物体）。"""
+HOME_TOL = 0.026
+"""回程到位的允许误差（26mm）。实测 9 关回零位后 TCP 离零位点只有 **1~2mm**
+（低位姿态的位置伺服静态误差），判定放到 26mm 是给不同任务/抖动留余量。"""
+HOME_SETTLE = 24
+"""回程最后静置帧数：让位置伺服把静态误差收干净（不再发新目标）。"""
+
 
 
 class SkillError(RuntimeError):
@@ -110,6 +120,15 @@ class Step:
     label: str
     ok: bool
     detail: str = ""
+
+
+JUDGE_LABEL = "判分"
+"""判定任务成败的那一步的 ``label``。``回程`` 是判分之后追加的收尾动作，不参与成败。"""
+
+
+def task_ok(steps: list[Step]) -> bool:
+    """任务是否通过：只看**判分**那一步（回程成不成不影响"这关过没过"）。"""
+    return any(s.label == JUDGE_LABEL and s.ok for s in steps)
 
 
 # ────────────────────────────── 感知：一切判据的来源 ──────────────────────────────
@@ -176,11 +195,13 @@ def gap_along(sess, name_a: str, name_b: str, direction) -> float:
     return float(np.linalg.norm(center_b[:2] - center_a[:2]) - lead_a - lead_b)
 
 
-def scene_rim_z(sess, exclude: str) -> float:
-    """**现场实测**：除被抓物以外，其它物体（含容器沿）的最高点。
+def scene_rim_z(sess, exclude: str | None = None) -> float:
+    """**现场实测**：其它物体（含容器沿）的最高点。
 
     这是修掉旧版 t9 事故的关键——搬运高度由"当前场景里所有东西的最高点"决定，
     所以"从托盘里取物"会自动把出发托盘的沿算进去，不需要任务里再写"源容器"字段。
+
+    ``exclude=None``（回程用）= 连被抓物一起算，取**全部**物体的最高点。
     """
     names = [item.get("name", item["key"].split("/")[-1]) for item in sess.task["objects"]]
     rim = -np.inf
@@ -205,6 +226,15 @@ def gripper_force(sess) -> float:
 
 def tcp(sess) -> np.ndarray:
     return sess.tcp_position()
+
+
+def home_tcp(sess) -> np.ndarray:
+    """**零位**（``reset()`` 之后、6 个关节目标全 0）下的末端位置，回程的终点。
+
+    ``SimSession.reset()`` 会把当时的 TCP 记进 ``sess.home_tcp``；取不到该属性时
+    退化成"当前 TCP"（回程就变成原地停住，不会报错、也不会乱动）。
+    """
+    return np.asarray(getattr(sess, "home_tcp", tcp(sess)), dtype=float).copy()
 
 
 def body_names_in_contact(sess, names: set[str]) -> set[str]:
@@ -648,6 +678,55 @@ def release_object(sess, obj: str) -> tuple[bool, str]:
     return False, f"松手后物体仍跟着走 {dz_obj * 1000:+.0f}mm（可能卡在爪里）"
 
 
+def return_home(sess) -> tuple[bool, str]:
+    """**回程**：张开夹爪 → 原地抬到安全高度 → 横移到零位上方 → 落到零位。返回 (是否到位, 明细)。
+
+    ⚠ 为什么要有这一步：判分一旦完成，整条臂就停在物体上方几十毫米处（``放稳`` 那一步），
+    既挡住相机视野，也没法直接接着跑下一关 —— 用户看到的就是"任务做完了，臂却杵在那里"。
+
+    ⚠ 为什么三步的顺序不能变（实测，脚本 ``E:\\deepenv\\_tools\\diag_home.py``）：
+    结束时末端下方就是刚摆好的物体，**任何横move 都会扫到它**；先**原地竖直**抬到"当前
+    场景全部物体的最高点之上 60mm"（与开局 ``抬臂准备`` 同一判据）再横移就不会碰。
+    实测各关物体到"零位 TCP 点"最近也有 91mm（t9 木托盘），指尖总宽约 50mm，落下去是安全的。
+
+    ⚠ 为什么最后一步**不能**用关节空间直接收敛到零位：实测从零位 xy 起做关节空间归零，
+    t5 的 TCP 会下沉到 880.9mm（原 908.2）并**刮到木托盘**、t7 刮到布丁盒/番茄酱罐 ——
+    关节空间直线在笛卡尔空间是条弧，指尖会摆出去。所以全程走笛卡尔 + IK（``ramp``），
+    单帧关节变化仍由 ``set_ee_target`` 里的 8° 限速兜住。
+
+    代价（实测，脚本 ``E:\\deepenv\\_tools\\diag_home_pose2.py``）：**位置**回到零位点
+    （9 关 TCP 差 **1~2mm**），但**姿态**与零位差 **24°（t1）/ 45°（t7）** —— 零位的工具是
+    斜向上 45°，而 IK 按"接近轴竖直向下"出姿态（``down_orientation``，全任务都这么用），
+    要一模一样只能走关节空间，而那条路会刮到物体。所以"回程"= **回到零位点上方的待命姿态**。
+    """
+    yield from open_gripper(sess)
+    safe = scene_rim_z(sess, None) + HOME_LIFT_EXTRA
+    yield from ramp(sess, lambda c: np.array([c[0], c[1], safe]),
+                    yaw=sess.grasp_yaw, step=LIFT_STEP, frames=320, label="回程：抬到安全高度")
+
+    fingers = finger_bodies(sess)
+
+    def bumped() -> bool:
+        """指尖碰到外部东西（含桌面）→ 立刻停止回程，别硬挤。"""
+        return bool(body_names_in_contact(sess, fingers) - fingers)
+
+    home = home_tcp(sess)
+    yield from ramp(sess, lambda c: np.array([home[0], home[1], c[2]]),
+                    yaw=sess.grasp_yaw, step=MOVE_STEP, frames=620, stop=bumped,
+                    label="回程：横移到零位上方")
+    yield from ramp(sess, lambda _c: home, yaw=sess.grasp_yaw, step=LIFT_STEP, frames=320,
+                    stop=bumped, label="回程：落到零位")
+    for _ in range(HOME_SETTLE):
+        yield "回程：等伺服收稳"
+
+    err = float(np.linalg.norm(tcp(sess) - home))
+    if bumped():
+        return False, f"回程途中指尖碰到外部物体，停在 {np.round(tcp(sess) * 1000).astype(int)}mm"
+    ok = err < HOME_TOL
+    return ok, (f"{'已' if ok else '未完全'}回到零位：TCP "
+                f"{np.round(tcp(sess) * 1000).astype(int)}mm，离零位 {err * 1000:.0f}mm")
+
+
 def _stall_watch(tol: float = 0.0006, need: int = 15):
     """返回一个"末端/物体连续若干帧不动"的判据闭包（用于"卡住了"的兜底停止）。"""
     state = {"ref": None, "n": 0}
@@ -820,6 +899,7 @@ def script_for(sess):
 
     ``into/onto/stack/from/region`` → 抓取 + 放置；``push`` → 闭环推滑。
     ``region``（t8）没有容器，放置判据自动退化成"碰到桌面"。
+    判分之后追加**回程**（``return_home``）：把臂收回零位，免得任务做完后臂停在物体上方。
     """
     task = sess.task
     obj = task["grasp_object"]
@@ -847,7 +927,10 @@ def script_for(sess):
     for _ in range(45):                     # 让物体静置（判分要的是稳定状态）
         yield "等待稳定"
     ok, msg = check_success(task, sess.model, sess.data, sess.catalog)
-    steps.append(Step("判分", ok, msg))
+    steps.append(Step(JUDGE_LABEL, ok, msg))
+    # 判分之后**回程**（用户报的"任务做完了臂还杵在物体上方"）：收尾动作，不参与成败判定
+    ok_home, detail_home = yield from return_home(sess)
+    steps.append(Step("回程", ok_home, detail_home))
     return steps
 
 
@@ -894,7 +977,7 @@ class SkillRunner:
         except StopIteration as exc:
             self.active, self.finished = False, True
             self.steps = list(exc.value or [])
-            ok = bool(self.steps) and self.steps[-1].ok
+            ok = task_ok(self.steps)          # 只看"判分"那一步（回程不参与成败）
             self.status = "完成 ✅" if ok else "完成 ❌（见下方明细）"
         except SkillError as exc:
             self.active, self.finished, self.error = False, True, str(exc)
@@ -910,7 +993,7 @@ class SkillRunner:
     # ── 展示 ──
     @property
     def ok(self) -> bool:
-        return bool(self.steps) and self.steps[-1].ok
+        return task_ok(self.steps)
 
     def summary(self) -> str:
         if self.error:

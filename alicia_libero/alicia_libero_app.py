@@ -113,6 +113,8 @@ class SimSession:
         self.apply_control()
         mujoco.mj_forward(self.model, self.data)
         self.ee_target = self.tcp_position().copy()
+        # 零位（6 关节目标全 0）下的末端位置：技能库"回程"的终点，见 skills.return_home
+        self.home_tcp = self.tcp_position().copy()
 
     # ── 控制 ──
     def apply_control(self) -> None:

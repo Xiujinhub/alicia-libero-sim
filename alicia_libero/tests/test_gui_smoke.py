@@ -135,8 +135,8 @@ def main() -> int:
               "alicia_libero/skills.py 可用")
         check("会话带闭环技能所需接口",
               all(hasattr(window.session, name) for name in
-                  ("set_ee_target", "tcp_position", "gripper", "step", "task")),
-              "set_ee_target/tcp_position/gripper/step/task 齐备")
+                  ("set_ee_target", "tcp_position", "gripper", "step", "task", "home_tcp")),
+              "set_ee_target/tcp_position/gripper/step/task/home_tcp 齐备")
         check("界面有自动执行控件",
               all(hasattr(window, name) for name in
                   ("auto_button", "auto_step_button", "auto_status", "auto_result")),
@@ -144,6 +144,11 @@ def main() -> int:
         check("SkillRunner 已挂到会话",
               window.auto is not None and window.auto.sess is window.session,
               "window.auto 指向当前 session")
+        import skills as skills_mod
+
+        check("技能库带回程（return_home）",
+              hasattr(skills_mod, "return_home") and hasattr(window.session, "home_tcp"),
+              f"return_home + session.home_tcp={np.round(window.session.home_tcp * 1000, 1)}")
         # 单步一次：应能推进技能状态且不抛异常
         window.auto.start()
         window.callback_auto_single()
