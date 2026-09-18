@@ -67,6 +67,22 @@ TCP 上方 5~70mm、掌底只比 TCP 低约 4mm**（直接用模型量出来的�
 夹不住再往上抬。实测：黄油在 TCP≈0.81 时夹持面正好套住它上半段，能夹稳。"""
 MIN_TCP_Z = TABLE_TOP_Z + 0.004
 """TCP 允许的最低高度：掌底只比 TCP 低 4mm，再低就是掌底压进桌面了。"""
+JAW_OPEN = 0.050
+"""爪口最大开口（模型里两指滑轨各 25mm）。判断"套得下去吗"必须拿它比**投影宽**。"""
+
+CONTACT_STOP_TASKS = {"t3_pudding_into_ramekin"}
+"""下降阶段"**手指一碰到物体就停、就地合爪**"的任务（其余任务保持原来的"停滞才停"）。
+
+⚠ 为什么只给 t3 开（实测记录）：布丁盒 27.4×46.3mm 的**矩形**截面几乎塞满爪口 ——
+沿闭合轴的投影宽 = 27.4·cosθ + 46.3·sinθ，而 IK 姿态是**软约束**，实测命令 yaw=0° 时
+真实闭合轴与窄边差 **θ=40°** → 投影 **51.4mm ≈ 爪口 50mm（间隙为负）**，
+手指根本套不下去，只能压在盒盖/顶沿上。
+旧代码要等"连续 14 帧不动"才停，而命令点期间仍以 3.5mm/帧 往下走（≈49mm 过行程）——
+等于用伺服力把盒子**拧了 25°**（下降前后按高度切片对比：沿闭合轴投影 51.4→39.9mm，
+垂直轴投影 52.7→52.0mm），这就是用户看到的"夹爪下去就把物品撞歪"。
+现在：①先扫候选朝向挑**投影最窄**的（``plan_clear_yaw``）；②一接触就停（≤1 帧、≤1.75mm
+过行程）；③触到就跳过低位横向微调（避免侧推）。"""
+
 
 
 class SkillError(RuntimeError):
@@ -382,87 +398,186 @@ def calibrated_yaw(sess, obj: str, yaw0: float | None = None,
     return best_yaw
 
 
+STABLE_GRASP_WIDTH_TASKS = {"t3_pudding_into_ramekin"}
+"""开口判据改用 catalog 里**建场景时量好的** ``grasp_width``，而不是"实时 AABB 宽度"。
+
+⚠ 为什么只给 t3 开（实测记录）：夹取过程里"实时宽度"会被自己的手指污染 ——
+布丁盒 27.4mm 宽，指尖一压就歪，实测闭合那一刻的实时宽度依次是 **65.7 / 56.0 / 52.9mm**，
+而**开口**却是 26.4 / 31.9 / 32.1mm、**夹持力** 2.8~3.2N，且抬起后物体底分别跟随了
++19.8 / +17.5 / +16.8mm（= 真的夹住了、也抬起来了）。可判据拿"失真的宽度"当参照，
+于是把三次成功全判成失败 → 主动在空中松爪把盒子摔回桌面，越摔越歪，第 4 次只能在
+896mm 高处空夹（开口 -0.2mm）——用户看到的"夹住了几次又松开"就是这个。
+
+改用 catalog 的 ``grasp_width``（27.4mm，与三次实测开口 26.4/31.9/32.1 都吻合，而与
+空夹的 -0.2mm 差 27mm）后，四次判定全部正确。其它任务按实时宽度已能过，就不动它们。"""
+
+
+def jaws_clearance(sess, obj: str, axis) -> tuple[float, float]:
+    """沿"实测闭合轴"算物体的**投影宽度**与**单边间隙**（米），用于判断"套得下去吗"。
+
+    ⚠ 不能拿"爪口 50mm vs 盒宽 27.4mm"直接比：矩形截面的投影宽 = 27.4·cosθ + 46.3·sinθ，
+    θ 是闭合轴与盒子窄边的夹角（IK 姿态是软约束，实测 t3 的 θ≈40° → 投影 51.4mm，
+    比爪口还宽）。物体按世界轴对齐（本项目的物体 yaw 都是 0）。
+    """
+    ext = aabb(sess, obj)[1] - aabb(sess, obj)[0]
+    short, long_ = sorted((float(ext[0]), float(ext[1])))
+    u = np.asarray(axis, dtype=float).copy()
+    u[2] = 0.0
+    n = float(np.linalg.norm(u))
+    if n < 1e-9:
+        return -1.0, 0.0
+    u = u / n
+    ang = math.asin(min(1.0, abs(float(u[1]))))          # 世界 x 与闭合轴的夹角
+    width = short * math.cos(ang) + long_ * math.sin(ang)
+    return (JAW_OPEN - width) / 2.0, width
+
+
+def plan_clear_yaw(sess, obj: str, offsets=(0.0, 90.0, 180.0),
+                   settle: int = 40, label=True):
+    """候选偏航角列表 + 每个朝向**实测**的"预计单边间隙"（米），供明细显示与排序参考。
+
+    在物体上方 ``ALIGN_H`` 处逐个摆好、用两指 body 连线量真实闭合轴（见
+    ``CONTACT_STOP_TASKS`` 的实测说明）。返回 ``[(yaw, 单边间隙, 投影宽), ...]``。
+    """
+    base = yaw_for_axis(sess, obj)
+    plan: list[tuple[float, float, float]] = []
+    for off in offsets:
+        cand = base + off
+        c = center(sess, obj)
+        target = np.array([c[0], c[1], top_z(sess, obj) + ALIGN_H])
+
+        def _hold(_c, t=target):
+            return t
+
+        yield from ramp(sess, _hold, yaw=cand, frames=settle, tol=0.0,
+                        label=(f"试朝向 {cand:.0f}°" if label else f"到 {obj} 上方"))
+        gap_side, width = jaws_clearance(sess, obj, measured_closing_axis(sess))
+        plan.append((cand, gap_side, width))
+    return plan
+
+
 def grasp_object(sess, obj: str) -> tuple[bool, str]:
     """抓取：接近 → 对齐 → **竖直下降（xy 冻结）** → 闭合 → 抬起验证"物体是否跟着走"。
 
-    判据全部来自实测：闭合后的**开口**要落在物体实时宽度附近；抬起 25mm 后物体的
-    底面要跟着升高 —— 两个都对才算抓住（旧版只看"高度到位了没"）。
-    一档不行就换下一档（``GRASP_BAND_LADDER``），最多 4 档。
+    判据全部来自实测：闭合后的**开口**要落在物体宽度附近；抬起 25mm 后物体的底面要跟着
+    升高 —— 两个都对才算抓住（旧版只看"高度到位了没"）。一档不行就换下一档
+    （``GRASP_BAND_LADDER``）。物体"几乎塞满爪口"的任务（``CONTACT_STOP_TASKS``）还会
+    先量出各候选朝向的实际间隙（``plan_clear_yaw``），并且**手指一碰到就停**（避免推歪）。
     """
+    task_id = sess.task.get("id")
+    watch = task_id in CONTACT_STOP_TASKS
+    #   t3 实测：dz=0 那一档才能夹到盒子的窄边（开口 26mm），dz=+20mm 只会卡在盒顶
+    #   （开口停在全开 51mm = 空夹）—— 所以"几乎塞满爪口"的任务把 dz=0 提到第一档。
+    ladder = (GRASP_BAND_LADDER[1], GRASP_BAND_LADDER[0]) if watch else GRASP_BAND_LADDER
+    descend_step = DESCEND_STEP * 0.5 if watch else DESCEND_STEP
     last = "未尝试"
     yaw_fixed = None
-    if sess.task.get("id") in YAW_CALIBRATED_TASKS:
+    if task_id in YAW_CALIBRATED_TASKS:
         # 先用实测挑出"真能夹住"的偏航角（见 YAW_CALIBRATED_TASKS 的说明）
         yaw_fixed = yield from calibrated_yaw(sess, obj)
-    for attempt, dz in enumerate(GRASP_BAND_LADDER, start=1):
-        yaw = yaw_fixed if yaw_fixed is not None else yaw_for_axis(sess, obj)
+    yaw_seq: list = [yaw_fixed]
+    yaw_clear: dict = {}
+    if watch:
+        # 扫 0°/90°/180°：既把末端摆到对齐高度，又量出每个朝向的"预计单边间隙"
+        # （实测 t3：0° 真实闭合轴与盒子窄边差 40° → 沿轴投影 51.4mm ≈ 爪口 50mm）
+        plan = yield from plan_clear_yaw(sess, obj)
+        yaw_seq = [cand for cand, _, _ in plan]
+        yaw_clear = {cand: gap for cand, gap, _ in plan}
+    for yaw_sel in yaw_seq:
+        for attempt, dz in enumerate(ladder, start=1):
+            yaw = yaw_sel if yaw_sel is not None else yaw_for_axis(sess, obj)
+            tag = f"（朝向 {yaw:.0f}°）" if watch else ""
 
-        # ① 到物体正上方（高处，保证不会碰到任何东西）
-        def above(_c):
-            c = center(sess, obj)
-            return np.array([c[0], c[1], top_z(sess, obj) + APPROACH_H])
+            # ① 到物体正上方（高处，保证不会碰到任何东西）
+            def above(_c):
+                c = center(sess, obj)
+                return np.array([c[0], c[1], top_z(sess, obj) + APPROACH_H])
 
-        yield from ramp(sess, above, yaw=yaw, frames=300,
-                        label=f"接近 {obj}（第 {attempt} 次）")
+            yield from ramp(sess, above, yaw=yaw, frames=300,
+                            label=f"接近 {obj}（第 {attempt} 次）")
 
-        # ② 对齐到"顶面上方 28mm"（指尖刚好停在物体顶面之上），横向校正都在这一步做完
-        def align(_c):
-            c = center(sess, obj)
-            return np.array([c[0], c[1], top_z(sess, obj) + ALIGN_H])
+            # ② 对齐到"顶面上方 28mm"（指尖刚好停在物体顶面之上），横向校正都在这一步做完
+            def align(_c):
+                c = center(sess, obj)
+                return np.array([c[0], c[1], top_z(sess, obj) + ALIGN_H])
 
-        yield from ramp(sess, align, yaw=yaw, frames=200, label=f"对齐 {obj} 正上方")
-        c0 = center(sess, obj)
-        yield from align_xy(sess, c0[:2], yaw, top_z(sess, obj) + ALIGN_H)
+            yield from ramp(sess, align, yaw=yaw, frames=200, label=f"对齐 {obj} 正上方")
+            c0 = center(sess, obj)
+            yield from align_xy(sess, c0[:2], yaw, top_z(sess, obj) + ALIGN_H)
 
-        # ③ **竖直下降：xy 冻结**，不再每帧追物体。
-        #    ⚠ 踩坑 3：先前下降时 xy 还在追"物体实时中心"，而手指只有 50mm 间距、
-        #    黄油/布丁这类轻物体（素材密度 100 ≈ 泡沫）一碰就跑 —— 实测手指把 18mm 厚的
-        #    黄油块撞倒，实时 AABB 宽度从 18mm 变成 47mm，再合爪就夹空（t2/t3 失败根因）。
-        #    ⚠ 踩坑 6：停止判据**不能用"手指一碰就停"**——掌底只比 TCP 低 4mm，
-        #    矮物体（黄油 40mm 高）下降时掌底先碰到它的顶面，一停就落在"夹持面还在物体
-        #    上方"的位置，合爪只能夹到顶上一条边（实测开口停在 19mm 但抬起就滑脱）。
-        #    现在改成：降到目标高度为止，若**末端停滞**（被物体/桌面顶住）也停。
-        aligned = tcp(sess)
-        xy0 = aligned[:2].copy()
-        stalled = _stall_watch(tol=0.0004, need=14)
+            # ③ **竖直下降：xy 冻结**，不再每帧追物体。
+            #    ⚠ 踩坑 3：先前下降时 xy 还在追"物体实时中心"，而手指只有 50mm 间距、
+            #    黄油/布丁这类轻物体（素材密度 100 ≈ 泡沫）一碰就跑 —— 实测手指把 18mm 厚的
+            #    黄油块撞倒，实时 AABB 宽度从 18mm 变成 47mm，再合爪就夹空（t2/t3 失败根因）。
+            #    ⚠ 踩坑 6：停止判据**不能用"手指一碰就停"**——掌底只比 TCP 低 4mm，
+            #    矮物体（黄油 40mm 高）下降时掌底先碰到它的顶面，一停就落在"夹持面还在物体
+            #    上方"的位置，合爪只能夹到顶上一条边（实测开口停在 19mm 但抬起就滑脱）。
+            #    现在改成：降到目标高度为止，若**末端停滞**（被物体/桌面顶住）也停。
+            #    ⚠ 例外（``CONTACT_STOP_TASKS``，仅 t3）：布丁盒几乎塞满爪口，手指必然先压到
+            #    盒盖，而"停滞 14 帧"期间命令点还会多走 49mm、把盒子拧歪 25°。所以这里
+            #    **一接触就停**（≤1 帧、≤1.75mm 过行程），就地合爪。
+            aligned = tcp(sess)
+            xy0 = aligned[:2].copy()
+            stalled = _stall_watch(tol=0.0004, need=14)
+            flags = {"touch": False}
 
-        def band(_c):
-            c = center(sess, obj)
-            return np.array([xy0[0], xy0[1],
-                             max(c[2] + grasp_offset_now(sess, obj) + dz, MIN_TCP_Z)])
+            def band(_c):
+                c = center(sess, obj)
+                return np.array([xy0[0], xy0[1],
+                                 max(c[2] + grasp_offset_now(sess, obj) + dz, MIN_TCP_Z)])
 
-        yield from ramp(sess, band, yaw=yaw, frames=200, step=DESCEND_STEP,
-                        stop=lambda: stalled(tcp(sess)),
-                        label=f"竖直下降对准 {obj}（档 {attempt}）")
-        # ③.5 低位再微调一次 xy：姿态变了，伺服的静态误差也变了（实测低位会漂 6~7mm）。
-        #      但**只允许沿物体长轴修**——夹紧轴方向手指正贴着物体两侧，
-        #      横move 会把轻物体推倒（实测布丁 AABB 宽度 27→49mm，t3 就是这么挂的）。
-        c1 = center(sess, obj)
-        long_axis = (1.0, 0.0) if live_grasp_axis(sess, obj) == "y" else (0.0, 1.0)
-        yield from align_xy(sess, c1[:2], yaw, float(tcp(sess)[2]),
-                            rounds=2, tol=0.0025, hold=22, max_shift=0.006,
-                            mask=long_axis)
-        axis = live_grasp_axis(sess, obj)
-        expect = width_along(sess, obj, axis)
-        sess.grasp_yaw = yaw
-        gap = yield from close_gripper(sess)
-        z0_obj, z0_tcp = bottom_z(sess, obj), float(tcp(sess)[2])
-        yield from ramp(sess,
-                        lambda c: np.array([c[0], c[1], z0_tcp + 0.025]),
-                        yaw=yaw, step=LIFT_STEP, frames=60, label=f"抬起验证 {obj}")
-        dz_obj = bottom_z(sess, obj) - z0_obj
-        dz_tcp = float(tcp(sess)[2]) - z0_tcp
-        following = abs(dz_obj - dz_tcp) < GRASP_FOLLOW_TOL and dz_obj > 0.008
-        gap_ok = abs(gap - expect) < 0.014
-        if following and gap_ok:
-            return True, (f"夹住 {obj}：开口 {gap * 1000:.0f}mm"
-                          f"（物体宽 {expect * 1000:.0f}mm），抬起跟随 {dz_obj * 1000:.0f}mm")
-        last = (f"第 {attempt} 次未夹住：开口 {gap * 1000:.0f}mm"
-                f"（物体宽 {expect * 1000:.0f}mm），抬起后物体只动 {dz_obj * 1000:.0f}mm")
-        yield from open_gripper(sess)
-        yield from ramp(sess,
-                        lambda c: np.array([c[0], c[1], top_z(sess, obj) + APPROACH_H]),
-                        yaw=yaw, step=LIFT_STEP, frames=80, label="退回重试")
+            def _stop(flags=flags, stalled=stalled):
+                if watch and touched_by_fingers(sess, obj):
+                    flags["touch"] = True
+                    return True
+                return stalled(tcp(sess))
+
+            yield from ramp(sess, band, yaw=yaw, frames=200, step=descend_step,
+                            stop=_stop,
+                            label=f"竖直下降对准 {obj}（档 {attempt}）{tag}")
+            # ③.5 低位再微调一次 xy：姿态变了，伺服的静态误差也变了（实测低位会漂 6~7mm）。
+            #      但**只允许沿物体长轴修**——夹紧轴方向手指正贴着物体两侧，
+            #      横move 会把轻物体推倒（实测布丁 AABB 宽度 27→49mm，t3 就是这么挂的）。
+            #      手指已经搭在物体上时直接跳过（任何横move 都是侧推）。
+            c1 = center(sess, obj)
+            long_axis = (1.0, 0.0) if live_grasp_axis(sess, obj) == "y" else (0.0, 1.0)
+            if not flags["touch"]:
+                yield from align_xy(sess, c1[:2], yaw, float(tcp(sess)[2]),
+                                    rounds=2, tol=0.0025, hold=22, max_shift=0.006,
+                                    mask=long_axis)
+            axis = live_grasp_axis(sess, obj)
+            if task_id in STABLE_GRASP_WIDTH_TASKS:
+                # 见 STABLE_GRASP_WIDTH_TASKS 的说明：实时宽度会被手指压歪而失真
+                expect = float(catalog_object(sess.catalog, obj)["grasp_width"])
+            else:
+                expect = width_along(sess, obj, axis)
+            sess.grasp_yaw = yaw
+            gap = yield from close_gripper(sess)
+            z0_obj, z0_tcp = bottom_z(sess, obj), float(tcp(sess)[2])
+            yield from ramp(sess,
+                            lambda c: np.array([c[0], c[1], z0_tcp + 0.025]),
+                            yaw=yaw, step=LIFT_STEP, frames=60, label=f"抬起验证 {obj}")
+            dz_obj = bottom_z(sess, obj) - z0_obj
+            dz_tcp = float(tcp(sess)[2]) - z0_tcp
+            following = abs(dz_obj - dz_tcp) < GRASP_FOLLOW_TOL and dz_obj > 0.008
+            gap_ok = abs(gap - expect) < 0.014
+            gap_side = yaw_clear.get(yaw, 0.0)
+            if following and gap_ok:
+                extra = "（触到盒顶即夹）" if flags["touch"] else ""
+                return True, (f"夹住 {obj}：开口 {gap * 1000:.0f}mm"
+                              f"（物体宽 {expect * 1000:.0f}mm），"
+                              f"抬起跟随 {dz_obj * 1000:.0f}mm{extra}")
+            last = (f"第 {attempt} 次未夹住{tag}：开口 {gap * 1000:.0f}mm"
+                    f"（物体宽 {expect * 1000:.0f}mm），抬起后物体只动 {dz_obj * 1000:.0f}mm")
+            if watch:
+                enough = "够" if gap_side > 0.001 else "不足"
+                last += (f"；该朝向预计单边间隙 {gap_side * 1000:+.1f}mm（{enough}）")
+            if flags["touch"]:
+                last += "；下降时手指已触到物体"
+            yield from open_gripper(sess)
+            yield from ramp(sess,
+                            lambda c: np.array([c[0], c[1], top_z(sess, obj) + APPROACH_H]),
+                            yaw=yaw, step=LIFT_STEP, frames=80, label="退回重试")
     return False, last
 
 
