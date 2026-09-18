@@ -68,6 +68,21 @@ TCP 上方 5~70mm、掌底只比 TCP 低约 4mm**（直接用模型量出来的�
 夹不住再往上抬。实测：黄油在 TCP≈0.81 时夹持面正好套住它上半段，能夹稳。"""
 MIN_TCP_Z = TABLE_TOP_Z + 0.004
 """TCP 允许的最低高度：掌底只比 TCP 低 4mm，再低就是掌底压进桌面了。"""
+LYING_GRASP_BASE = 0.010
+"""**平放物体**的抓取高度：TCP 停在"物体底面 + 10mm"（米）。
+
+⚠ 立着的物体用的是"中心 + ``grasp_tcp_offset``"，那个偏移是沿物体**局部 Z** 量的；
+瓶子平放后局部 Z 变成水平，"加高度"就没有意义了。平放时指面（在 TCP 之上 0~73mm）
+只要贴着底面开始往上盖就能把躺着的瓶子整段包住（实测躺姿高 56.2mm < 指面 74mm）。
+底面 + 10mm 同时保证掌底（TCP−4mm）离桌面还有 6mm，不会蹭桌。"""
+
+CONTAINER_DROP_CLEAR = 0.015
+"""**平放/斜躺**被夹物放置时，在"容器口上方"这么多米处**凌空松手**（米）。
+
+⚠ 为什么要跟立姿物区别对待（实测 §8.9）：平放的瓶子直直降到"碰篮子沿"再松手时，
+有 1/6 会顶在沿上不倒进去（真实最低点 896~913mm，判分失败）；而在容器口上方 15mm
+凌空松手，落体测试 9/9 全部滑到容器内底（最低点 817~827mm）。"""
+
 JAW_OPEN = 0.050
 """爪口最大开口（模型里两指滑轨各 25mm）。判断"套得下去吗"必须拿它比**投影宽**。"""
 
@@ -317,16 +332,116 @@ def live_grasp_axis(sess, obj: str) -> str:
     return "x" if width_along(sess, obj, "x") <= width_along(sess, obj, "y") else "y"
 
 
+def grasp_axes_world(sess, obj: str):
+    """物体**薄轴 / 长轴**在世界系下的方向（单位向量），按**实时姿态**解析算出。
+
+    薄轴 = catalog 里最薄的那条**局部轴**（番茄酱是局部 Y＝36.8mm），长轴 = 最长的那条
+    （局部 Z＝145.6mm）。姿态随机之后（§8.9 瓶子可能平放、还斜 45°）**不能**再用
+    "世界 AABB 谁短"来定闭合方向：斜躺时 AABB 退化成一个近似正方形（实测 45° 时
+    129×129mm），按它猜有 50% 概率夹错方向，手指会横着扎进瓶身。
+
+    返回 ``(薄轴, 长轴)``；薄轴被转到**竖直**时（那种姿态平行夹爪没法水平闭合）返回
+    ``(None, 长轴)``，调用方回退到旧逻辑。
+    """
+    obj_cat = catalog_object(sess.catalog, obj)
+    local = np.asarray(obj_cat["size"], dtype=float)
+    rot = quat_to_mat(sess.data.xquat[_body_id(sess, obj)])
+    thin = np.zeros(3)
+    thin[int(np.argmin(local))] = 1.0
+    long_ = np.zeros(3)
+    long_[int(np.argmax(local))] = 1.0
+    thin_w, long_w = rot @ thin, rot @ long_
+    return (None if abs(float(thin_w[2])) > 0.9 else thin_w), long_w
+
+
+def long_axis_dir(sess, obj: str) -> tuple[float, float]:
+    """物体**长轴**在世界水平面上的方向（单位向量）—— 低位微调只允许沿它修 xy。
+
+    长轴接近竖直时（立着的瓶子）退回"薄轴的垂线"，也就是旧版 ``mask`` 的效果
+    （夹紧轴方向不许动、另一个水平方向可以动）。
+    """
+    _, long_w = grasp_axes_world(sess, obj)
+    flat = np.asarray(long_w[:2], dtype=float)
+    norm = float(np.linalg.norm(flat))
+    if norm > 0.2:
+        return (float(flat[0] / norm), float(flat[1] / norm))
+    thin = thin_axis_world(sess, obj)
+    return (float(-thin[1]), float(thin[0]))
+
+
+def width_along_dir(sess, obj: str, direction) -> float:
+    """物体沿**任意水平方向**的投影宽度（米）—— 用碰撞盒角点投影，斜放也算得准。
+
+    ``width_along`` 只给得出世界 X/Y 的宽度，斜躺的物体用它量"沿闭合轴的宽度"
+    会得到 129mm（AABB 的对角），而真实闭合宽只有 36.8mm —— 合爪判据会误判。
+    """
+    pts = world_box_corners(sess, obj)[:, :2]
+    d = np.asarray(direction, dtype=float)[:2]
+    d = d / (np.linalg.norm(d) + 1e-12)
+    proj = pts @ d
+    return float(proj.max() - proj.min())
+
+
 def yaw_for_axis(sess, obj: str) -> float:
     """把"沿哪条轴闭合"换算成 ``down_orientation`` 需要的偏航角（度）。
 
     约定（见 ``SimSession._grasp_yaw`` 与 ``AliciaIK`` 的零位推导）：
-    偏航 0° 时闭合轴沿 X；要沿 Y 闭合则 +90°。另外叠加物体自身的实时偏航。
+    偏航 0° 时闭合轴沿 X；要沿 Y 闭合则 +90°。这里直接取**薄轴的水平方向角**，
+    所以物体立着、平放、斜 45° 都成立（立着时与旧算法一致：薄轴是局部 Y → 90°）；
+    平放/斜躺时再折算到"负角"那半圈（``reachable_yaw``：躺姿只有负角够得着）。
     """
-    bid = _body_id(sess, obj)
-    rot = quat_to_mat(sess.data.xquat[bid])
-    obj_yaw = math.degrees(math.atan2(rot[1, 0], rot[0, 0]))
-    return obj_yaw + (0.0 if live_grasp_axis(sess, obj) == "x" else 90.0)
+    thin = thin_axis_world(sess, obj)
+    yaw = math.degrees(math.atan2(thin[1], thin[0]))
+    return yaw if is_upright(sess, obj) else reachable_yaw(yaw)
+
+
+def grasp_tcp_z(sess, obj: str) -> float:
+    """抓取时 TCP 该停的**高度**（米）—— 随物体姿态换算法。
+
+    * **立着**（物体的局部 Z 竖直）：``物体中心 + catalog 的 grasp_tcp_offset``，
+      与旧版逐字一致；
+    * **平放/斜躺**：改成 ``物体底面 + LYING_GRASP_BASE``（局部 Z 已经水平，
+      沿它加高度没有意义；详见 ``LYING_GRASP_BASE`` 的说明）。
+    """
+    if is_upright(sess, obj):
+        return float(center(sess, obj)[2] + grasp_offset_now(sess, obj))
+    return float(bottom_z(sess, obj) + LYING_GRASP_BASE)
+
+def reachable_yaw(yaw_deg: float) -> float:
+    """把闭合轴偏航角折算成"**躺姿也够得着**"的那个等价代表（度）。
+
+    ⚠ 为什么可以随便换 ±180°：平行夹爪是沿一条**直线**闭合的 —— yaw 和 yaw±180° 只是
+    把两个手指对调，物理上完全一样。但机械臂的姿态不同、够得着的范围也不同：实测躺姿
+    抓取（TCP 要压到 810~830mm）在 **负角** 那半圈才够得着（−45°/−135° 各 6/6），
+    正角那半圈压不到（+45° 2/6、+135° 1/6，手指会偏进瓶身）。所以躺姿算出来的闭合角
+    一律折算到 ``(−180°, 0°]``；立姿不折算（+90° 立姿夹得好好的，别动它）。
+    """
+    y = float(yaw_deg) % 360.0
+    if y > 180.0:
+        y -= 360.0
+    elif y > 0.0:
+        y -= 180.0
+    return y
+
+
+def is_upright(sess, obj: str) -> bool:
+    """物体是否**立着**（局部 Z 大致竖直）。斜躺/平放时抓取高度、接近高度都要换算法。"""
+    rot = quat_to_mat(sess.data.xquat[_body_id(sess, obj)])
+    return abs(float((rot @ np.array([0.0, 0.0, 1.0]))[2])) > 0.9
+
+
+def approach_z(sess, obj: str) -> float:
+    """抓取前"高悬点位"的高度（物体顶面之上 ``APPROACH_H``）。
+
+    ⚠ 平放/斜躺时物体顶面只有 56mm 高（实测躺着的瓶子顶面 861mm），"顶面 + 60mm"
+    比篮子沿（941mm）还低 —— 横移过去的那段路会从篮子身上擦过去。所以非立姿时改成
+    "顶面与现场最高沿取大者 + ``APPROACH_H``"。立姿时与旧版逐字一致（t1 立着的瓶子
+    945.6mm 本来就比篮子高），其它任务全部走立姿分支，行为不变。
+    """
+    top = top_z(sess, obj)
+    if is_upright(sess, obj):
+        return top + APPROACH_H
+    return max(top, scene_rim_z(sess, exclude=obj)) + APPROACH_H
 
 
 def grasp_offset_now(sess, obj: str) -> float:
@@ -416,7 +531,7 @@ def held_offset(sess, obj: str) -> float:
 
 def align_xy(sess, goal_xy, yaw: float, z: float, rounds: int = 3,
              tol: float = 0.003, hold: int = 26, max_shift: float = 0.012,
-             mask=(1.0, 1.0)):
+             mask=(1.0, 1.0), direction=None, ref=None):
     """闭环把末端 **xy 对准目标**：逐轮把"指令点"反向偏置，抵消位置伺服的静态误差。
 
     ⚠ 为什么必须这么做（实测）：低位姿态下位置伺服的 xy 有 6~7mm 静态误差
@@ -428,13 +543,31 @@ def align_xy(sess, goal_xy, yaw: float, z: float, rounds: int = 3,
     夹紧方向上手指就贴着物体两侧，横move 会把轻物体推倒（实测布丁被推倒、AABB 宽度
     从 27mm 变成 49mm，t3 因此失败）；沿"物体长轴"方向才有自由空间。
 
+    ``direction``：给一个**单位方向**时改成"只沿该方向修"（误差投影到它上面）。
+    物理上比逐轴 mask 更对：平放并斜 45° 的瓶子，长轴不与世界轴平行，
+    逐轴 mask 表达不出"只沿瓶身长轴微调"（§8.9）；轴对齐时两者结果完全一致。
+
+    ``ref``：**被对准的那个点**（默认末端 TCP）。搬着东西对准容器时要用"被夹物的中心"
+    （``ref=lambda s: center(s, obj)[:2]``）—— 物体相对 TCP 可能偏十几毫米（夹得偏一点、
+    抬起时再滑一点），只对 TCP 会让瓶子重心落在篮子边沿上（§8.9 平放掉不进去的根因）。
+
     ``max_shift`` 限制总偏置量，避免在物体旁边"横扫"把它推走。返回是否对准。
     """
     goal = np.asarray(goal_xy, dtype=float)
     mask = np.asarray(mask, dtype=float)
+
+    def where() -> np.ndarray:
+        return np.asarray(ref(sess)[:2], dtype=float) if ref is not None else tcp(sess)[:2]
+
+    dirv = None
+    if direction is not None:
+        dirv = np.asarray(direction, dtype=float)[:2]
+        n = float(np.linalg.norm(dirv))
+        dirv = dirv / n if n > 1e-9 else None
     bias = np.zeros(2)
     for _ in range(rounds):
-        err = (goal - tcp(sess)[:2]) * mask
+        delta = goal - where()
+        err = (delta @ dirv) * dirv if dirv is not None else delta * mask
         if float(np.linalg.norm(err)) < tol:
             return True
         bias = np.clip(bias + err, -max_shift, max_shift)
@@ -445,7 +578,9 @@ def align_xy(sess, goal_xy, yaw: float, z: float, rounds: int = 3,
 
         yield from ramp(sess, _hold, yaw=yaw, frames=hold, tol=0.0, step=MOVE_STEP,
                         label="xy 闭环微调")
-    return float(np.linalg.norm((goal - tcp(sess)[:2]) * mask)) < 0.006
+    delta = goal - where()
+    err = (delta @ dirv) * dirv if dirv is not None else delta * mask
+    return float(np.linalg.norm(err)) < 0.006
 
 
 YAW_CALIBRATED_TASKS = {"t2_butter_onto_plate", "t7_stack_pudding_on_can"}
@@ -472,9 +607,19 @@ YAW_CALIBRATED_TASKS = {"t2_butter_onto_plate", "t7_stack_pudding_on_can"}
 
 
 def thin_axis_world(sess, obj: str) -> np.ndarray:
-    """物体"薄边"在世界水平面上的方向（单位向量，只取 x/y）。"""
-    ext = aabb(sess, obj)[1] - aabb(sess, obj)[0]
-    return np.array([1.0, 0.0]) if ext[0] <= ext[1] else np.array([0.0, 1.0])
+    """物体"薄边"在世界水平面上的方向（单位向量，只取 x/y）。
+
+    旧版是"AABB 短边取世界 X 或 Y"—— **只在物体轴对齐时**成立；平放且斜 45° 时
+    AABB 退化成一个近似正方形（实测 129×129mm），按它猜有 50% 概率夹错方向。
+    现在按"局部薄轴 + 实时姿态"解析算（见 ``grasp_axes_world``），轴对齐时结果与旧版一致。
+    """
+    thin, _ = grasp_axes_world(sess, obj)
+    if thin is None:                                  # 薄轴竖直：回退到旧逻辑
+        ext = aabb(sess, obj)[1] - aabb(sess, obj)[0]
+        return np.array([1.0, 0.0]) if ext[0] <= ext[1] else np.array([0.0, 1.0])
+    flat = np.asarray(thin[:2], dtype=float)
+    norm = float(np.linalg.norm(flat))
+    return flat / norm if norm > 1e-6 else np.array([1.0, 0.0])
 
 
 def measured_closing_axis(sess) -> np.ndarray:
@@ -609,7 +754,7 @@ def grasp_object(sess, obj: str) -> tuple[bool, str]:
             # ① 到物体正上方（高处，保证不会碰到任何东西）
             def above(_c):
                 c = center(sess, obj)
-                return np.array([c[0], c[1], top_z(sess, obj) + APPROACH_H])
+                return np.array([c[0], c[1], approach_z(sess, obj)])
 
             yield from ramp(sess, above, yaw=yaw, frames=300,
                             label=f"接近 {obj}（第 {attempt} 次）")
@@ -622,6 +767,13 @@ def grasp_object(sess, obj: str) -> tuple[bool, str]:
             yield from ramp(sess, align, yaw=yaw, frames=200, label=f"对齐 {obj} 正上方")
             c0 = center(sess, obj)
             yield from align_xy(sess, c0[:2], yaw, top_z(sess, obj) + ALIGN_H)
+            # ②.5 平放/斜躺的物体还要再"贴近顶面"补一次完整 xy 对准：
+            #     躺姿的抓取位比立姿低 ~90mm（810~830mm），低位伺服的静态漂移会把手指
+            #     送到物体侧面上（实测远端漂 5~20mm，直接把瓶子撞走 → 整局失败）。
+            #     在"顶面上方 5mm"处对准时指面还悬在物体上方（掌底 = TCP−4mm ≈ 物体顶面），
+            #     横move 不会碰到它；立姿不走进这个分支（行为与旧版一致）。
+            if not is_upright(sess, obj):
+                yield from align_xy(sess, c0[:2], yaw, top_z(sess, obj) + 0.005, rounds=2)
 
             # ③ **竖直下降：xy 冻结**，不再每帧追物体。
             #    ⚠ 踩坑 3：先前下降时 xy 还在追"物体实时中心"，而手指只有 50mm 间距、
@@ -640,9 +792,8 @@ def grasp_object(sess, obj: str) -> tuple[bool, str]:
             flags = {"touch": False}
 
             def band(_c):
-                c = center(sess, obj)
                 return np.array([xy0[0], xy0[1],
-                                 max(c[2] + grasp_offset_now(sess, obj) + dz, MIN_TCP_Z)])
+                                 max(grasp_tcp_z(sess, obj) + dz, MIN_TCP_Z)])
 
             def _stop(flags=flags, stalled=stalled):
                 if watch and touched_by_fingers(sess, obj):
@@ -658,17 +809,18 @@ def grasp_object(sess, obj: str) -> tuple[bool, str]:
             #      横move 会把轻物体推倒（实测布丁 AABB 宽度 27→49mm，t3 就是这么挂的）。
             #      手指已经搭在物体上时直接跳过（任何横move 都是侧推）。
             c1 = center(sess, obj)
-            long_axis = (1.0, 0.0) if live_grasp_axis(sess, obj) == "y" else (0.0, 1.0)
+            long_axis = long_axis_dir(sess, obj)
             if not flags["touch"]:
                 yield from align_xy(sess, c1[:2], yaw, float(tcp(sess)[2]),
                                     rounds=2, tol=0.0025, hold=22, max_shift=0.006,
-                                    mask=long_axis)
-            axis = live_grasp_axis(sess, obj)
+                                    mask=long_axis, direction=long_axis)
             if task_id in STABLE_GRASP_WIDTH_TASKS:
                 # 见 STABLE_GRASP_WIDTH_TASKS 的说明：实时宽度会被手指压歪而失真
                 expect = float(catalog_object(sess.catalog, obj)["grasp_width"])
             else:
-                expect = width_along(sess, obj, axis)
+                # ⚠ 用**沿实测闭合轴的投影宽**（``width_along`` 只认世界 X/Y，斜躺的瓶子
+                #   会被量成 AABB 对角线 129mm，合爪判据直接失效）
+                expect = width_along_dir(sess, obj, thin_axis_world(sess, obj))
             sess.grasp_yaw = yaw
             gap = yield from close_gripper(sess)
             z0_obj, z0_tcp = bottom_z(sess, obj), float(tcp(sess)[2])
@@ -694,7 +846,7 @@ def grasp_object(sess, obj: str) -> tuple[bool, str]:
                 last += "；下降时手指已触到物体"
             yield from open_gripper(sess)
             yield from ramp(sess,
-                            lambda c: np.array([c[0], c[1], top_z(sess, obj) + APPROACH_H]),
+                            lambda c: np.array([c[0], c[1], approach_z(sess, obj)]),
                             yaw=yaw, step=LIFT_STEP, frames=80, label="退回重试")
     return False, last
 
@@ -785,10 +937,17 @@ def place_object(sess, obj: str, target: str | None) -> tuple[bool, str]:
     不再需要任务里填一个假的 ``target_object``（这正是旧版 t8 从 21mm 高处掉下来的原因）。
     ``target`` 存在时，判据是"**被夹物**碰到目标物"（物体—容器/物体—罐顶），
     不依赖任何"内底/盘面"的推算（这正是旧版 t5 离底 55mm 松手的原因）。
+
+    ⚠ 例外（**平放/斜躺**的被夹物，实测 §8.9）：直直降到"碰到容器沿"再松手，细长物体
+    会顶在沿上不倒进去（实测 t1 平放的瓶子 1/6 卡在沿口，真实最低点 896~913mm）。
+    改成**在容器口上方 ``CONTAINER_DROP_CLEAR`` 处凌空松手** —— 落体测试里同样高度
+    凌空松手 9/9 全部滑到容器内底（最低点 817~827mm）。立姿物仍走原来的"接触即停"，
+    其它任务一字不变。
     """
     def safe_z():
         return scene_rim_z(sess, exclude=obj) + 0.03 + held_offset(sess, obj)
 
+    lying = not is_upright(sess, obj)          # 抓住之后物体的姿态仍是平躺的
     yield from ramp(sess,
                     lambda c: np.array([c[0], c[1], safe_z()]),
                     yaw=sess.grasp_yaw, step=LIFT_STEP, frames=200, label="抬到安全高度")
@@ -823,10 +982,21 @@ def place_object(sess, obj: str, target: str | None) -> tuple[bool, str]:
 
     def down(_cur):
         c = center(sess, target) if target else np.array([*sess.task["success"]["xy"], 0.0])
-        return np.array([c[0], c[1], 0.80 + 0.005 + held_offset(sess, obj)])
+        z = 0.80 + 0.005 + held_offset(sess, obj)          # 物体底面落到桌面（旧行为）
+        if lying and target is not None:                   # 平放物：在容器口上方凌空松手
+            z = scene_rim_z(sess, exclude=obj) + CONTAINER_DROP_CLEAR + held_offset(sess, obj)
+        return np.array([c[0], c[1], z])
 
     yield from ramp(sess, down, yaw=sess.grasp_yaw, step=DESCEND_STEP, frames=300,
                     stop=stop, label="下降放置")
+    if lying and target is not None:
+        # ⚠ 平放物松手前要**拿"被夹物的中心"再对准一次篮子中心**：一是低位伺服有 5~15mm
+        # 静态漂移，二是物体本身相对 TCP 就可能偏十几毫米（夹得偏一点、抬起时再滑一点）。
+        # 而"瓶子重心偏离篮子中心"正是它架在沿口、判分失败的**直接原因**（实测四个朝向
+        # 20 局里坏 4 局，坏的那几局判分水平偏差都只有 14~16mm —— 就差这几毫米倒不进去）。
+        # 此时瓶子悬在篮口上方 15mm，横move 不会碰到篮子，align_xy 自己还限了 12mm 偏置量。
+        yield from align_xy(sess, tg[:2], sess.grasp_yaw, float(tcp(sess)[2]), rounds=3,
+                            ref=lambda s: center(s, obj)[:2])
     for _ in range(12):                     # 放稳再松手（不额外下压，避免把容器压翻）
         yield f"放稳（{how['why']}）"
     ok, detail = yield from release_object(sess, obj)

@@ -52,9 +52,22 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from alicia_ik import AliciaIK, finger_targets  # noqa: E402
-from libero_catalog import catalog_object, load_catalog  # noqa: E402
+from libero_catalog import (  # noqa: E402
+    catalog_object,
+    load_catalog,
+    quat_from_axis_angle,
+    quat_to_mat,
+)
 from libero_scene import TABLE_TOP_Z  # noqa: E402
-from libero_tasks import TASKS, build_task_scene, check_success, sample_spawn  # noqa: E402
+from libero_tasks import (  # noqa: E402
+    TASKS,
+    as_spawn_pose,
+    build_task_scene,
+    check_success,
+    placed_pose,
+    sample_spawn,
+    SpawnPose,
+)
 import skills  # noqa: E402  （闭环技能库：接触/跟随判据驱动的自动执行）
 
 VIEW_W, VIEW_H = 900, 640          # 离屏渲染分辨率
@@ -94,7 +107,7 @@ class SimSession:
         self.grasp_yaw = self._grasp_yaw(task)
         # 随机安放（任务多样化）：随机源 + "AABB 中心 → body 原点"的 xy 偏移（见 _apply_spawn）
         self.spawn_rng = np.random.default_rng(spawn_seed)
-        self.spawn: dict[str, tuple[float, float]] = {}
+        self.spawn: dict[str, SpawnPose] = {}
         self.spawn_offset: dict[str, np.ndarray] = {}
         for region_name in task.get("spawn_region", {}):
             entry = next((e for e in task["objects"]
@@ -106,33 +119,59 @@ class SimSession:
                                               - np.asarray(entry["xy"], dtype=float))
         self.reset()
 
-    def _grasp_yaw(self, task: dict) -> float:
-        """用素材分析结果决定夹爪的闭合方向（偏航角）。
+    def _grasp_yaw(self, task: dict, quat=None) -> float:
+        """用素材分析结果决定夹爪的闭合方向（偏航角，**按物体实际姿态算**）。
 
         ⚠ 踩坑：夹爪是平行开合，**必须沿物体的窄边闭合**。
         实测番茄酱 56×37mm，若沿 56mm 侧闭合，50mm 开口根本夹不上，
         搬运途中就掉了（最后掉到地上）。这里按 catalog 里 AABB 的较短边自动选方向：
         窄边在 X → 闭合轴沿 X（yaw=0）；窄边在 Y → 闭合轴沿 Y（yaw=90°）。
+
+        姿态随机之后（§8.9：瓶子可能平放、还斜 45°）不能再按"世界 X/Y 谁短"猜 ——
+        那是**包围盒**的短边，斜躺时骨架会退化成一个近似正方形（实测 45° 时 AABB 129×129mm），
+        猜错就会横着扎进瓶身。改成把物体的**局部薄轴**（catalog 里最薄的那条边）转到世界
+        坐标系，再取它的水平方向 —— 对任意姿态都成立；立着时结果与旧算法完全一致
+        （薄轴是局部 Y → yaw=90°）。
+
+        薄轴本来就**竖直**的物体（例如 t6 那本平放的书，厚度方向朝上）没法水平闭合，
+        退回旧规则"按物体横截面的短边 + 任务里的 yaw"。
         """
+        name = task["grasp_object"]
+        obj = catalog_object(self.catalog, name)
         objects = {item["key"]: item for item in task["objects"]}
-        item = objects.get(task["grasp_object"]) or next(
-            (v for k, v in objects.items() if k.endswith("/" + task["grasp_object"])), None)
+        item = objects.get(name) or next(
+            (v for k, v in objects.items() if k.endswith("/" + name)), None)
         obj_yaw = float(item.get("yaw", 0.0)) if item else 0.0
-        obj = catalog_object(self.catalog, task["grasp_object"])
-        narrow_is_x = obj["size"][0] <= obj["size"][1]
-        return obj_yaw + (0.0 if narrow_is_x else 90.0)
+        local = np.asarray(obj["size"], dtype=float)
+        thin = np.zeros(3)
+        thin[int(np.argmin(local))] = 1.0                 # 局部最薄的那条边 = 夹爪要闭合的方向
+        rot = quat_to_mat(np.asarray(quat, dtype=float) if quat is not None
+                          else quat_from_axis_angle("z", obj_yaw))
+        world = rot @ thin
+        if abs(world[2]) > 0.9:                           # 薄轴竖直 → 平行夹爪没法水平闭合
+            narrow_is_x = obj["size"][0] <= obj["size"][1]
+            return obj_yaw + (0.0 if narrow_is_x else 90.0)
+        yaw = math.degrees(math.atan2(world[1], world[0]))
+        # 躺姿再折算到"负角"那半圈（等价方向，见 skills.reachable_yaw 的实测说明）
+        return yaw if skills.is_upright(self, name) else skills.reachable_yaw(yaw)
 
     def reset(self, resample: bool = True) -> None:
         """回到任务初始状态（物体按 XML 初始位姿复位）。
 
-        ``resample=True``（默认）：带 ``spawn_region`` 的抓取物**重新抽一个位置** ——
+        ``resample=True``（默认）：带 ``spawn_region`` 的抓取物**重新抽一个位置/姿态** ——
         所以界面上的"复位"= 换一局新摆位（任务多样化的入口）；``resample=False``：
-        沿用本次会话已抽到的位置（可复现的实验用，例如基准脚本按种子生成的每一局）。
+        沿用本次会话已抽到的摆位（可复现的实验用，例如基准脚本按种子生成的每一局）。
         """
         mujoco.mj_resetData(self.model, self.data)
         if resample:
             self.spawn = sample_spawn(self.task, self.spawn_rng, self.catalog)
         self._apply_spawn()
+        # ⚠ 必须先 mj_forward 把 xpos/xquat 刷新出来，下面 _grasp_yaw 里的 is_upright 才读得到
+        # 本局真实姿态（mj_resetData 之后这些派生量还是旧的/零，会让"立着"被误判成"平放"，
+        # 闭合轴被折算成 −90°）。
+        mujoco.mj_forward(self.model, self.data)
+        # 夹爪闭合方向跟着**本局姿态**走（平放/斜躺与立着完全不同），必须在摆位之后重算
+        self.grasp_yaw = self._grasp_yaw(self.task, self._spawned_quat(self.task["grasp_object"]))
         self.joint_target = np.zeros(6)
         self.gripper = 1.0
         self.apply_control()
@@ -141,20 +180,37 @@ class SimSession:
         # 零位（6 关节目标全 0）下的末端位置：技能库"回程"的终点，见 skills.return_home
         self.home_tcp = self.tcp_position().copy()
 
-    def _apply_spawn(self) -> None:
-        """把随机抽到的 XY 写进物体自由关节。
+    def _spawned_quat(self, name: str):
+        """本局该物体的姿态四元数（没随机姿态就返回 None = 沿用 XML）。"""
+        entry = self.spawn.get(name)
+        return as_spawn_pose(entry).quat if entry is not None else None
 
-        只动 x/y：z 与朝向沿用 XML（``SceneBuilder`` 已把底面精确摆在桌面上），
-        所以瓶子还是立着的、偏航角也不变 —— 夹爪闭合方向不受随机化影响。
+    def _apply_spawn(self) -> None:
+        """把随机抽到的位姿写进物体自由关节。
+
+        没有随机姿态时只动 x/y：z 与朝向沿用 XML（``SceneBuilder`` 已把底面精确摆在桌面上）。
+        有随机姿态时（§8.9 的"平放"）用 ``placed_pose`` 重算 body 位置：平放是**侧面**贴桌，
+        沿用立姿的 z 会让瓶子悬空或穿桌；同时把抽到的四元数写进自由关节。
         """
-        for name, (x, y) in self.spawn.items():
-            offset = self.spawn_offset.get(name)
+        for name, raw in self.spawn.items():
+            pose = as_spawn_pose(raw)
+            x, y = pose.xy
             try:
                 adr = self.model.jnt_qposadr[self.model.joint(f"{name}_joint").id]
             except Exception:  # noqa: BLE001  物体不是自由关节就跳过
                 continue
-            self.data.qpos[adr] = x + (float(offset[0]) if offset is not None else 0.0)
-            self.data.qpos[adr + 1] = y + (float(offset[1]) if offset is not None else 0.0)
+            if pose.quat is None:
+                offset = self.spawn_offset.get(name)
+                self.data.qpos[adr] = x + (float(offset[0]) if offset is not None else 0.0)
+                self.data.qpos[adr + 1] = y + (float(offset[1]) if offset is not None else 0.0)
+                continue
+            key = next((e["key"] for e in self.task["objects"]
+                        if e.get("name", e["key"].split("/")[-1]) == name), None)
+            if key is None:
+                continue
+            pos, quat = placed_pose(key, (x, y), pose.quat, self.catalog)
+            self.data.qpos[adr:adr + 3] = pos
+            self.data.qpos[adr + 3:adr + 7] = quat
 
     # ── 控制 ──
     def apply_control(self) -> None:
@@ -236,11 +292,16 @@ class SimSession:
         return text + ("；" + report if report else "")
 
     def spawn_report(self) -> str:
-        """本局随机安放的位置（没有 ``spawn_region`` 的任务返回空串）。"""
+        """本局随机安放的位姿（没有 ``spawn_region`` 的任务返回空串）。"""
         if not self.spawn:
             return ""
-        parts = [f"{name} ({x * 1000:+.0f}, {y * 1000:+.0f}) mm"
-                 for name, (x, y) in self.spawn.items()]
+        parts = []
+        for name, raw in self.spawn.items():
+            pose = as_spawn_pose(raw)
+            text = f"{name} ({pose.xy[0] * 1000:+.0f}, {pose.xy[1] * 1000:+.0f}) mm"
+            if pose.quat is not None:
+                text += f"·{pose.label}"
+            parts.append(text)
         return "本局随机安放 " + "、".join(parts)
 
 

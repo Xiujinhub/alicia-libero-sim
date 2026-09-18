@@ -26,6 +26,8 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import numpy as np
 
 from libero_catalog import (
@@ -33,6 +35,7 @@ from libero_catalog import (
     catalog_object,
     load_catalog,
     quat_from_axis_angle,
+    quat_mul,
     rotate_boxes,
 )
 from libero_scene import TABLE_HALF, TABLE_TOP_Z, SceneBuilder
@@ -50,17 +53,24 @@ TASKS: list[dict] = [
             # 篮子单独配重：素材默认 density=100（泡沫级，仅 136g），机械臂经过时会被撞走
             {"key": "stable_scanned_objects/basket", "xy": [0.22, 0.10], "yaw": 0.0, "density": 1500},
         ],
-        # 任务多样化：抓取物**和篮子**每次随机安放（都立着、朝向不变），只在机械臂工作范围内的小
-        # 矩形里抽。这是**运行时**行为（SimSession 抽完后写进物体的自由关节）；场景 XML 里仍写上面
-        # 那两个标称位置，以便 build_all_scenes / render_preview 产出的图固定可比。
+        # 任务多样化：抓取物**和篮子**每次随机安放（瓶子位置 + 姿态都随机），只在机械臂工作范围内
+        # 的小矩形里抽。这是**运行时**行为（SimSession 抽完后写进物体的自由关节）；场景 XML 里仍写
+        # 上面那两个标称位置（瓶子立着），以便 build_all_scenes / render_preview 产出的图固定可比。
         # 区域怎么定的见 README §8.9。
         # 抓取物上沿取到 -0.10（而不是 -0.06）：网格实测 (0.00,-0.06) 这个"离底座只有 277mm"的角点
         # 会让手指把瓶子碰倒（实时宽度 37→122mm、连续 4 档都夹空），其余 19 个格点全过。
-        # 篮子区域：离底座 0.42~0.58m（`set_ee_target` 的舒适半径 0.62m 之内），且与抓取物区域
-        # 保持"两个外接圆 + 25mm 间隙"的余量（33.6 + 115.6 + 25 ≈ 174mm）；4×4 网格 + 角点组合
-        # 实测全过（判分水平偏差最大 37mm / 容差 55mm）。
+        # 姿态："立着" 或 "平放"（各 50%）。平放还会**随机长轴朝向**，但生成前会把它
+        #   适配到实测能过关的角度（`SPAWN_LYING_YAWS`：4 个"斜躺"角度，见那里的实测表）；
+        #   瓶子长 145.6mm 比篮子内腔（122×111mm）还长，长轴与篮子边平行时必卡在沿口。
+        #   位置与姿态都在**运行时**生效，机制见 README §8.9。
         "spawn_region": {
-            "ketchup": {"x": [0.00, 0.18], "y": [-0.24, -0.10]},
+            "ketchup": {"x": [0.00, 0.18], "y": [-0.24, -0.10],
+                        "poses": ["upright", "lying"],
+                        # 平放还要单独收紧位置：躺姿的抓取点比立姿低约 90mm（TCP 要压到
+                        # 810~830mm），而机械臂在远端压不到那么低（实测离底座 ≥400mm 时
+                        # TCP 停在 ~870mm 且 xy 漂 5~20mm，手指会偏进瓶身）。
+                        # 所以"平放"只出现在够得着的近处，"立着"仍用整个区域。
+                        "pose_regions": {"lying": {"x": [0.00, 0.08], "y": [-0.24, -0.10]}}},
             "basket": {"x": [0.14, 0.28], "y": [0.02, 0.20]},
         },
         "grasp_object": "ketchup",
@@ -210,7 +220,7 @@ TASKS: list[dict] = [
 ]
 
 
-# ─────────────────── 任务多样化：抓取物随机安放 ───────────────────
+# ─────────────────── 任务多样化：抓取物随机安放（位置 + 姿态） ───────────────────
 SPAWN_TRIES = 200
 """随机安放的拒绝采样上限（区域里可能被其它物体的占地挡住一部分）。"""
 SPAWN_CLEARANCE = 0.025
@@ -218,31 +228,166 @@ SPAWN_CLEARANCE = 0.025
 SPAWN_TABLE_MARGIN = 0.06
 """随机安放区域距桌沿至少留的余量（米），免得瓶子被摆到桌子边缘外掉下去。"""
 
+# 平放姿态：绕**局部 Y**（瓶子最薄的那条边）转 90°，长轴就从竖直变成水平（= 平放），
+# 而且薄边仍然水平 —— 平行夹爪才夹得住；再绕**世界 Z** 转 θ（长轴朝向）决定躺的方向。
+_LAY_Y = quat_from_axis_angle("y", 90.0)
+
+
+def lying_quat(theta_deg: float) -> tuple[float, float, float, float]:
+    """平放姿态：长轴指向世界 θ 角（θ=225 就是以前写死的 ``laid_225``）。"""
+    return quat_mul(quat_from_axis_angle("z", float(theta_deg)), _LAY_Y)
+
+
+SPAWN_LYING_YAWS = (45.0, 140.0, 215.0, 320.0)
+"""平放允许的长轴朝向（度）。**朝向随机**，但只在实测"能过关"的角度里抽。
+
+⚠ 这张表是逐角度量出来的（脚本 ``_tools\\diag_t1_yaw_sweep.py``：把瓶子按长轴 θ 摆到
+篮子中心正上方、瓶底在篮口上方 15mm 凌空松手，落定后看判据；每角度测 9 个落点 ——
+中心 + 8 向 15mm 偏移，模拟真实放置误差）：
+
+| 长轴朝向 θ | 全落点通过 | 说明 |
+| --- | --- | --- |
+| 40°, 45° | **9/9** | 45° 家族 ✓ |
+| 140°, 150° | **9/9** | 145° 附近 ✓ |
+| 205°, 210°, 225° | **9/9** | 斜对角家族 ✓ |
+| 320° | **9/9** | 320° 附近 ✓ |
+| 75°~105°、255°~285° | **0~2/9** | 长轴几乎与篮子边平行 —— 瓶子比内腔还长，必卡在沿口 |
+| 其余（0°/15°/…/350°） | 2~8/9 | 对落点偏移太敏感，不用 |
+
+四组角度大致相隔 90°（都在"斜躺"族里），少量偏差是瓶身重心偏在瓶体那端造成的。
+``adapt_lying_yaw`` 就是把任意随机角度**折到这张表里最近的一个** —— 这就是"生成前
+调整角度适配"的那一步。"""
+
+
+def adapt_lying_yaw(theta_deg: float, allowed=SPAWN_LYING_YAWS) -> float:
+    """把随机抽到的长轴朝向**适配**到允许的角度（取最近的一个，考虑 0/360 环绕）。"""
+    candidates = list(allowed)
+    return min(candidates, key=lambda a: abs((float(theta_deg) - a + 180.0) % 360.0 - 180.0))
+
+
+SPAWN_POSE_QUATS: dict[str, tuple[float, float, float, float]] = {
+    "upright": (1.0, 0.0, 0.0, 0.0),                       # 立着（= XML 里的姿态）
+    **{f"laid_{t:g}": lying_quat(t) for t in SPAWN_LYING_YAWS},
+}
+"""姿态名 → 物体**局部位姿**要乘的四元数（作用在 catalog 的碰撞盒上）。
+
+``lying`` / ``laid`` 是**类别**，由 ``pick_spawn_pose`` 现场抽角度 + 适配（见上表）；
+直接写具体名字（如 ``laid_45``）也可以。"""
+
+SPAWN_POSE_LABELS = {"upright": "立着", "lying": "平放"}
+"""界面上显示用的中文名。"""
+
+
+def posed_boxes(key: str, quat, catalog: dict) -> list:
+    """catalog 的碰撞盒**按给定姿态旋转后**的盒子（``quat=None`` = 原样）。"""
+    obj = catalog_object(catalog, key)
+    boxes = [([float(v) for v in pos], [float(v) for v in q], [float(v) for v in size])
+             for pos, q, size in obj["boxes"]]
+    return rotate_boxes(boxes, quat) if quat is not None else boxes
+
+
+def footprint_radius_boxes(boxes) -> float:
+    """一组（已带姿态的）盒子在世界 XY 上的**外接圆半径**（米）。"""
+    lo, hi = boxes_aabb(boxes)
+    return 0.5 * float(np.hypot(hi[0] - lo[0], hi[1] - lo[1]))
+
+
+def placed_pose(key: str, xy, quat, catalog: dict) -> tuple[list, tuple]:
+    """给定"姿态 + AABB 中心要落在的世界 xy"，返回物体 body 的 ``(位置, 四元数)``。
+
+    和 ``SceneBuilder.placed_boxes`` 同一套算法（AABB 中心落在 xy、底面正好贴桌面），
+    只是这里的姿态是任意四元数（不只是绕 Z 的偏航角）。平放时必须重新算 z：
+    立着时底面在瓶子底部，平放时是**侧面**贴桌 —— 沿用 XML 的 z 会让瓶子悬空/穿桌。
+    """
+    boxes = posed_boxes(key, quat, catalog)
+    lo, hi = boxes_aabb(boxes)
+    pos = [float(xy[0]) - (lo[0] + hi[0]) / 2.0,
+           float(xy[1]) - (lo[1] + hi[1]) / 2.0,
+           TABLE_TOP_Z - float(lo[2])]
+    return pos, (tuple(quat) if quat is not None else (1.0, 0.0, 0.0, 0.0))
+
 
 def footprint_radius(key: str, yaw_deg: float, catalog: dict) -> float:
     """物体水平占地的**外接圆半径**（米）。随机安放时用它判断"会不会和旁边的东西叠在一起"。
 
     摆放约定（见 ``SceneBuilder.placed_boxes``）：物体 AABB 中心落在任务给的 ``xy`` 上，
     所以两个物体的世界 XY 距离 > ``r_a + r_b + 间隙`` 就一定不重叠。
+
+    默认 = 物体**立着**（XML 里的姿态）、再绕 Z 转 ``yaw_deg``；随机姿态的占地用
+    ``footprint_radius_boxes(posed_boxes(...))`` 算（平放的瓶子占地会大一圈：33.6 → 73mm）。
     """
     obj = catalog_object(catalog, key)
     boxes = [([float(v) for v in pos], [float(v) for v in quat], [float(v) for v in size])
              for pos, quat, size in obj["boxes"]]
     if abs(yaw_deg) > 1e-6:
         boxes = rotate_boxes(boxes, quat_from_axis_angle("z", yaw_deg))
-    lo, hi = boxes_aabb(boxes)
-    return 0.5 * float(np.hypot(hi[0] - lo[0], hi[1] - lo[1]))
+    return footprint_radius_boxes(boxes)
+
+
+class SpawnPose(NamedTuple):
+    """本局某个物体的摆位：AABB 中心的世界 XY + 姿态四元数（``None`` = 沿用 XML 的立姿）。"""
+
+    xy: tuple[float, float]
+    quat: tuple[float, float, float, float] | None = None
+    pose: str = "upright"                      # "upright" / "lying"（任务里写的姿态类别）
+    detail: str = ""                           # 实际抽到的姿态名（如 "laid_45"），给界面显示
+
+    @property
+    def label(self) -> str:
+        """界面上显示的姿态中文名。"""
+        return SPAWN_POSE_LABELS.get(self.pose, self.pose)
+
+
+def as_spawn_pose(value) -> SpawnPose:
+    """把 ``(x, y)`` / ``SpawnPose`` 统一成 ``SpawnPose``（脚本、测试直接写位置时用）。
+
+    允许 ``sess.spawn = {"ketchup": (x, y)}`` 这种旧写法继续能用 —— 那时按"立着"处理。
+    """
+    if isinstance(value, SpawnPose):
+        return value
+    if len(value) == 2 and not hasattr(value[0], "__len__"):
+        return SpawnPose((float(value[0]), float(value[1])))
+    xy, quat, pose = (list(value) + [None, "upright"])[:3]
+    return SpawnPose((float(xy[0]), float(xy[1])),
+                     tuple(quat) if quat is not None else None, pose)
+
+
+def pick_spawn_pose(box: dict, rng) -> tuple[str, str, tuple | None]:
+    """按区域配置抽一个姿态，返回 ``(姿态类别, 实际姿态名, 四元数)``。
+
+    ``box["poses"]`` 写的是**姿态类别**（如 ``["upright", "lying"]``，各 50%）：
+
+    * ``upright``：沿用 XML 的姿态与 z（**四元数返回 None**）→ 立姿局一个字节不变；
+    * ``lying``（别名 ``laid``）：**先随机抽长轴朝向，再适配到允许的角度**
+      （``adapt_lying_yaw`` → ``SPAWN_LYING_YAWS``），最后 ``lying_quat`` 转成四元数。
+      区域里可以用 ``lying_yaws`` 覆盖"允许的角度表"。
+
+    没写 ``poses`` 就一律"立着"。
+    """
+    tokens = list(box.get("poses") or ("upright",))
+    token = tokens[int(rng.integers(len(tokens)))]
+    if token in ("lying", "laid"):
+        allowed = tuple(box.get("lying_yaws") or SPAWN_LYING_YAWS)
+        theta = adapt_lying_yaw(float(rng.uniform(0.0, 360.0)), allowed)
+        return "lying", f"laid_{theta:g}", lying_quat(theta)
+    if token == "upright":
+        return token, token, None
+    return token, token, SPAWN_POSE_QUATS[token]
 
 
 def sample_spawn(task: dict, rng=None, catalog: dict | None = None) -> dict:
-    """按 ``task["spawn_region"]`` 随机抽物体的初始 XY，返回 ``{物体名: (x, y)}``。
+    """按 ``task["spawn_region"]`` 随机抽物体的初始位姿，返回 ``{物体名: SpawnPose}``。
 
-    只改 XY：物体在 XML 里的 **z 与朝向不动**（所以瓶子还是立着的、还是那个偏航角，
-    夹爪的闭合方向不受影响）。抽到的位置要同时满足
+    位置只改 XY（z 由姿态和桌面重新算，见 ``placed_pose``）；姿态默认**不动**
+    （沿用 XML 的立姿），只有区域里写了 ``poses`` 才会随机（t1：立着 / 平放）。
+    抽到的位置要同时满足
 
     1. 落在任务里写的小矩形内（该矩形是按"抓取成功率"实测选出来的，见 README §8.9）；
-    2. 与**其它物体占地**（外接圆 + ``SPAWN_CLEARANCE``）不重叠；
+    2. 与**其它物体占地**（外接圆 + ``SPAWN_CLEARANCE``）不重叠 —— 半径按**抽到的姿态**算
+       （平放的瓶子占地 33.6 → 73mm，不按姿态算就会叠在一起）；
     3. 距桌沿留 ``SPAWN_TABLE_MARGIN``（区域被桌沿裁掉时自动收紧）。
+
+    抽到姿态**之后**才算占地，所以"平放"会挤占更多空间、可放的点更少（拒绝采样自己会躲开）。
 
     ``spawn_region`` 里有多个物体时（t1：番茄酱 + 篮子）**按书写顺序依次抽**，
     后面的物体避让前面**已经抽到的实际位置**（而不是标称位置）—— 否则两个随机物
@@ -257,23 +402,36 @@ def sample_spawn(task: dict, rng=None, catalog: dict | None = None) -> dict:
     rng = rng if rng is not None else np.random.default_rng()
     catalog = catalog or load_catalog()
     items = {item.get("name", item["key"].split("/")[-1]): item for item in task["objects"]}
-    out: dict[str, tuple[float, float]] = {}
+    out: dict[str, SpawnPose] = {}
     for name, box in region.items():
         item = items[name]
         key, yaw = item["key"], float(item.get("yaw", 0.0))
         nominal = np.asarray(item.get("xy", (0.2, 0.0)), dtype=float)
-        r_self = footprint_radius(key, yaw, catalog)
-        # 其它物体：若它也在 region 里且已经抽过 → 用抽到的实际位置；否则用任务里写死的位置
+        pose, detail, quat = pick_spawn_pose(box, rng)
+        # 姿态可以有自己的矩形（``pose_regions``）：例如"平放"只在机械臂够得着的近处出现，
+        # 因为躺姿的抓取点更低、远端压不下去（见 t1 的 spawn_region 注释）。
+        # 键可以写姿态类别（``lying``）也可以写实际朝向名（``laid_225``）。
+        pose_areas = box.get("pose_regions", {})
+        area = pose_areas.get(detail) or pose_areas.get(pose) or box
+        r_self = (footprint_radius_boxes(posed_boxes(key, quat, catalog)) if quat is not None
+                  else footprint_radius(key, yaw, catalog))
+        # 其它物体：若它也在 region 里且已经抽过 → 用抽到的**姿态+位置**；否则用任务里写死的位置
         blocked = []
         for other_name, other in items.items():
             if other_name == name:
                 continue
-            r_other = footprint_radius(other["key"], float(other.get("yaw", 0.0)), catalog)
-            other_xy = out.get(other_name, other.get("xy", (0.2, 0.0)))
+            other_self = out.get(other_name)
+            if other_self is not None and other_self.quat is not None:
+                r_other = footprint_radius_boxes(
+                    posed_boxes(other["key"], other_self.quat, catalog))
+                other_xy = other_self.xy
+            else:
+                r_other = footprint_radius(other["key"], float(other.get("yaw", 0.0)), catalog)
+                other_xy = other_self.xy if other_self else other.get("xy", (0.2, 0.0))
             blocked.append((np.asarray(other_xy, dtype=float), r_other))
-        lo = np.maximum(np.array([box["x"][0], box["y"][0]], dtype=float),
+        lo = np.maximum(np.array([area["x"][0], area["y"][0]], dtype=float),
                         -TABLE_HALF + SPAWN_TABLE_MARGIN)
-        hi = np.minimum(np.array([box["x"][1], box["y"][1]], dtype=float),
+        hi = np.minimum(np.array([area["x"][1], area["y"][1]], dtype=float),
                         TABLE_HALF - SPAWN_TABLE_MARGIN)
         pick = nominal
         for _ in range(SPAWN_TRIES):
@@ -282,7 +440,7 @@ def sample_spawn(task: dict, rng=None, catalog: dict | None = None) -> dict:
                    for xy, r in blocked):
                 pick = cand
                 break
-        out[name] = (float(pick[0]), float(pick[1]))
+        out[name] = SpawnPose((float(pick[0]), float(pick[1])), quat, pose, detail)
     return out
 
 
@@ -336,6 +494,32 @@ def object_world_aabb(model, data, catalog: dict, name: str):
     return corners.min(axis=0), corners.max(axis=0)
 
 
+def object_lowest_z(model, data, catalog: dict, name: str) -> float:
+    """物体**碰撞盒角点**里最低的那个 z（"真正的最低材料点"）。
+
+    和 ``object_world_aabb`` 的 ``lo[2]`` 的区别：AABB 用的是"物体**局部 AABB** 的 8 个角点"，
+    对**斜放**的物体那个角点往往是**空的** —— 实测平放进篮子的瓶子：AABB 底面 806mm（相对
+    桌面 +6mm，只差 6mm 就会被 z 判据判失败），而真实最低点 821mm 正压在篮底（+21mm）。
+    轴对齐时两者完全相同（其余 8 关的姿态都是轴对齐的，判据一字不变）。
+    """
+    import itertools
+
+    from libero_catalog import normalize_quat, quat_to_mat
+
+    body_id = model.body(name).id
+    obj = catalog_object(catalog, name)
+    rot = quat_to_mat(data.xquat[body_id])
+    org = data.xpos[body_id]
+    z_min = np.inf
+    for bpos, bquat, bsize in obj["boxes"]:
+        brot = quat_to_mat(normalize_quat(bquat))
+        half = np.asarray(bsize, dtype=float)
+        for corner in itertools.product(*zip(-half, half)):
+            point = org + rot @ (np.asarray(bpos, dtype=float) + brot @ np.asarray(corner))
+            z_min = min(z_min, float(point[2]))
+    return float(z_min)
+
+
 def check_success(task: dict, model, data, catalog: dict | None = None) -> tuple[bool, str]:
     """检查任务是否完成，返回 (是否成功, 说明文字)。"""
     catalog = catalog or load_catalog()
@@ -356,7 +540,9 @@ def check_success(task: dict, model, data, catalog: dict | None = None) -> tuple
         z_ref = TABLE_TOP_Z + float(target["size"][2])
     else:
         z_ref = TABLE_TOP_Z
-    bottom = float(lo[2] - z_ref)
+    # 用**真实最低点**（碰撞盒角点）而不是 AABB 的 lo[2]：斜放物体的 AABB 底面是空角点，
+    # 会把"已经稳稳放在篮子/盘子里"的情况算低十几毫米（见 ``object_lowest_z``）。
+    bottom = float(object_lowest_z(model, data, catalog, task["grasp_object"]) - z_ref)
 
     ok_xy = error_xy <= spec["xy_tol"]
     # 高度判据留 2mm 弹性：物体静止时可能因接触软约束略低于基准（实测 -0.4mm 会被判失败）
