@@ -208,11 +208,16 @@ class SimSession:
                 self.data.qpos[adr] = x + (float(offset[0]) if offset is not None else 0.0)
                 self.data.qpos[adr + 1] = y + (float(offset[1]) if offset is not None else 0.0)
                 continue
-            key = next((e["key"] for e in self.task["objects"]
-                        if e.get("name", e["key"].split("/")[-1]) == name), None)
-            if key is None:
+            entry = next((e for e in self.task["objects"]
+                          if e.get("name", e["key"].split("/")[-1]) == name), None)
+            if entry is None:
                 continue
-            pos, quat = placed_pose(key, (x, y), pose.quat, self.catalog)
+            pos, quat = placed_pose(entry["key"], (x, y), pose.quat, self.catalog)
+            # 物体要**坐在容器内底面**上时（t9：番茄酱立在木托盘里，z_offset = 内底高度 7.7mm），
+            # 抬高量必须跟"无姿态"分支保持一致 —— 那条分支沿用 XML 的 z（已含 z_offset），
+            # 这里不补的话瓶子会陷进托盘地板 7.7mm（实测会卡住/歪倒）。其余任务的 z_offset = 0，
+            # 所以这一行对它们逐字不变。
+            pos[2] += float(entry.get("z_offset", 0.0))
             self.data.qpos[adr:adr + 3] = pos
             self.data.qpos[adr + 3:adr + 7] = quat
 

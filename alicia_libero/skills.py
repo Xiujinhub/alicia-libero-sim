@@ -107,6 +107,12 @@ GRASP_BAND_LADDER_TASKS: dict[str, tuple[float, ...]] = {
     #     但**搬运途中会滑落**（实测平放局因此整局失败：判分水平偏 292mm、黄油躺在桌面上）。
     #     dz=0 时指面盖住黄油 32mm（807~839mm 对 800~839.5mm），握得实。
     "t2_butter_onto_plate": (0.000, 0.020, 0.045, 0.075),
+    # t9：和 t1 是**同一支瓶子**（ketchup，56.2×36.8×145.6mm、grasp_tcp_offset=+39.8mm），
+    #     所以直接沿用 t1 实测出来的那档：dz=+10mm 让指面多咬住 34.5~35.5mm（+20mm 只咬 25mm，
+    #     是"浅握"）。随机化之后这一档更关键 —— 瓶子在托盘里的位置/朝向每局都不同，
+    #     浅握会在抬起 25mm 的"跟随校验"里**刚好过关**、却在搬运途中滑落（实测：判分偏 409mm、
+    #     瓶子又坐回托盘里，而"抓取/放置"两步都报 ✓）。
+    "t9_ketchup_out_of_tray": (0.010, 0.020, 0.000, 0.045, 0.075),
 }
 """逐任务的抓取高度档位覆盖（覆盖 ``GRASP_BAND_LADDER``；列表顺序 = 尝试顺序）。
 
@@ -594,7 +600,8 @@ def align_xy(sess, goal_xy, yaw: float, z: float, rounds: int = 3,
     return float(np.linalg.norm(err)) < 0.006
 
 
-YAW_CALIBRATED_TASKS = {"t2_butter_onto_plate", "t7_stack_pudding_on_can"}
+YAW_CALIBRATED_TASKS = {"t2_butter_onto_plate", "t7_stack_pudding_on_can",
+                        "t9_ketchup_out_of_tray"}
 """需要"**实测校准**夹爪闭合轴"的任务；其余任务保持原 ``yaw_for_axis`` 约定不动。
 
 ⚠ 为什么只给 t2 开（实测记录，见下）：``yaw`` 与"真实闭合轴"**不是**注释里写的那种
@@ -1153,6 +1160,24 @@ def push_object(sess, obj: str, speed: float = 0.0025) -> tuple[bool, str]:
 
 # ────────────────────────────── 每关的动作骨架 ──────────────────────────────
 
+LIFT_OVER_GRASP_TASKS = {"t9_ketchup_out_of_tray"}
+"""开局"抬臂准备"的高度**连被抓物一起算**（``max(其它物体最高点, 被抓物顶面) + 60mm``）的任务。
+
+⚠ 为什么只给 t9 开（实测，脚本 ``_tools\\diag_t9_grasp.py`` 逐帧追踪）：开局/复位后 TCP 停在
+零位 ``(42, 0, 908)mm``，而"抬臂准备"的高度原本只按**其它物体**算（``scene_rim_z(exclude=obj)``），
+t9 里就是木托盘沿 **881mm** → 抬到 941mm 就开始横移。可 t9 的番茄酱瓶顶在 **953mm**
+（抓取物自己才是现场最高的东西），于是张开的手指（指尖比 TCP 低 ~35mm、两指各在 TCP 两侧
+25~35mm）正好在瓶身高度段（808~953mm）里横扫过去：
+
+| 配置 | 旧行为（抬到 941mm 再横移） | 抬高到瓶顶之上（1013mm） |
+| --- | --- | --- |
+| 瓶在托盘中心、托 (25,5)、瓶朝向 45° | 第 1 帧还在 (68.8, 20.2, 881) 立着，**第 15 帧就变成躺着 (112.4, −25.1, 864)** —— 被撞倒、还被拖出托盘 88mm ✗ | 瓶子原地不动 ✓ |
+
+撞倒之后：抓取 4 档全空（"物体宽"被量成 141mm = 高度），瓶子最后躺在托盘外，判分偏 261~579mm。
+抬高之后横移发生在 1013mm（= ``approach_z``，瓶顶之上 60mm），指尖 978mm > 瓶顶 953mm ✓ 全清。
+其它任务不列进这个集合，"抬臂准备"逐字不变。"""
+
+
 def script_for(sess):
     """按任务的 ``kind`` 组装一条技能流水线（生成器，返回值 = 每步结果列表）。
 
@@ -1167,9 +1192,17 @@ def script_for(sess):
     sess.gripper = 1.0
 
     # 0) 先抬到"全场最高点之上"再横移：开局/复位后 TCP 可能贴着桌面，直接横扫会撞东西
+    #    ⚠ 高度默认只算**其它物体**（``exclude=obj``）；t9 的瓶子本身就是现场最高的东西，
+    #    必须连它一起算 —— 否则横移时手指从瓶身里扫过、把瓶子撞倒拖出托盘
+    #    （见 ``LIFT_OVER_GRASP_TASKS``，只对该集合里的任务生效，其它关卡逐字不变）。
+    over_grasp = task.get("id") in LIFT_OVER_GRASP_TASKS
+
+    def prep_z():
+        rim = scene_rim_z(sess, exclude=obj)
+        return (max(rim, top_z(sess, obj)) if over_grasp else rim) + 0.06
+
     yield from ramp(sess,
-                    lambda c: np.array([c[0], c[1],
-                                        scene_rim_z(sess, exclude=obj) + 0.06]),
+                    lambda c: np.array([c[0], c[1], prep_z()]),
                     yaw=sess.grasp_yaw, step=LIFT_STEP, frames=200, label="抬臂准备")
     if kind == "push":
         ok, detail = yield from push_object(sess, obj)

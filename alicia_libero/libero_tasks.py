@@ -274,7 +274,8 @@ TASKS: list[dict] = [
         "kind": "from",
         "difficulty": "★★★",
         "task_text": "番茄酱现在立在木托盘里，先夹出来再放到盘子上。",
-        "hint": "瓶高 146mm、托盘边高 82mm——直接从瓶子上部夹出来即可，手腕不用伸进托盘。",
+        "hint": "瓶高 146mm、托盘边高 82mm——直接从瓶子上部夹出来即可，手腕不用伸进托盘。"
+                "（本关瓶子在托盘里的位置随机、朝向随机，托盘与盘子的位置也都随机）",
         "objects": [
             # z_offset = 托盘内底面高度（实测碰撞盒顶面 0.8077）：瓶子要正好坐在托盘里，
             # 抬太高会"掉进托盘"砸倒自己（旧版 z_offset=0.03 就是这么翻的）
@@ -284,9 +285,22 @@ TASKS: list[dict] = [
             {"key": "turbosquid_objects/wooden_tray", "xy": [0.13, 0.04], "yaw": 0.0, "density": 1500},
             {"key": "stable_scanned_objects/plate", "xy": [0.15, -0.12], "yaw": 0.0},
         ],
+        "spawn_region": {
+            # ① 盘子（**先抽**）：x/y 都给足（盘 137.6mm 圆、占地外接圆 97.3mm，全在桌面内）
+            "plate": {"x": [0.04, 0.26], "y": [-0.30, -0.18]},
+            # ② 木托盘（后抽，避让**已抽到的**盘子）：托盘 297×166mm、占地外接圆 170.5mm，
+            #    跟盘子要隔开 170.5 + 97.3 + 25 ≈ 293mm —— 所以放在桌子靠里那半
+            "wooden_tray": {"x": [0.14, 0.24], "y": [0.04, 0.16]},
+            # ③ 番茄酱（**锚在托盘里**）：x/y 是相对托盘的偏移（瓶底坐在托盘内底、跟着托盘走），
+            #    朝向整圆周随机；偏移范围按实测挑（见 README §8.9.4）
+            "ketchup": {"anchor": "wooden_tray", "x": [-0.035, 0.035], "y": [-0.02, 0.02],
+                        "upright_yaws": None},
+        },
         "grasp_object": "ketchup",
         "target_object": "plate",
-        "success": {"xy": [0.15, -0.12], "xy_tol": 0.07, "z_ref": "table", "z_band": [0.0, 0.06]},
+        # ``xy_ref="target"``：盘子随机安放 → 判分取**盘子当前实际中心**（与 t1/t2/t3/t5 同理）
+        "success": {"xy": [0.15, -0.12], "xy_ref": "target", "xy_tol": 0.07,
+                    "z_ref": "table", "z_band": [0.0, 0.06]},
     },
 ]
 
@@ -512,7 +526,12 @@ def sample_spawn(task: dict, rng=None, catalog: dict | None = None) -> dict:
 
     ``spawn_region`` 里有多个物体时（t1：番茄酱 + 篮子）**按书写顺序依次抽**，
     后面的物体避让前面**已经抽到的实际位置**（而不是标称位置）—— 否则两个随机物
-    会按标称位置算避让、实际却可能叠在一起。
+    会按标称位置算避让、实际却可能叠在一起。**书写顺序同时是"谁先抽"**：t9 把盘子写在
+    托盘前面，托盘才能避让"已抽到的盘子"，而不是被盘子的**标称位置**卡死（§8.9.4）。
+
+    区域里写 ``anchor`` 的物体（t9 的番茄酱锚在木托盘里）走另一条路：它的 ``x``/``y`` 是
+    **相对锚点的偏移**，跟着锚点一起走，不参与外接圆避让（它本来就该在锚点的占地里面）；
+    反过来，锚定的物体也不当别人的障碍 —— 它的"标称位置"没有参考价值。
 
     拒绝采样最多 ``SPAWN_TRIES`` 次；实在抽不到就退回任务里写死的 ``xy``（不会抛异常）。
     没有 ``spawn_region`` 的任务直接返回空字典 —— 完全不影响其它任务。
@@ -534,12 +553,32 @@ def sample_spawn(task: dict, rng=None, catalog: dict | None = None) -> dict:
         # 键可以写姿态类别（``lying``）也可以写实际朝向名（``laid_225``）。
         pose_areas = box.get("pose_regions", {})
         area = pose_areas.get(detail) or pose_areas.get(pose) or box
+        # ``anchor``：这个物体必须**待在另一个也被随机安放的物体里**（t9：番茄酱坐在木托盘里，
+        # "从托盘里取物"要求瓶子永远在托盘内底面上）。指到谁，``x``/``y`` 就是**相对谁的偏移**，
+        # 跟着锚点一起走（托盘摆到哪儿、瓶子就跟到哪儿），此时不再做避让/拒绝采样 ——
+        # 瓶子本来就该"在托盘的占地里面"，拿外接圆去避让会把唯一合法的位置全否掉。
+        anchor = box.get("anchor")
+        if anchor:
+            if anchor in out:
+                base = np.asarray(out[anchor].xy, dtype=float)
+            else:
+                base = np.asarray(items[anchor].get("xy", (0.2, 0.0)), dtype=float)
+            off = rng.uniform([area["x"][0], area["y"][0]], [area["x"][1], area["y"][1]])
+            pick = np.clip(base + off, -TABLE_HALF + SPAWN_TABLE_MARGIN,
+                           TABLE_HALF - SPAWN_TABLE_MARGIN)
+            out[name] = SpawnPose((float(pick[0]), float(pick[1])), quat, pose, detail)
+            continue
         r_self = (footprint_radius_boxes(posed_boxes(key, quat, catalog)) if quat is not None
                   else footprint_radius(key, yaw, catalog))
         # 其它物体：若它也在 region 里且已经抽过 → 用抽到的**姿态+位置**；否则用任务里写死的位置
         blocked = []
         for other_name, other in items.items():
             if other_name == name:
+                continue
+            if (region.get(other_name) or {}).get("anchor"):
+                # **锚定在别人身上的物体**（t9：番茄酱坐在托盘里）跟着它的容器走，
+                # 它的"标称位置"没有参考价值 —— 拿它当障碍只会把容器自己的合法位置全否掉
+                # （托盘区域正好盖住番茄酱的标称点 → 200 次全被拒 → 退回标称 = 等于没随机）。
                 continue
             other_self = out.get(other_name)
             if other_self is not None and other_self.quat is not None:

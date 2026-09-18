@@ -460,11 +460,79 @@ def main() -> int:
               f"{len(yaws)} 个：" + " ".join(sorted(yaws)[:6]) + " …")
         check("t5 摆位（位置+姿态+高度+闭合轴）都合规", not bad, "；".join(bad) if bad else "6 局都合规")
 
+    # 11d) t9 三件物体都随机：瓶子（锚在托盘里 + 整圆周朝向）、木托盘、盘子（见 README §8.9.4）
+    def s11d():
+        window.task_combo.setCurrentIndex(8)          # 切到 t9
+        regions = window.session.task.get("spawn_region", {})
+        bot, tray, plate = (regions.get("ketchup"), regions.get("wooden_tray"),
+                            regions.get("plate"))
+        check("t9 瓶子带随机安放区域", bot is not None,
+              f"相对托盘的偏移 x={bot['x']} y={bot['y']}" if bot else "没有 spawn_region")
+        check("t9 瓶子**锚在木托盘里**（anchor，跟着托盘走）",
+              bot is not None and bot.get("anchor") == "wooden_tray",
+              f"anchor={bot.get('anchor') if bot else None}")
+        check("t9 瓶子朝向整圆周随机（upright_yaws=None）",
+              bot is not None and "upright_yaws" in bot and bot["upright_yaws"] is None,
+              f"upright_yaws={bot.get('upright_yaws') if bot else None}")
+        check("t9 木托盘与盘子都带随机安放区域",
+              tray is not None and plate is not None,
+              f"托盘 x={tray['x']} y={tray['y']}；盘子 x={plate['x']} y={plate['y']}"
+              if tray and plate else "托盘或盘子没有 spawn_region")
+        check("t9 判分取盘子当前位置（xy_ref=target）",
+              window.session.task["success"].get("xy_ref") == "target")
+        if bot is None or tray is None or plate is None:
+            return
+        # 三件物体的占地：托盘 297×166mm（外接圆 170.5）、盘 137.6mm（97.3）——随机摆位不能重叠
+        seen, seen_tray, seen_plate, bad = set(), set(), set(), []
+        for _ in range(6):
+            window.callback_reset()
+            sess = window.session
+            bp, tp, pp = (sess.spawn["ketchup"], sess.spawn["wooden_tray"],
+                          sess.spawn["plate"])
+            seen.add((round(bp.xy[0], 4), round(bp.xy[1], 4)))
+            seen_tray.add((round(tp.xy[0], 4), round(tp.xy[1], 4)))
+            seen_plate.add((round(pp.xy[0], 4), round(pp.xy[1], 4)))
+            # ① 瓶子必须落在"托盘位置 + 允许的偏移"里（锚定：x/y 是相对量，不是绝对坐标）
+            dx, dy = bp.xy[0] - tp.xy[0], bp.xy[1] - tp.xy[1]
+            if not (bot["x"][0] - 1e-9 <= dx <= bot["x"][1] + 1e-9
+                    and bot["y"][0] - 1e-9 <= dy <= bot["y"][1] + 1e-9):
+                bad.append(f"瓶子相对托盘的偏移 ({dx * 1000:+.0f},{dy * 1000:+.0f})mm 超出区域")
+            # ② 托盘也在自己的区域里
+            if not (tray["x"][0] <= tp.xy[0] <= tray["x"][1]
+                    and tray["y"][0] <= tp.xy[1] <= tray["y"][1]):
+                bad.append(f"托盘 ({tp.xy[0]:.3f},{tp.xy[1]:.3f}) 抽到了区域外")
+            # ③ 托盘 ↔ 盘子 不能重叠（外接圆之和 + 采样间隙，和 sample_spawn 的判据一致）
+            r_sum = (tasks_mod.footprint_radius("turbosquid_objects/wooden_tray", 0.0, sess.catalog)
+                     + tasks_mod.footprint_radius("stable_scanned_objects/plate", 0.0, sess.catalog))
+            gap = float(np.hypot(*(np.asarray(tp.xy) - np.asarray(pp.xy))))
+            if gap <= r_sum + tasks_mod.SPAWN_CLEARANCE - 1e-9:
+                bad.append(f"托盘与盘子只隔 {gap * 1000:.0f}mm"
+                           f"（≤ 外接圆 {r_sum * 1000:.0f} + 间隙 {tasks_mod.SPAWN_CLEARANCE * 1000:.0f}mm）")
+            # ④ 瓶子要**坐在托盘内底**上（内底 = 桌面 +8mm），不能悬空也不能穿地板
+            low = tasks_mod.object_lowest_z(sess.model, sess.data, sess.catalog, "ketchup")
+            if not (tasks_mod.TABLE_TOP_Z + 0.004 <= low <= tasks_mod.TABLE_TOP_Z + 0.012):
+                bad.append(f"瓶子最低点 {low * 1000:.1f}mm 不在托盘内底（桌面 +8mm）上")
+            # ⑤ 托盘、盘子也要贴桌面
+            for name, key in (("wooden_tray", "托盘"), ("plate", "盘")):
+                lo, hi = skills_mod.aabb(sess, name)
+                if abs(lo[2] - tasks_mod.TABLE_TOP_Z) > 0.004:
+                    bad.append(f"{key}子底面 {lo[2] * 1000:.1f}mm 没贴桌面")
+        check("t9 复位会重新随机摆位（三件物体位置都变）",
+              len(seen) >= 5 and len(seen_tray) >= 5 and len(seen_plate) >= 5,
+              f"瓶子 {len(seen)} 种 / 托盘 {len(seen_tray)} 种 / 盘子 {len(seen_plate)} 种")
+        rng = np.random.default_rng(7)
+        yaws = {p.detail for p in (tasks_mod.sample_spawn(sess.task, rng, sess.catalog)["ketchup"]
+                                   for _ in range(20))}
+        check("t9 朝向整圆周随机（20 局抽到多个不同 yaw）", len(yaws) >= 8,
+              f"{len(yaws)} 个：" + " ".join(sorted(yaws)[:6]) + " …")
+        check("t9 摆位（锚定+区域+不重叠+贴桌面）都合规", not bad,
+              "；".join(bad) if bad else "6 局都合规")
+
     # 12) 让主循环再跑一会，统计 FPS 并报告
     def s9():
         check("主循环无异常", not ERRORS, f"{len(ERRORS)} 个异常")
 
-    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s11b, s11c):
+    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s11b, s11c, s11d):
         step(fn)
 
     QTimer.singleShot(900, run_next)
