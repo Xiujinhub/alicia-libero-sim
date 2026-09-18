@@ -23,8 +23,16 @@
 
 from __future__ import annotations
 
-from libero_catalog import catalog_object, load_catalog
-from libero_scene import TABLE_TOP_Z, SceneBuilder
+import numpy as np
+
+from libero_catalog import (
+    boxes_aabb,
+    catalog_object,
+    load_catalog,
+    quat_from_axis_angle,
+    rotate_boxes,
+)
+from libero_scene import TABLE_HALF, TABLE_TOP_Z, SceneBuilder
 
 TASKS: list[dict] = [
     {
@@ -39,6 +47,12 @@ TASKS: list[dict] = [
             # 篮子单独配重：素材默认 density=100（泡沫级，仅 136g），机械臂经过时会被撞走
             {"key": "stable_scanned_objects/basket", "xy": [0.22, 0.10], "yaw": 0.0, "density": 1500},
         ],
+        # 任务多样化：抓取物每次随机安放（立着、朝向不变），只在机械臂工作范围内的小矩形里抽。
+        # 这是**运行时**行为（SimSession 抽完后写进物体的自由关节）；场景 XML 里仍写上面那个标称位置，
+        # 以便 build_all_scenes / render_preview 产出的图固定可比。区域怎么定的见 README §8.9。
+        # 上沿取到 -0.10（而不是 -0.06）：网格实测 (0.00,-0.06) 这个"离底座只有 277mm"的角点
+        # 会让手指把瓶子碰倒（实时宽度 37→122mm、连续 4 档都夹空），其余 19 个格点全过。
+        "spawn_region": {"ketchup": {"x": [0.00, 0.18], "y": [-0.24, -0.10]}},
         "grasp_object": "ketchup",
         "target_object": "basket",
         "success": {"xy": [0.22, 0.10], "xy_tol": 0.055, "z_ref": "table", "z_band": [0.0, 0.06]},
@@ -183,6 +197,77 @@ TASKS: list[dict] = [
 ]
 
 
+# ─────────────────── 任务多样化：抓取物随机安放 ───────────────────
+SPAWN_TRIES = 200
+"""随机安放的拒绝采样上限（区域里可能被其它物体的占地挡住一部分）。"""
+SPAWN_CLEARANCE = 0.025
+"""随机安放位置与"其它物体占地"之间要留的间隙（米）。"""
+SPAWN_TABLE_MARGIN = 0.06
+"""随机安放区域距桌沿至少留的余量（米），免得瓶子被摆到桌子边缘外掉下去。"""
+
+
+def footprint_radius(key: str, yaw_deg: float, catalog: dict) -> float:
+    """物体水平占地的**外接圆半径**（米）。随机安放时用它判断"会不会和旁边的东西叠在一起"。
+
+    摆放约定（见 ``SceneBuilder.placed_boxes``）：物体 AABB 中心落在任务给的 ``xy`` 上，
+    所以两个物体的世界 XY 距离 > ``r_a + r_b + 间隙`` 就一定不重叠。
+    """
+    obj = catalog_object(catalog, key)
+    boxes = [([float(v) for v in pos], [float(v) for v in quat], [float(v) for v in size])
+             for pos, quat, size in obj["boxes"]]
+    if abs(yaw_deg) > 1e-6:
+        boxes = rotate_boxes(boxes, quat_from_axis_angle("z", yaw_deg))
+    lo, hi = boxes_aabb(boxes)
+    return 0.5 * float(np.hypot(hi[0] - lo[0], hi[1] - lo[1]))
+
+
+def sample_spawn(task: dict, rng=None, catalog: dict | None = None) -> dict:
+    """按 ``task["spawn_region"]`` 随机抽抓取物的初始 XY，返回 ``{物体名: (x, y)}``。
+
+    只改 XY：物体在 XML 里的 **z 与朝向不动**（所以瓶子还是立着的、还是那个偏航角，
+    夹爪的闭合方向不受影响）。抽到的位置要同时满足
+
+    1. 落在任务里写的小矩形内（该矩形是按"抓取成功率"实测选出来的，见 README §8.9）；
+    2. 与**其它物体占地**（外接圆 + ``SPAWN_CLEARANCE``）不重叠；
+    3. 距桌沿留 ``SPAWN_TABLE_MARGIN``（区域被桌沿裁掉时自动收紧）。
+
+    拒绝采样最多 ``SPAWN_TRIES`` 次；实在抽不到就退回任务里写死的 ``xy``（不会抛异常）。
+    没有 ``spawn_region`` 的任务直接返回空字典 —— 完全不影响其它任务。
+    """
+    region = task.get("spawn_region")
+    if not region:
+        return {}
+    rng = rng if rng is not None else np.random.default_rng()
+    catalog = catalog or load_catalog()
+    items = {item.get("name", item["key"].split("/")[-1]): item for item in task["objects"]}
+    out: dict[str, tuple[float, float]] = {}
+    for name, box in region.items():
+        item = items[name]
+        key, yaw = item["key"], float(item.get("yaw", 0.0))
+        nominal = np.asarray(item.get("xy", (0.2, 0.0)), dtype=float)
+        r_self = footprint_radius(key, yaw, catalog)
+        # 其它物体按任务里写死的位置算占地（random 的只有 region 里列出的那些）
+        blocked = []
+        for other_name, other in items.items():
+            if other_name == name:
+                continue
+            r_other = footprint_radius(other["key"], float(other.get("yaw", 0.0)), catalog)
+            blocked.append((np.asarray(other.get("xy", (0.2, 0.0)), dtype=float), r_other))
+        lo = np.maximum(np.array([box["x"][0], box["y"][0]], dtype=float),
+                        -TABLE_HALF + SPAWN_TABLE_MARGIN)
+        hi = np.minimum(np.array([box["x"][1], box["y"][1]], dtype=float),
+                        TABLE_HALF - SPAWN_TABLE_MARGIN)
+        pick = nominal
+        for _ in range(SPAWN_TRIES):
+            cand = rng.uniform(lo, hi)
+            if all(float(np.linalg.norm(cand - xy)) > r + r_self + SPAWN_CLEARANCE
+                   for xy, r in blocked):
+                pick = cand
+                break
+        out[name] = (float(pick[0]), float(pick[1]))
+    return out
+
+
 # ─────────────────── 场景生成 ───────────────────
 def target_region_geom(success: dict) -> dict:
     """把成功区域画成一个半透明圆盘，让操作者看得见目标。"""
@@ -218,8 +303,6 @@ def object_world_aabb(model, data, catalog: dict, name: str):
     """用物体世界位姿 + catalog 的局部 AABB 算出世界系 AABB（不假设物体一定竖直）。"""
     import itertools
 
-    import numpy as np
-
     from libero_catalog import boxes_aabb, quat_to_mat
 
     body_id = model.body(name).id
@@ -233,8 +316,6 @@ def object_world_aabb(model, data, catalog: dict, name: str):
 
 def check_success(task: dict, model, data, catalog: dict | None = None) -> tuple[bool, str]:
     """检查任务是否完成，返回 (是否成功, 说明文字)。"""
-    import numpy as np
-
     catalog = catalog or load_catalog()
     spec = task["success"]
     lo, hi = object_world_aabb(model, data, catalog, task["grasp_object"])

@@ -84,6 +84,38 @@ CONTACT_STOP_TASKS = {"t3_pudding_into_ramekin"}
 现在：①先扫候选朝向挑**投影最窄**的（``plan_clear_yaw``）；②一接触就停（≤1 帧、≤1.75mm
 过行程）；③触到就跳过低位横向微调（避免侧推）。"""
 
+GRASP_BAND_LADDER_TASKS: dict[str, tuple[float, ...]] = {
+    # t1：把夹取高度**往下 10mm**（TCP 相对"窄带中点"再低 10mm），指面多咬住瓶子约 10mm
+    "t1_ketchup_into_basket": (0.010, 0.020, 0.000, 0.045, 0.075),
+}
+"""逐任务的抓取高度档位覆盖（覆盖 ``GRASP_BAND_LADDER``；列表顺序 = 尝试顺序）。
+
+⚠ 为什么 t1 要单独往下压（实测，脚本都在 ``E:\\deepenv\\_tools\\``：``diag_t1_depth.py``、
+``diag_t1_depth2.py``、``diag_t1_sweep.py``、``diag_t1_quality.py``、``diag_t1_align.py``）：
+
+夹爪**指面只有 74mm 长，而且全在 TCP 之上**（指面 z ≈ TCP+0 ~ +73mm），而 ketchup 的
+``grasp_tcp_offset=+39.8mm`` 把 TCP 停在 912.8mm（瓶子 803~962mm）—— 指面只"咬"住瓶子
+**顶部 21~25mm**，就是用户说的"夹得浅、夹得不稳"。
+
+但"往下压"有硬限制（这张表是逐档量出来的，不是猜的）：
+
+| dz | 指面盖住瓶子 | 抓取时 TCP | 合爪质量（开口−物体宽 / 两指接触） | 判定 |
+| --- | --- | --- | --- | --- |
+| +20mm（原第一档） | 25mm | 932.5mm | +1.3mm / 1+1 指 | 稳，但太浅 |
+| **+10mm（新档）** | **34.5~35.5mm** | **922.5mm** | **+2.9~3.1mm / 两指都接触** | ✅ 深了一点、质量不掉 |
+| 0mm | 41~45mm | 915.9mm | +8.9mm / 只有 1 指 ✗ | 远端会"虚夹" |
+| -10mm | 52mm | 905.4mm | +11.9mm / 只有 1 指 ✗ | 远端更差 |
+| -20mm | 60mm | 897.4mm | 近处 3+2 指✓，远端 +7.1mm ✗ | 近处很好、远端没准头 |
+| -35mm 及更深 | 62mm | 892.9mm | 下探时把瓶子带歪（实时宽 37.5→67.9mm ✗） | 远端会碰倒 |
+
+根因（``diag_t1_align.py`` 实测）：对齐阶段结束时 TCP 与物体中心的 xy 误差在所有摆位都只有
+**0.9~1.8mm**，但**低位姿态下位置伺服还有 6~9mm 静态漂移**（0.4~0.5m 处更明显），
+而爪口对 37mm 瓶子的单边间隙只有 ~5mm —— 走得越深，手指就越容易蹭到瓶身
+（实测远端"开口−物体宽"从 +1.3mm 恶化到 +11.9mm，甚至把瓶子顶歪）。
+**这是本机械臂在远端的物理限制，不是调参能绕过的**，所以取"两个极端摆位都不失手"的最深档
+（+10mm）；原来那四档全部保留在后面当回退 —— 最坏情况与改动前**完全一致**。"""
+
+
 PUSH_STOP_GAP = 0.003
 """推滑"停手间隙"：被推物体的前沿距**目标物体**前沿还剩这么多就收手（撤力 → 等待 → 判分）。
 
@@ -550,9 +582,11 @@ def grasp_object(sess, obj: str) -> tuple[bool, str]:
     """
     task_id = sess.task.get("id")
     watch = task_id in CONTACT_STOP_TASKS
+    #  逐任务的档位覆盖（见 GRASP_BAND_LADDER_TASKS：t1 需要夹得更深）
+    base_ladder = GRASP_BAND_LADDER_TASKS.get(task_id, GRASP_BAND_LADDER)
     #   t3 实测：dz=0 那一档才能夹到盒子的窄边（开口 26mm），dz=+20mm 只会卡在盒顶
     #   （开口停在全开 51mm = 空夹）—— 所以"几乎塞满爪口"的任务把 dz=0 提到第一档。
-    ladder = (GRASP_BAND_LADDER[1], GRASP_BAND_LADDER[0]) if watch else GRASP_BAND_LADDER
+    ladder = (base_ladder[1], base_ladder[0]) if watch else base_ladder
     descend_step = DESCEND_STEP * 0.5 if watch else DESCEND_STEP
     last = "未尝试"
     yaw_fixed = None

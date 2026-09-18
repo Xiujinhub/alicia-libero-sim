@@ -1,6 +1,6 @@
 """GUI 冒烟测试：真实创建窗口，自动切任务、模拟鼠标拖动/按键/滑块，并捕获所有异常。
 
-运行：python tests/test_gui_smoke.py    （期望输出 通过 16/16）
+运行：python tests/test_gui_smoke.py    （期望输出：全部 PASS、0 异常；结尾会打印"通过 N/N"）
 """
 import sys
 import traceback
@@ -156,11 +156,40 @@ def main() -> int:
               f"status={window.auto.status}")
         window.auto.stop()
 
-    # 10) 让主循环再跑一会，统计 FPS 并报告
+    # 10) t1 抓取物随机安放（任务多样化：每次复位换一局新摆位）
+    def s10():
+        window.task_combo.setCurrentIndex(0)          # 回到 t1
+        region = window.session.task.get("spawn_region", {}).get("ketchup")
+        check("t1 抓取物带随机安放区域", region is not None,
+              f"x={region['x']} y={region['y']}" if region else "没有 spawn_region")
+        if region is None:
+            return
+        seen, bad = set(), []
+        for _ in range(4):
+            window.callback_reset()                   # 复位 = 换一局新摆位
+            sess = window.session
+            x, y = sess.spawn["ketchup"]
+            seen.add((round(x, 4), round(y, 4)))
+            if not (region["x"][0] <= x <= region["x"][1] and region["y"][0] <= y <= region["y"][1]):
+                bad.append(f"({x:.3f},{y:.3f}) 抽到了区域外")
+            adr = sess.model.jnt_qposadr[sess.model.joint("ketchup_joint").id]
+            off = sess.spawn_offset["ketchup"]
+            q, q0 = sess.data.qpos[adr:adr + 7], sess.model.qpos0[adr:adr + 7]
+            if abs(q[0] - off[0] - x) > 1e-6 or abs(q[1] - off[1] - y) > 1e-6:
+                bad.append(f"物体没落到抽到的位置（qpos x={q[0]:.4f}，应为 {x + off[0]:.4f}）")
+            if abs(q[2] - q0[2]) > 1e-9 or not np.allclose(q[3:7], q0[3:7], atol=1e-9):
+                bad.append("z 或姿态被改了（瓶子不再立着）")
+        check("复位会重新随机摆位（多次复位位置不同）", len(seen) >= 3,
+              f"{len(seen)} 种：" + " ".join(f"({px * 1000:+.0f},{py * 1000:+.0f})"
+                                            for px, py in sorted(seen)))
+        check("随机摆位在区域内 / 真写进仿真 / 瓶子仍立着", not bad,
+              "；".join(bad) if bad else "4 局都合规")
+
+    # 11) 让主循环再跑一会，统计 FPS 并报告
     def s9():
         check("主循环无异常", not ERRORS, f"{len(ERRORS)} 个异常")
 
-    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9):
+    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9, s10):
         step(fn)
 
     QTimer.singleShot(900, run_next)

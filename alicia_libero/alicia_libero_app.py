@@ -54,7 +54,7 @@ sys.path.insert(0, str(HERE))
 from alicia_ik import AliciaIK, finger_targets  # noqa: E402
 from libero_catalog import catalog_object, load_catalog  # noqa: E402
 from libero_scene import TABLE_TOP_Z  # noqa: E402
-from libero_tasks import TASKS, build_task_scene, check_success  # noqa: E402
+from libero_tasks import TASKS, build_task_scene, check_success, sample_spawn  # noqa: E402
 import skills  # noqa: E402  （闭环技能库：接触/跟随判据驱动的自动执行）
 
 VIEW_W, VIEW_H = 900, 640          # 离屏渲染分辨率
@@ -66,8 +66,13 @@ CAMERA_LABELS = ["斜前方", "正上方", "侧前方", "腕部相机"]
 class SimSession:
     """一次任务场景的仿真会话：模型 / 数据 / IK / 渲染器 / 目标点。"""
 
-    def __init__(self, task: dict, catalog: dict, render: bool = True) -> None:
-        """``render=False`` 时不建 MuJoCo 离屏渲染器（无头批量试验用，快很多）。"""
+    def __init__(self, task: dict, catalog: dict, render: bool = True,
+                 spawn_seed: int | None = None) -> None:
+        """``render=False`` 时不建 MuJoCo 离屏渲染器（无头批量试验用，快很多）。
+
+        ``spawn_seed``：带 ``spawn_region`` 的任务（当前是 t1）随机安放抓取物用的种子；
+        给同一个种子就复现同一串随机位置（基准脚本用它保证可复现），``None`` = 真随机。
+        """
         self.task = task
         self.catalog = catalog
         xml, _ = build_task_scene(task, catalog=catalog)
@@ -87,6 +92,18 @@ class SimSession:
         self.gripper = 1.0                     # 1 = 张开
         self.camera = "cam_front"
         self.grasp_yaw = self._grasp_yaw(task)
+        # 随机安放（任务多样化）：随机源 + "AABB 中心 → body 原点"的 xy 偏移（见 _apply_spawn）
+        self.spawn_rng = np.random.default_rng(spawn_seed)
+        self.spawn: dict[str, tuple[float, float]] = {}
+        self.spawn_offset: dict[str, np.ndarray] = {}
+        for region_name in task.get("spawn_region", {}):
+            entry = next((e for e in task["objects"]
+                          if e.get("name", e["key"].split("/")[-1]) == region_name), None)
+            if entry is None:
+                continue
+            adr = self.model.jnt_qposadr[self.model.joint(f"{region_name}_joint").id]
+            self.spawn_offset[region_name] = (self.model.qpos0[adr:adr + 2]
+                                              - np.asarray(entry["xy"], dtype=float))
         self.reset()
 
     def _grasp_yaw(self, task: dict) -> float:
@@ -105,9 +122,17 @@ class SimSession:
         narrow_is_x = obj["size"][0] <= obj["size"][1]
         return obj_yaw + (0.0 if narrow_is_x else 90.0)
 
-    def reset(self) -> None:
-        """回到任务初始状态（物体按 XML 初始位姿复位）。"""
+    def reset(self, resample: bool = True) -> None:
+        """回到任务初始状态（物体按 XML 初始位姿复位）。
+
+        ``resample=True``（默认）：带 ``spawn_region`` 的抓取物**重新抽一个位置** ——
+        所以界面上的"复位"= 换一局新摆位（任务多样化的入口）；``resample=False``：
+        沿用本次会话已抽到的位置（可复现的实验用，例如基准脚本按种子生成的每一局）。
+        """
         mujoco.mj_resetData(self.model, self.data)
+        if resample:
+            self.spawn = sample_spawn(self.task, self.spawn_rng, self.catalog)
+        self._apply_spawn()
         self.joint_target = np.zeros(6)
         self.gripper = 1.0
         self.apply_control()
@@ -115,6 +140,21 @@ class SimSession:
         self.ee_target = self.tcp_position().copy()
         # 零位（6 关节目标全 0）下的末端位置：技能库"回程"的终点，见 skills.return_home
         self.home_tcp = self.tcp_position().copy()
+
+    def _apply_spawn(self) -> None:
+        """把随机抽到的 XY 写进物体自由关节。
+
+        只动 x/y：z 与朝向沿用 XML（``SceneBuilder`` 已把底面精确摆在桌面上），
+        所以瓶子还是立着的、偏航角也不变 —— 夹爪闭合方向不受随机化影响。
+        """
+        for name, (x, y) in self.spawn.items():
+            offset = self.spawn_offset.get(name)
+            try:
+                adr = self.model.jnt_qposadr[self.model.joint(f"{name}_joint").id]
+            except Exception:  # noqa: BLE001  物体不是自由关节就跳过
+                continue
+            self.data.qpos[adr] = x + (float(offset[0]) if offset is not None else 0.0)
+            self.data.qpos[adr + 1] = y + (float(offset[1]) if offset is not None else 0.0)
 
     # ── 控制 ──
     def apply_control(self) -> None:
@@ -189,9 +229,19 @@ class SimSession:
     def object_report(self) -> str:
         name = self.task["grasp_object"]
         obj = catalog_object(self.catalog, name)
-        return (f"抓取物 {name}：{obj['size'][0]*1000:.0f}×{obj['size'][1]*1000:.0f}"
+        text = (f"抓取物 {name}：{obj['size'][0]*1000:.0f}×{obj['size'][1]*1000:.0f}"
                 f"×{obj['size'][2]*1000:.0f} mm，最窄处 {obj['body_width']*1000:.0f} mm，"
                 f"50mm 夹爪{'可夹' if obj['graspable_strict'] else '偏宽（可改用侧面/边缘）'}")
+        report = self.spawn_report()
+        return text + ("；" + report if report else "")
+
+    def spawn_report(self) -> str:
+        """本局随机安放的位置（没有 ``spawn_region`` 的任务返回空串）。"""
+        if not self.spawn:
+            return ""
+        parts = [f"{name} ({x * 1000:+.0f}, {y * 1000:+.0f}) mm"
+                 for name, (x, y) in self.spawn.items()]
+        return "本局随机安放 " + "、".join(parts)
 
 
 class SimView(QLabel):
@@ -423,7 +473,9 @@ class MainWindow(QMainWindow):
         self.mode_combo.setCurrentIndex(0)
         self.callback_mode_changed(0)
         self._sync_controls()
-        self.statusBar().showMessage(f"已加载 {task['id']}（{task['kind']}，难度 {task['difficulty']}）")
+        self.statusBar().showMessage(
+            f"已加载 {task['id']}（{task['kind']}，难度 {task['difficulty']}）"
+            + ("；" + self.session.spawn_report() if self.session.spawn_report() else ""))
 
     def _sync_controls(self) -> None:
         """把界面控件同步到 session 当前状态。
@@ -468,10 +520,12 @@ class MainWindow(QMainWindow):
                 self.auto_button.setText("▶ 自动完成本关")
             self.session.reset()
             self._sync_controls()
+            self.object_text.setText(self.session.object_report())
             self.was_success = False
             self.result_text.setStyleSheet("font-size:13px; font-weight:bold; color:#d7e3f4;")
             self.result_text.setText("状态：进行中")
-            self.statusBar().showMessage("场景已复位")
+            spawn = self.session.spawn_report()
+            self.statusBar().showMessage("场景已复位" + ("（" + spawn + "）" if spawn else ""))
 
     # ────────────────── 自动执行（闭环技能库） ──────────────────
     def _pause_auto(self) -> None:

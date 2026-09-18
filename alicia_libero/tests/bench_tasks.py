@@ -55,8 +55,11 @@ def run_once(task: dict, catalog: dict, rng, jitter: float, verbose: bool = Fals
 
     "任务本体帧数" = 进入**回程**之前的帧数（判分已完成）——技能库在判分后会追加
     ``回程``（``skills.return_home``），把它和任务本体分开统计，各关耗时才能继续横向对比。
+
+    抓取物的初始位置由 ``spawn_seed`` 决定（只对带 ``spawn_region`` 的任务生效，如 t1）：
+    种子取自本脚本的 ``rng`` → 每次运行位置都不同，但同一版本重跑可复现同一串位置。
     """
-    sess = SimSession(task, catalog, render=False)
+    sess = SimSession(task, catalog, render=False, spawn_seed=int(rng.integers(2 ** 31)))
     sess.reset()
     jitter_scene(sess, rng, jitter)
     runner = skills.SkillRunner(sess)
@@ -74,6 +77,7 @@ def run_once(task: dict, catalog: dict, rng, jitter: float, verbose: bool = Fals
     ok, msg = check_success(task, sess.model, sess.data, sess.catalog)
     detail = runner.summary()
     if verbose:
+        print(f"[{sess.spawn_report() or '本任务无随机安放'}]")
         print(detail)
     sess.renderer = None
     reason = "" if ok else (runner.error or msg)
