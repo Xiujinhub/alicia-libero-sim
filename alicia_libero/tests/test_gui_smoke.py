@@ -252,11 +252,94 @@ def main() -> int:
         check("摆位（位置+姿态+闭合轴+贴桌+不重叠）都合规", not bad,
               "；".join(bad) if bad else "6 局都合规")
 
-    # 11) 让主循环再跑一会，统计 FPS 并报告
+    # 11) t2 抓取物（黄油：位置+姿态）与盘子随机安放（与 t1 同一套机制，见 README §8.9）
+    def s11():
+        window.task_combo.setCurrentIndex(1)          # 切到 t2
+        regions = window.session.task.get("spawn_region", {})
+        region = regions.get("butter")
+        check("t2 黄油带随机安放区域", region is not None,
+              f"x={region['x']} y={region['y']}" if region else "没有 spawn_region")
+        check("t2 黄油带姿态随机（立着/平放）",
+              list(region.get("poses", [])) == ["upright", "lying"] if region else False,
+              f"poses={region.get('poses') if region else None}  lie_axis="
+              f"{region.get('lie_axis') if region else None}")
+        check("t2 盘子也带随机安放区域（目标物随机）",
+              regions.get("plate") is not None,
+              f"x={regions['plate']['x']} y={regions['plate']['y']}"
+              if regions.get("plate") else "盘子没有 spawn_region")
+        check("t2 平放只在这些实测夹得住的朝向上随机",
+              tuple(region.get("lying_yaws") or tasks_mod.SPAWN_BOX_YAWS)
+              == tasks_mod.SPAWN_BOX_YAWS if region else False,
+              f"lying_yaws={region.get('lying_yaws') if region else None}")
+        if region is None:
+            return
+        seen, bad, seen_plate, poses, flats = set(), [], set(), set(), set()
+        for _ in range(6):
+            window.callback_reset()
+            sess = window.session
+            bp = sess.spawn["butter"]
+            x, y = bp.xy
+            poses.add(bp.pose)
+            seen.add((round(x, 4), round(y, 4)))
+            if not (region["x"][0] <= x <= region["x"][1] and region["y"][0] <= y <= region["y"][1]):
+                bad.append(f"黄油 ({x:.3f},{y:.3f}) 抽到了区域外")
+            adr = sess.model.jnt_qposadr[sess.model.joint("butter_joint").id]
+            q, q0 = sess.data.qpos[adr:adr + 7], sess.model.qpos0[adr:adr + 7]
+            if bp.pose == "upright":                  # 立着：z 不变；朝向可以是（随机出来的）纯 yaw
+                if bp.quat is None:
+                    if abs(q[2] - q0[2]) > 1e-9 or not np.allclose(q[3:7], q0[3:7], atol=1e-9):
+                        bad.append("黄油立着那局 z 或姿态被改了")
+                else:
+                    if not np.allclose(q[3:7], bp.quat, atol=1e-6):
+                        bad.append("黄油立着的随机朝向没写进自由关节")
+                    if abs(q[2] - q0[2]) > 1e-9:
+                        bad.append("黄油立着那局的 z 变了（纯绕 Z 转不该改高度）")
+            else:                                     # 平放：姿态写进去、大平面贴桌
+                if not np.allclose(q[3:7], bp.quat, atol=1e-6):
+                    bad.append("黄油平放那局的四元数没写进自由关节")
+                if bp.detail:
+                    flats.add(bp.detail)
+                low = tasks_mod.object_lowest_z(sess.model, sess.data, sess.catalog, "butter")
+                if abs(low - tasks_mod.TABLE_TOP_Z) > 0.002:
+                    bad.append(f"黄油平放那局最低点 {low * 1000:.1f}mm 没贴在桌面上")
+            # 闭合轴要跟着姿态走：立着沿 17.4mm 薄边、平放沿 39.5mm 那对侧面
+            thin = skills_mod.thin_axis_world(sess, "butter")
+            wide = skills_mod.width_along_dir(sess, "butter", thin) * 1000
+            want = 17.4 if bp.pose == "upright" else 39.5
+            if abs(wide - want) > 1.5:
+                bad.append(f"{bp.label}那局闭合轴方向量到的宽度 {wide:.1f}mm ≠ {want}mm（夹错方向）")
+            box = regions.get("plate")
+            if box is None:
+                continue
+            pl = sess.spawn["plate"]
+            px_, py_ = pl.xy
+            seen_plate.add((round(px_, 4), round(py_, 4)))
+            if not (box["x"][0] <= px_ <= box["x"][1] and box["y"][0] <= py_ <= box["y"][1]):
+                bad.append(f"盘子 ({px_:.3f},{py_:.3f}) 抽到了区域外")
+            padr = sess.model.jnt_qposadr[sess.model.joint("plate_joint").id]
+            poff = sess.spawn_offset["plate"]
+            pq, pq0 = sess.data.qpos[padr:padr + 7], sess.model.qpos0[padr:padr + 7]
+            if abs(pq[0] - poff[0] - px_) > 1e-6 or abs(pq[1] - poff[1] - py_) > 1e-6:
+                bad.append("盘子没落到抽到的位置")
+            if abs(pq[2] - pq0[2]) > 1e-9 or not np.allclose(pq[3:7], pq0[3:7], atol=1e-9):
+                bad.append("盘子的 z 或姿态被改了")
+        check("t2 复位会重新随机摆位（黄油与盘子位置都变）", len(seen) >= 5 and len(seen_plate) >= 5,
+              f"黄油 {len(seen)} 种 / 盘子 {len(seen_plate)} 种")
+        check("t2 复位也会随机姿态（6 局里立着/平放都出现过）", len(poses) == 2,
+              f"抽到 {sorted(poses)}")
+        # 立着的朝向也随机：用固定种子的采样器直查（不受"6 局里刚好几局立着"的随机性影响）
+        rng = np.random.default_rng(7)
+        up_yaws = {p.detail for p in (tasks_mod.sample_spawn(sess.task, rng, sess.catalog)["butter"]
+                                      for _ in range(20)) if p.pose == "upright"}
+        check("t2 立着的朝向也随机（20 局抽到多个不同 yaw）", len(up_yaws) >= 8,
+              f"{len(up_yaws)} 个：" + " ".join(sorted(up_yaws)[:6]) + " …")
+        check("t2 摆位（位置+姿态+闭合轴+贴桌）都合规", not bad, "；".join(bad) if bad else "6 局都合规")
+
+    # 12) 让主循环再跑一会，统计 FPS 并报告
     def s9():
         check("主循环无异常", not ERRORS, f"{len(ERRORS)} 个异常")
 
-    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9, s10):
+    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11):
         step(fn)
 
     QTimer.singleShot(900, run_next)

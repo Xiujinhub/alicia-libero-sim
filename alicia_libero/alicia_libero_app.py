@@ -129,12 +129,16 @@ class SimSession:
 
         姿态随机之后（§8.9：瓶子可能平放、还斜 45°）不能再按"世界 X/Y 谁短"猜 ——
         那是**包围盒**的短边，斜躺时骨架会退化成一个近似正方形（实测 45° 时 AABB 129×129mm），
-        猜错就会横着扎进瓶身。改成把物体的**局部薄轴**（catalog 里最薄的那条边）转到世界
-        坐标系，再取它的水平方向 —— 对任意姿态都成立；立着时结果与旧算法完全一致
-        （薄轴是局部 Y → yaw=90°）。
+        猜错就会横着扎进瓶身。改成把物体的**局部轴**逐条转到世界系，只在**大致水平**的轴里
+        挑**最短**的一条闭合（平行夹爪只能水平开合）：
 
-        薄轴本来就**竖直**的物体（例如 t6 那本平放的书，厚度方向朝上）没法水平闭合，
-        退回旧规则"按物体横截面的短边 + 任务里的 yaw"。
+        * 立着的瓶子/黄油：最薄的局部 Y 本来就在水平面上 → 选它（与旧算法逐字一致）；
+        * 平放的瓶子：三条轴都水平，最薄的局部 Y 仍是最短的 → 结果也不变；
+        * 平放的**黄油**（t2，§8.9）：最薄的局部 Y 被转成**竖直**了 → 退而选次短的局部 Z
+          （39.5mm，正好是它横躺时那对侧面），旧算法只能按 AABB 猜、斜 45° 时
+          AABB 退化成 81.8×81.8mm 近乎正方形（50% 概率夹错方向）。
+
+        返回的仍然是"要沿哪条水平轴闭合"的偏航角（度）。
         """
         name = task["grasp_object"]
         obj = catalog_object(self.catalog, name)
@@ -143,15 +147,15 @@ class SimSession:
             (v for k, v in objects.items() if k.endswith("/" + name)), None)
         obj_yaw = float(item.get("yaw", 0.0)) if item else 0.0
         local = np.asarray(obj["size"], dtype=float)
-        thin = np.zeros(3)
-        thin[int(np.argmin(local))] = 1.0                 # 局部最薄的那条边 = 夹爪要闭合的方向
         rot = quat_to_mat(np.asarray(quat, dtype=float) if quat is not None
                           else quat_from_axis_angle("z", obj_yaw))
-        world = rot @ thin
-        if abs(world[2]) > 0.9:                           # 薄轴竖直 → 平行夹爪没法水平闭合
-            narrow_is_x = obj["size"][0] <= obj["size"][1]
+        axes = rot.T                                # ⚠ axes[i] = 第 i 列 = 局部轴 i 在世界系的方向
+        horiz = [i for i in range(3) if abs(float(axes[i][2])) < 0.9]
+        if not horiz:                                     # 三条轴都竖直：不可能，兜底用旧规则
+            narrow_is_x = local[0] <= local[1]
             return obj_yaw + (0.0 if narrow_is_x else 90.0)
-        yaw = math.degrees(math.atan2(world[1], world[0]))
+        thin = np.asarray(axes[min(horiz, key=lambda i: local[i])], dtype=float)
+        yaw = math.degrees(math.atan2(thin[1], thin[0]))
         # 躺姿再折算到"负角"那半圈（等价方向，见 skills.reachable_yaw 的实测说明）
         return yaw if skills.is_upright(self, name) else skills.reachable_yaw(yaw)
 

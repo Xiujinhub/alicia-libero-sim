@@ -102,6 +102,11 @@ CONTACT_STOP_TASKS = {"t3_pudding_into_ramekin"}
 GRASP_BAND_LADDER_TASKS: dict[str, tuple[float, ...]] = {
     # t1：把夹取高度**往下 10mm**（TCP 相对"窄带中点"再低 10mm），指面多咬住瓶子约 10mm
     "t1_ketchup_into_basket": (0.010, 0.020, 0.000, 0.045, 0.075),
+    # t2：**dz=0 提到第一档**。黄油只有 17~40mm 厚，而指面全在 TCP 之上 ~73mm ——
+    #     dz=+20 时指面整段都停在黄油顶面之上，只咬住顶角（浅握），抬起 25mm 的校验能过，
+    #     但**搬运途中会滑落**（实测平放局因此整局失败：判分水平偏 292mm、黄油躺在桌面上）。
+    #     dz=0 时指面盖住黄油 32mm（807~839mm 对 800~839.5mm），握得实。
+    "t2_butter_onto_plate": (0.000, 0.020, 0.045, 0.075),
 }
 """逐任务的抓取高度档位覆盖（覆盖 ``GRASP_BAND_LADDER``；列表顺序 = 尝试顺序）。
 
@@ -335,23 +340,29 @@ def live_grasp_axis(sess, obj: str) -> str:
 def grasp_axes_world(sess, obj: str):
     """物体**薄轴 / 长轴**在世界系下的方向（单位向量），按**实时姿态**解析算出。
 
-    薄轴 = catalog 里最薄的那条**局部轴**（番茄酱是局部 Y＝36.8mm），长轴 = 最长的那条
-    （局部 Z＝145.6mm）。姿态随机之后（§8.9 瓶子可能平放、还斜 45°）**不能**再用
-    "世界 AABB 谁短"来定闭合方向：斜躺时 AABB 退化成一个近似正方形（实测 45° 时
-    129×129mm），按它猜有 50% 概率夹错方向，手指会横着扎进瓶身。
+    薄轴 = **大致水平**的局部轴里**最短**的那条（平行夹爪只能水平开合），长轴 = 最长的
+    那条。姿态随机之后（§8.9 瓶子可能平放、还斜 45°）**不能**再用"世界 AABB 谁短"来定
+    闭合方向：斜躺时 AABB 退化成一个近似正方形（实测 45° 时 129×129mm），按它猜有 50%
+    概率夹错方向，手指会横着扎进瓶身。
 
-    返回 ``(薄轴, 长轴)``；薄轴被转到**竖直**时（那种姿态平行夹爪没法水平闭合）返回
+    * 立着的瓶子/黄油（局部 Y 最薄且水平）→ 薄轴 = 局部 Y，与旧版逐字一致；
+    * 平放的瓶子（三条轴都水平）→ 仍是最短的局部 Y，也不变；
+    * 平放的**黄油**（t2，局部 Y 被转成竖直）→ 退而选次短的局部 Z（39.5mm，正是它横躺时
+      那对侧面）；旧版这时只能回退到"世界 AABB 短边"，斜 45° 时 81.8×81.8mm 猜不准。
+
+    返回 ``(薄轴, 长轴)``；三条局部轴里**没有**水平的（不可能发生）时返回
     ``(None, 长轴)``，调用方回退到旧逻辑。
     """
     obj_cat = catalog_object(sess.catalog, obj)
     local = np.asarray(obj_cat["size"], dtype=float)
     rot = quat_to_mat(sess.data.xquat[_body_id(sess, obj)])
-    thin = np.zeros(3)
-    thin[int(np.argmin(local))] = 1.0
-    long_ = np.zeros(3)
-    long_[int(np.argmax(local))] = 1.0
-    thin_w, long_w = rot @ thin, rot @ long_
-    return (None if abs(float(thin_w[2])) > 0.9 else thin_w), long_w
+    axes = rot.T                       # ⚠ axes[i] = 旋转矩阵的**第 i 列** = 局部轴 i 在世界系的方向
+    long_w = np.asarray(axes[int(np.argmax(local))], dtype=float)
+    horiz = [i for i in range(3) if abs(float(axes[i][2])) < 0.9]
+    if not horiz:
+        return None, long_w
+    thin_w = np.asarray(axes[min(horiz, key=lambda i: local[i])], dtype=float)
+    return thin_w, long_w
 
 
 def long_axis_dir(sess, obj: str) -> tuple[float, float]:
@@ -636,14 +647,21 @@ def calibrated_yaw(sess, obj: str, yaw0: float | None = None,
 
     摆动发生在"物体上方 28mm"处（``ALIGN_H``），此时指尖还悬在物体上方，不会撞到它。
     ``yaw0`` 默认用物体当前偏航；候选 = yaw0 + {0, ±90, 180}。
+
+    ⚠ 候选只差 90°，所以残余最多还有 ~45° —— 对"几乎塞满爪口"的物体不够用（实测平放的
+    黄油 39.5mm 侧面 / 爪口 50mm：残余 31.5° 时投影宽 39.5·cos31.5 + 76.2·sin31.5 = 72mm，
+    手指直接夹空）。试过"带符号闭环微调"（按实测误差反向补命令角）但**方向关系不稳定**
+    （IK 的偏航误差随姿态变、还随 yaw 换分支），实测把本来能过的朝向也带坏了，故不做；
+    改成**按实测筛朝向**（§8.9 t2：8 个朝向里只有 yaw≈−90°/−135° 那 4 个夹得住，
+    于是 `lying_yaws` 只保留对应的朝向）。
     """
     thin2 = thin_axis_world(sess, obj)
     thin3 = np.array([thin2[0], thin2[1], 0.0])
     base = yaw_for_axis(sess, obj) if yaw0 is None else yaw0
+    c = center(sess, obj)
+    target = np.array([c[0], c[1], top_z(sess, obj) + ALIGN_H])
     best_yaw, best_ang = base, 999.0
     for cand in (base, base - 90.0, base + 180.0, base + 90.0):
-        c = center(sess, obj)
-        target = np.array([c[0], c[1], top_z(sess, obj) + ALIGN_H])
 
         def _hold(_c, t=target):
             return t

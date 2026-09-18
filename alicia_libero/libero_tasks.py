@@ -91,9 +91,41 @@ TASKS: list[dict] = [
             {"key": "stable_hope_objects/butter", "xy": [0.02, -0.14], "yaw": 0.0},
             {"key": "stable_scanned_objects/plate", "xy": [0.20, 0.08], "yaw": 0.0},
         ],
+        # 任务多样化（与 t1 同一套机制，见 README §8.9）：**黄油位置 + 姿态随机、盘子位置随机**。
+        # 与 t1 的差别（每条都实测过）：
+        #   ① 黄油是 76×17×40mm 的**小扁块**，盘面 137mm 宽 —— 任意朝向都放得下，
+        #      所以不需要 t1 那种"为了落进容器而收窄角度"；收窄的原因变成了**夹得住**：
+        #      平放时能夹的只有 39.5mm 那对侧面，而爪口 50mm，闭合轴必须准到 ~8° 以内。
+        #      实测 8 个朝向里只有 θ∈{0°,135°,180°,315°} 在两个位置上全夹住，
+        #      其余 4 个残余偏角太大（31°+ → 投影宽 72mm > 爪口）直接夹空 → 只保留这 4 个。
+        #      （黄油左右对称，0/180 与 135/315 其实是同一条线，所以**等效于两种朝向各 50%**。）
+        #   ② 黄油"平放"= 绕**长轴（局部 X）**躺下 → 厚边(17.4)朝上、大平面贴桌。
+        #      t1 的瓶子是绕**薄轴（局部 Y）**躺下（薄边仍水平才夹得住），所以这里要写 lie_axis="x"；
+        #      两种姿态各 50%。
+        #   ③ 立着时抓取点 ≈ 807mm、平放时 = 底面 + 10mm ≈ 810mm —— 两种姿态的 TCP 都压得很低
+        #      （和 t1 的躺姿一样），所以位置区域整体收紧，不放 t1 立姿那样远的 x=0.18。
+        "spawn_region": {
+            "butter": {"x": [0.00, 0.09], "y": [-0.21, -0.12],
+                       "poses": ["upright", "lying"],
+                       "lie_axis": "x",
+                       "lying_yaws": [0.0, 135.0, 180.0, 315.0],
+                       # 立着也随机朝向（绕 Z 转，站姿不变）：实测 8 个 yaw × 2 个位置
+                       # **16/16 都夹得住**（立着夹的是 17.4mm 薄边、爪口 50mm，IK 偏角不影响），
+                       # 所以这里放开成**整圆周任意朝向**（None = 不限制）
+                       "upright_yaws": None,
+                       # 平放再单独收一点：x≈0 那一列（离底座最近）夹得住但**搬运会滑落**
+                       # —— 实测 flat_0 在 x=0 的 3 次里坏 1 次，x≥0.04 的 9 次全过（t1 同款手法）
+                       "pose_regions": {"lying": {"x": [0.04, 0.09], "y": [-0.21, -0.12]}}},
+            # 盘子区域比 t1 的篮子略收：实测失败的几局都是"黄油在 x≈0.10/y≈−0.22 的远角、盘子又在
+            # x≈0.25/y≈0.03 的远角"，两点相距 ~300mm（最长），5g 的黄油长距离搬运途中会滑落
+            # （判分水平偏 300mm+、黄油躺在桌面上）。收进 x≤0.24/y≤0.16 后这类极端组合不再出现。
+            "plate": {"x": [0.14, 0.24], "y": [0.02, 0.16]},
+        },
         "grasp_object": "butter",
         "target_object": "plate",
-        "success": {"xy": [0.20, 0.08], "xy_tol": 0.07, "z_ref": "table", "z_band": [0.0, 0.06]},
+        # ``xy_ref="target"``：盘子随机安放 → 判分取**盘子当前实际中心**（与 t1 的篮子同理）
+        "success": {"xy": [0.20, 0.08], "xy_ref": "target", "xy_tol": 0.07,
+                    "z_ref": "table", "z_band": [0.0, 0.06]},
     },
     {
         "id": "t3_pudding_into_ramekin",
@@ -228,18 +260,25 @@ SPAWN_CLEARANCE = 0.025
 SPAWN_TABLE_MARGIN = 0.06
 """随机安放区域距桌沿至少留的余量（米），免得瓶子被摆到桌子边缘外掉下去。"""
 
-# 平放姿态：绕**局部 Y**（瓶子最薄的那条边）转 90°，长轴就从竖直变成水平（= 平放），
-# 而且薄边仍然水平 —— 平行夹爪才夹得住；再绕**世界 Z** 转 θ（长轴朝向）决定躺的方向。
-_LAY_Y = quat_from_axis_angle("y", 90.0)
+# 平放姿态的构造见 ``lying_quat``：绕**局部某条水平轴**转 90°（长轴从竖直变水平），
+# 再绕**世界 Z** 转 θ 决定躺的方向。绕哪条轴由 `lie_axis` 决定 —— 瓶子绕薄轴（薄边仍水平，
+# 平行夹爪还能水平闭合）、扁盒（黄油）绕长轴（大平面朝下）。
 
 
-def lying_quat(theta_deg: float) -> tuple[float, float, float, float]:
-    """平放姿态：长轴指向世界 θ 角（θ=225 就是以前写死的 ``laid_225``）。"""
-    return quat_mul(quat_from_axis_angle("z", float(theta_deg)), _LAY_Y)
+def lying_quat(theta_deg: float, axis: str = "y") -> tuple[float, float, float, float]:
+    """平放姿态：绕**局部 ``axis``** 躺下、再绕世界 Z 转到长轴朝向 ``theta_deg``。
+
+    * ``axis="y"``（默认，t1 的瓶子）：绕**薄轴**躺下 → 薄轴仍水平（夹爪还能水平闭合），
+      长轴从竖直变水平；θ=225 就是以前写死的 ``laid_225``。
+    * ``axis="x"``（t2 的黄油）：绕**长轴**躺下 → 厚边朝上、最大面贴桌（t1 的瓶子没有
+      这么"扁"，绕薄轴躺才稳；黄油是 76×39mm 的大平面朝下最自然）。
+    """
+    return quat_mul(quat_from_axis_angle("z", float(theta_deg)),
+                    quat_from_axis_angle(axis, 90.0))
 
 
 SPAWN_LYING_YAWS = (45.0, 140.0, 215.0, 320.0)
-"""平放允许的长轴朝向（度）。**朝向随机**，但只在实测"能过关"的角度里抽。
+"""**绕薄轴躺**（``axis="y"``）允许的长轴朝向（度）。**朝向随机**，但只在实测"能过关"的角度里抽。
 
 ⚠ 这张表是逐角度量出来的（脚本 ``_tools\\diag_t1_yaw_sweep.py``：把瓶子按长轴 θ 摆到
 篮子中心正上方、瓶底在篮口上方 15mm 凌空松手，落定后看判据；每角度测 9 个落点 ——
@@ -258,21 +297,49 @@ SPAWN_LYING_YAWS = (45.0, 140.0, 215.0, 320.0)
 ``adapt_lying_yaw`` 就是把任意随机角度**折到这张表里最近的一个** —— 这就是"生成前
 调整角度适配"的那一步。"""
 
+SPAWN_BOX_YAWS = (0.0, 135.0, 180.0, 315.0)
+"""**绕长轴躺**（``axis="x"``，t2 的黄油的默认表）：实测夹得住的 4 个朝向。
+
+黄油 76×17×40mm，平放后能夹的只有 **39.5mm** 那对侧面，而爪口 50mm —— 闭合轴必须准到
+~8° 以内，否则沿轴投影宽 = 39.5·cosθ + 76.2·sinθ 很快超过 50mm、手指直接夹空。
+
+实测（每个朝向 2 个位置，脚本 ``_tools\\diag_t2_poses.py``）：
+
+| 长轴朝向 θ | 抓取 | 说明 |
+| --- | --- | --- |
+| 0°, 180° | **2/2 ✓** | 闭合轴落在 yaw≈−90°（IK 咬得住） |
+| 135°, 315° | **2/2 ✓** | 闭合轴落在 yaw≈−135° ✓ |
+| 90°, 270° | 1/2 ✗ | 有时挑到 +90°（够不着），不稳 |
+| 45°, 225° | **0/2 ✗** | 残余偏角 31°+ → 投影宽 72mm > 爪口，夹空 |
+
+黄油左右对称，0/180 与 135/315 各是同一条线 —— 所以**等效于两种朝向各 50%**。
+（不能像 t1 那样在整圈上均匀取角度：这里的约束是"IK 能不能咬准闭合轴"，只有特定几个
+偏航角做得到。）"""
+
+SPAWN_LIE_DEFAULTS = {"y": SPAWN_LYING_YAWS, "x": SPAWN_BOX_YAWS}
+"""``lie_axis`` → 该姿态默认允许的朝向表（区域里可以再用 ``lying_yaws`` 覆盖）。"""
+
 
 def adapt_lying_yaw(theta_deg: float, allowed=SPAWN_LYING_YAWS) -> float:
-    """把随机抽到的长轴朝向**适配**到允许的角度（取最近的一个，考虑 0/360 环绕）。"""
+    """把随机抽到的长轴朝向**适配**到允许的角度（取最近的一个，考虑 0/360 环绕）。
+
+    ``allowed=None`` 表示不限制（原样返回）—— 留给"任意朝向都能过"的物体。
+    """
+    if allowed is None:
+        return float(theta_deg) % 360.0
     candidates = list(allowed)
     return min(candidates, key=lambda a: abs((float(theta_deg) - a + 180.0) % 360.0 - 180.0))
 
 
 SPAWN_POSE_QUATS: dict[str, tuple[float, float, float, float]] = {
     "upright": (1.0, 0.0, 0.0, 0.0),                       # 立着（= XML 里的姿态）
-    **{f"laid_{t:g}": lying_quat(t) for t in SPAWN_LYING_YAWS},
+    **{f"laid_{t:g}": lying_quat(t, "y") for t in SPAWN_LYING_YAWS},
+    **{f"flat_{t:g}": lying_quat(t, "x") for t in SPAWN_BOX_YAWS},
 }
 """姿态名 → 物体**局部位姿**要乘的四元数（作用在 catalog 的碰撞盒上）。
 
-``lying`` / ``laid`` 是**类别**，由 ``pick_spawn_pose`` 现场抽角度 + 适配（见上表）；
-直接写具体名字（如 ``laid_45``）也可以。"""
+``lying`` / ``laid`` / ``flat`` 是**类别**，由 ``pick_spawn_pose`` 现场抽角度 + 适配
+（见上面两张表）；直接写具体名字（如 ``laid_45``、``flat_0``）也可以。"""
 
 SPAWN_POSE_LABELS = {"upright": "立着", "lying": "平放"}
 """界面上显示用的中文名。"""
@@ -357,20 +424,35 @@ def pick_spawn_pose(box: dict, rng) -> tuple[str, str, tuple | None]:
 
     ``box["poses"]`` 写的是**姿态类别**（如 ``["upright", "lying"]``，各 50%）：
 
-    * ``upright``：沿用 XML 的姿态与 z（**四元数返回 None**）→ 立姿局一个字节不变；
-    * ``lying``（别名 ``laid``）：**先随机抽长轴朝向，再适配到允许的角度**
-      （``adapt_lying_yaw`` → ``SPAWN_LYING_YAWS``），最后 ``lying_quat`` 转成四元数。
-      区域里可以用 ``lying_yaws`` 覆盖"允许的角度表"。
+    * ``upright``：默认沿用 XML 的姿态与 z（**四元数返回 None**）→ 立姿局一个字节不变。
+      区域里写了 ``upright_yaws`` 才会**给立姿再随机一个朝向**（绕世界 Z 转，不影响"站得住"）：
+      ``None`` = 整圆周均匀随机（实测 t2 立着黄油 8 个 yaw × 2 个位置 **16/16 都夹得住**：
+      立着夹的是 17.4mm 薄边、爪口 50mm，IK 偏角不影响）；给一个列表则随机后**适配**到最近的
+      一个。姿态名给成 ``up_45`` 这样。
+    * ``lying``（别名 ``laid`` / ``flat``）：**先随机抽长轴朝向，再适配到允许的角度**
+      （``adapt_lying_yaw``），最后 ``lying_quat`` 转成四元数。
+
+      - 绕哪条轴躺由 ``box["lie_axis"]`` 决定：默认 ``"y"``＝绕薄轴躺（t1 的瓶子），
+        ``"x"``＝绕长轴躺（t2 的黄油：大平面朝下）；
+      - 允许的朝向表默认取 ``SPAWN_LIE_DEFAULTS[轴]``，区域里可以用 ``lying_yaws`` 覆盖
+        （``None`` = 不限制、真·任意朝向）；
+      - 姿态名（``detail``）按轴给：绕薄轴 → ``laid_45``、绕长轴 → ``flat_45``。
 
     没写 ``poses`` 就一律"立着"。
     """
     tokens = list(box.get("poses") or ("upright",))
     token = tokens[int(rng.integers(len(tokens)))]
-    if token in ("lying", "laid"):
-        allowed = tuple(box.get("lying_yaws") or SPAWN_LYING_YAWS)
+    if token in ("lying", "laid", "flat"):
+        axis = str(box.get("lie_axis") or "y")
+        allowed = box.get("lying_yaws", SPAWN_LIE_DEFAULTS.get(axis, SPAWN_LYING_YAWS))
         theta = adapt_lying_yaw(float(rng.uniform(0.0, 360.0)), allowed)
-        return "lying", f"laid_{theta:g}", lying_quat(theta)
+        prefix = "laid" if axis == "y" else "flat"
+        return "lying", f"{prefix}_{theta:g}", lying_quat(theta, axis)
     if token == "upright":
+        allowed = box.get("upright_yaws", 0.0)      # 缺省 0.0 = 不随机（老行为逐字不变）
+        if allowed is None or allowed:
+            yaw = adapt_lying_yaw(float(rng.uniform(0.0, 360.0)), allowed or None)
+            return "upright", f"up_{yaw:g}", quat_from_axis_angle("z", yaw)
         return token, token, None
     return token, token, SPAWN_POSE_QUATS[token]
 
