@@ -394,11 +394,77 @@ def main() -> int:
               f"{len(yaws)} 个：" + " ".join(sorted(yaws)[:6]) + " …")
         check("t3 摆位（位置+朝向+高度+闭合轴）都合规", not bad, "；".join(bad) if bad else "6 局都合规")
 
+    # 11c) t5 抓取物（瓶子：位置+姿态）与木托盘随机安放（照 t1 同一套机制，见 README §8.9.3）
+    def s11c():
+        window.task_combo.setCurrentIndex(4)          # 切到 t5
+        regions = window.session.task.get("spawn_region", {})
+        bot = regions.get("new_salad_dressing")
+        check("t5 瓶子带随机安放区域", bot is not None,
+              f"x={bot['x']} y={bot['y']}" if bot else "没有 spawn_region")
+        check("t5 瓶子带姿态随机（立着/平放，与 t1 同款）",
+              list(bot.get("poses", [])) == ["upright", "lying"] if bot else False,
+              f"poses={bot.get('poses') if bot else None}  lie_axis="
+              f"{bot.get('lie_axis') if bot else None}（默认 y = 绕薄轴躺）")
+        check("t5 立着/平放的朝向都整圆周随机",
+              bot is not None and "upright_yaws" in bot and bot["upright_yaws"] is None
+              and "lying_yaws" in bot and bot["lying_yaws"] is None,
+              f"upright_yaws={bot.get('upright_yaws') if bot else None} / "
+              f"lying_yaws={bot.get('lying_yaws') if bot else None}")
+        check("t5 木托盘也带随机安放区域（目标物随机）",
+              regions.get("wooden_tray") is not None,
+              f"x={regions['wooden_tray']['x']} y={regions['wooden_tray']['y']}"
+              if regions.get("wooden_tray") else "托盘没有 spawn_region")
+        check("t5 判分取托盘当前位置（xy_ref=target）",
+              window.session.task["success"].get("xy_ref") == "target")
+        if bot is None:
+            return
+        seen, seen_tray, bad, poses = set(), set(), [], set()
+        for _ in range(6):
+            window.callback_reset()
+            sess = window.session
+            bp = sess.spawn["new_salad_dressing"]
+            x, y = bp.xy
+            poses.add(bp.pose)
+            seen.add((round(x, 4), round(y, 4)))
+            if not (bot["x"][0] <= x <= bot["x"][1] and bot["y"][0] <= y <= bot["y"][1]):
+                bad.append(f"瓶子 ({x:.3f},{y:.3f}) 抽到了区域外")
+            adr = sess.model.jnt_qposadr[sess.model.joint("new_salad_dressing_joint").id]
+            q, q0 = sess.data.qpos[adr:adr + 7], sess.model.qpos0[adr:adr + 7]
+            if bp.pose == "upright":                  # 立着：z 不变 + 纯绕世界 Z 的朝向
+                if abs(q[2] - q0[2]) > 1e-9:
+                    bad.append("瓶子立着那局的 z 变了（纯绕 Z 转不该改高度）")
+                if abs(float(q[4])) > 1e-6 or abs(float(q[5])) > 1e-6:
+                    bad.append(f"瓶子立着朝向不是纯绕 Z（quat={np.round(q[3:7], 3)}）")
+            else:                                     # 平放：姿态写进去、侧面贴桌
+                if not np.allclose(q[3:7], bp.quat, atol=1e-6):
+                    bad.append("瓶子平放那局的四元数没写进自由关节")
+                low = tasks_mod.object_lowest_z(sess.model, sess.data, sess.catalog,
+                                                "new_salad_dressing")
+                if abs(low - tasks_mod.TABLE_TOP_Z) > 0.002:
+                    bad.append(f"瓶子平放那局最低点 {low * 1000:.1f}mm 没贴在桌面上")
+            # 两种姿态都该沿 35.5mm 薄边闭合（绕薄轴躺才不会变成 52.7mm > 爪口）
+            thin = skills_mod.thin_axis_world(sess, "new_salad_dressing")
+            wide = skills_mod.width_along_dir(sess, "new_salad_dressing", thin) * 1000
+            if abs(wide - 35.5) > 1.5:
+                bad.append(f"{bp.label}那局闭合轴方向量到的宽度 {wide:.1f}mm ≠ 35.5mm（夹错方向）")
+            tray = sess.spawn.get("wooden_tray")
+            if tray is not None:
+                seen_tray.add((round(tray.xy[0], 4), round(tray.xy[1], 4)))
+        check("t5 复位会重新随机摆位（瓶子与托盘位置都变）",
+              len(seen) >= 5 and len(seen_tray) >= 5,
+              f"瓶子 {len(seen)} 种 / 托盘 {len(seen_tray)} 种")
+        rng = np.random.default_rng(7)
+        yaws = {p.detail for p in (tasks_mod.sample_spawn(sess.task, rng, sess.catalog)["new_salad_dressing"]
+                                   for _ in range(20))}
+        check("t5 朝向整圆周随机（20 局抽到多个不同 yaw）", len(yaws) >= 8,
+              f"{len(yaws)} 个：" + " ".join(sorted(yaws)[:6]) + " …")
+        check("t5 摆位（位置+姿态+高度+闭合轴）都合规", not bad, "；".join(bad) if bad else "6 局都合规")
+
     # 12) 让主循环再跑一会，统计 FPS 并报告
     def s9():
         check("主循环无异常", not ERRORS, f"{len(ERRORS)} 个异常")
 
-    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s11b):
+    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s11b, s11c):
         step(fn)
 
     QTimer.singleShot(900, run_next)
