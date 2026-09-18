@@ -35,12 +35,13 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass
 
 import numpy as np
 
-from libero_catalog import catalog_object, quat_to_mat
+from libero_catalog import catalog_object, normalize_quat, quat_to_mat
 from libero_scene import TABLE_TOP_Z
 from libero_tasks import check_success, object_world_aabb
 
@@ -82,6 +83,20 @@ CONTACT_STOP_TASKS = {"t3_pudding_into_ramekin"}
 垂直轴投影 52.7→52.0mm），这就是用户看到的"夹爪下去就把物品撞歪"。
 现在：①先扫候选朝向挑**投影最窄**的（``plan_clear_yaw``）；②一接触就停（≤1 帧、≤1.75mm
 过行程）；③触到就跳过低位横向微调（避免侧推）。"""
+
+PUSH_STOP_GAP = 0.003
+"""推滑"停手间隙"：被推物体的前沿距**目标物体**前沿还剩这么多就收手（撤力 → 等待 → 判分）。
+
+⚠ 为什么必须"碰到之前就停"（t6 实测，脚本 ``E:\\deepenv\\_tools\\diag_t6d.py``）：
+书的投影半宽就有 84mm，而旧判据是"书心进盘心 85mm 内"——等于要求书**爬到盘子上**（盘高 19mm）。
+实测书爬不上去（盘的碰撞体是 10 个台阶式方块、没有斜坡），而机械臂推力远大于盘子摩擦：
+把盘子加重到 **920g**、只要继续顶，盘子照样被推走 100mm（三种质量 11.5/69/276g × 两种推速
+都是一样）。改成"前沿快到盘沿就停"后，四种间隙（0/2/5/10mm）下**盘子位移全是 0.0mm**。
+取 3mm 留一点安全余量；停手时书心在 (117,-13)mm 附近，重复性 ±1mm。"""
+
+PUSH_TARGET_SHIFT_TOL = 0.012
+"""推滑过程中目标物体被推走的允许上限（12mm）；超了直接报失败，
+免得"书到了判据点、盘子却被顶跑了"这种情况被当成通过。"""
 
 
 
@@ -128,6 +143,37 @@ def width_along(sess, name: str, axis: str) -> float:
     """物体 AABB 在 x/y 方向的宽度（实时，物体被转过也能跟上）。"""
     lo, hi = aabb(sess, name)
     return float(hi["xy".index(axis)] - lo["xy".index(axis)])
+
+
+def world_box_corners(sess, name: str) -> np.ndarray:
+    """物体**每个碰撞盒在世界系下的 8 个角点**（和 ``object_world_aabb`` 用同一套几何）。"""
+    obj = catalog_object(sess.catalog, name)
+    bid = _body_id(sess, name)
+    rot = quat_to_mat(sess.data.xquat[bid])
+    org = sess.data.xpos[bid]
+    points = []
+    for bpos, bquat, bsize in obj["boxes"]:
+        box_rot = quat_to_mat(normalize_quat(bquat))
+        half = np.asarray(bsize, dtype=float)
+        for sign in itertools.product((-1.0, 1.0), repeat=3):
+            local = np.asarray(bpos, dtype=float) + box_rot @ (half * np.asarray(sign))
+            points.append(org + rot @ local)
+    return np.asarray(points)
+
+
+def gap_along(sess, name_a: str, name_b: str, direction) -> float:
+    """沿 ``direction`` 量：物体 A 的前沿到物体 B 的前沿还剩多少**几何间隙**（米）。
+
+    ⚠ 为什么不用 AABB（t6 实测）：书在被推的过程中会转，AABB 从 134×110mm 涨到 **172×164mm**，
+    用 AABB 投影估间隙会低估 20mm 以上（"以为还差 3mm，其实已经顶上盘子了"）。
+    这里用碰撞盒角点在方向上的投影（支持函数），量到的是真间隙。
+    """
+    pa, pb = world_box_corners(sess, name_a), world_box_corners(sess, name_b)
+    center_a = (pa.min(axis=0) + pa.max(axis=0)) / 2.0
+    center_b = (pb.min(axis=0) + pb.max(axis=0)) / 2.0
+    lead_a = float(np.max((pa[:, :2] - center_a[:2]) @ direction))
+    lead_b = float(np.max((pb[:, :2] - center_b[:2]) @ (-direction)))
+    return float(np.linalg.norm(center_b[:2] - center_a[:2]) - lead_a - lead_b)
 
 
 def scene_rim_z(sess, exclude: str) -> float:
@@ -668,16 +714,21 @@ def place_object(sess, obj: str, target: str | None) -> tuple[bool, str]:
 
 
 def push_object(sess, obj: str, speed: float = 0.0025) -> tuple[bool, str]:
-    """推滑（t6 专用）：绕到物体后方，用**指尖侧面**小步推进，并按实测方向纠偏。
+    """推滑（t6 专用）：**高处绕到物体后方 → 竖直下降 → 推到目标物体前沿前停住**。
 
-    判据就是任务的 ``check_success``（书心进入目标区）——不依赖任何绝对高度，
+    判据就是任务的 ``check_success``（书心落在"盘沿前"的判据点上）——不依赖任何绝对高度，
     也不用"夹取高度"那套（旧版把推任务算成夹取动作，对 134mm 宽的书毫无意义）。
+    推进方向每帧朝**目标物体当前中心**重新对准；到前沿前 ``PUSH_STOP_GAP`` 就撤力停手，
+    并全程守着"目标物体不许被推走"（``PUSH_TARGET_SHIFT_TOL``）。
     """
+    target = sess.task.get("target_object")
     spec_xy = np.asarray(sess.task["success"]["xy"], dtype=float)
 
     def state():
+        """(物体中心, 朝目标物体中心的单位方向, 到目标的距离)。"""
         c = center(sess, obj)
-        d = spec_xy - c[:2]
+        aim = center(sess, target)[:2] if target else spec_xy[:2]
+        d = aim - c[:2]
         n = float(np.linalg.norm(d))
         return c, (d / n if n > 1e-6 else np.array([1.0, 0.0])), n
 
@@ -689,23 +740,38 @@ def push_object(sess, obj: str, speed: float = 0.0025) -> tuple[bool, str]:
     down_z = max(MIN_TCP_Z, top_z(sess, obj) - 0.025)
     back = np.array([c[0] - d[0] * (half + 0.05), c[1] - d[1] * (half + 0.05), down_z])
     yaw = math.degrees(math.atan2(d[1], d[0]))    # 闭合轴沿推进方向：后指推、前指让位
-    yield from goto(sess, back, yaw=yaw, frames=420, label=f"绕到 {obj} 后方")
 
+    # ⚠ 踩坑 7（t6 实测）：原先是**一步** ``goto(back)`` 直接到"后方 804mm"，等于贴着桌面
+    #   横穿过去 —— 实测路上先把书撞了 20.7mm，而且指尖一路贴着书，推的时候很容易被
+    #   "卡住"判据提前收场，表现就是用户看到的"书本没有推动"。
+    #   现在改成：先在**高处**平移到位（现场最高沿/物体顶面之上），再**竖直下降**。
+    travel_z = max(scene_rim_z(sess, exclude=obj) + 0.05, top_z(sess, obj) + 0.05)
+    yield from goto(sess, np.array([back[0], back[1], travel_z]), yaw=yaw,
+                    frames=420, label=f"高处绕到 {obj} 后方")
+    yield from goto(sess, back, yaw=yaw, step=DESCEND_STEP, frames=200,
+                    label=f"竖直降到 {obj} 后方")
+
+    anchor = center(sess, target)[:2].copy() if target else None
     last = center(sess, obj)[:2].copy()
     stuck = 0
     touched = False
-    for _ in range(700):
-        ok, msg = check_success(sess.task, sess.model, sess.data, sess.catalog)
-        if ok:
-            return True, f"书心已进入目标区（{msg}）"
-        touched = touched or touched_by_fingers(sess, obj)
+    gap = gap_along(sess, obj, target, d) if target else 0.0
+    # ⚠ 踩坑 9（t6 实测）：判据从"书心压到盘心 85mm 内"（= 要求书爬上盘子，物理上做不到）
+    #   改成"推到盘沿前停住"，所以停手条件是**几何间隙**，不是"check_success 通过"。
+    for _ in range(900):
         c, d, dist = state()
-        lateral = np.array([-d[1], d[0]])
-        off = float(np.dot(center(sess, obj)[:2] - c[:2], lateral))
+        if target is not None:
+            gap = gap_along(sess, obj, target, d)
+            shoved = float(np.linalg.norm(center(sess, target)[:2] - anchor))
+            if shoved > PUSH_TARGET_SHIFT_TOL:
+                return False, f"{target} 被推走了 {shoved * 1000:.0f}mm（推力远大于它的摩擦）"
+            if gap <= PUSH_STOP_GAP:
+                break                            # 到前沿了：撤力、等待、判分
+        touched = touched or touched_by_fingers(sess, obj)
         cur = tcp(sess)
-        step = d * speed + lateral * float(np.clip(off, -0.002, 0.002))
+        step = d * speed
         sess.set_ee_target(np.array([cur[0] + step[0], cur[1] + step[1], cur[2]]), yaw)
-        yield f"推 {obj}（距目标 {dist * 1000:.0f}mm）"
+        yield f"推 {obj}（距目标 {dist * 1000:.0f}mm，前沿间隙 {gap * 1000:.0f}mm）"
         now = center(sess, obj)[:2]
         # ⚠ 踩坑 4："卡住"必须在**指尖已经贴上物体之后**才开始计数：
         #   先前从第一帧就数"物体没动"，而接近阶段（要走 50mm 才碰到书）物体本来就不动，
@@ -713,8 +779,30 @@ def push_object(sess, obj: str, speed: float = 0.0025) -> tuple[bool, str]:
         stuck = stuck + 1 if (touched and float(np.linalg.norm(now - last)) < 0.0004) else 0
         last = now
         if stuck >= 60:
-            return False, "指尖已贴上但推不动（物体卡住或太重）"
-    return False, "推进超时"
+            break
+    else:
+        return False, "推进超时"
+
+    # 撤力：目标往回退 3mm 卸掉推力，再等物体停稳（贴着盘沿停住时，残余推力会把盘子顶走）
+    for _ in range(10):
+        cur = tcp(sess)
+        sess.set_ee_target(np.array([cur[0] - d[0] * 0.003, cur[1] - d[1] * 0.003, cur[2]]), yaw)
+        yield "收手（撤掉推力）"
+    for _ in range(45):
+        yield "等待稳定（物体滑停在盘沿前）"
+
+    if target is not None:
+        _, d_end, _ = state()
+        gap = gap_along(sess, obj, target, d_end)
+        shoved = float(np.linalg.norm(center(sess, target)[:2] - anchor))
+        if shoved > PUSH_TARGET_SHIFT_TOL:
+            return False, f"{target} 被推走了 {shoved * 1000:.0f}mm（推力远大于它的摩擦）"
+    ok, msg = check_success(sess.task, sess.model, sess.data, sess.catalog)
+    if not ok:
+        why = "指尖已贴上但推不动" if stuck >= 60 else "停在了目标前沿前"
+        return False, f"{why}，且没进判据（{msg}）"
+    where = f"{target} 前沿前 {gap * 1000:.0f}mm" if target else "判据点"
+    return True, f"已把 {obj} 推到 {where} 停住（{msg}）"
 
 
 # ────────────────────────────── 每关的动作骨架 ──────────────────────────────
