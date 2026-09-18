@@ -335,11 +335,70 @@ def main() -> int:
               f"{len(up_yaws)} 个：" + " ".join(sorted(up_yaws)[:6]) + " …")
         check("t2 摆位（位置+姿态+闭合轴+贴桌）都合规", not bad, "；".join(bad) if bad else "6 局都合规")
 
+    # 11b) t3 抓取物（布丁盒：位置+朝向）与小碟随机安放（照 t2 同一套机制，见 README §8.9.2）
+    def s11b():
+        window.task_combo.setCurrentIndex(2)          # 切到 t3
+        regions = window.session.task.get("spawn_region", {})
+        pud = regions.get("chocolate_pudding")
+        check("t3 布丁盒带随机安放区域", pud is not None,
+              f"x={pud['x']} y={pud['y']}" if pud else "没有 spawn_region")
+        check("t3 布丁盒朝向整圆周随机（upright_yaws=None）", pud is not None and "upright_yaws" in pud
+              and pud["upright_yaws"] is None,
+              f"upright_yaws={pud.get('upright_yaws') if pud else None}")
+        check("t3 不做平放（躺下 80.2mm 塞不进小碟内腔，见 §8.9.2）",
+              pud is not None and "lying" not in list(pud.get("poses") or ()),
+              f"poses={list(pud.get('poses') or ()) if pud else None}")
+        check("t3 小碟也带随机安放区域（目标物随机）",
+              regions.get("glazed_rim_porcelain_ramekin") is not None,
+              f"x={regions['glazed_rim_porcelain_ramekin']['x']} "
+              f"y={regions['glazed_rim_porcelain_ramekin']['y']}"
+              if regions.get("glazed_rim_porcelain_ramekin") else "小碟没有 spawn_region")
+        check("t3 判分取小碟当前位置（xy_ref=target）",
+              window.session.task["success"].get("xy_ref") == "target")
+        if pud is None:
+            return
+        seen, seen_dish, bad, poses = set(), set(), [], set()
+        for _ in range(6):
+            window.callback_reset()
+            sess = window.session
+            bp = sess.spawn["chocolate_pudding"]
+            x, y = bp.xy
+            poses.add(bp.pose)
+            seen.add((round(x, 4), round(y, 4)))
+            if not (pud["x"][0] <= x <= pud["x"][1] and pud["y"][0] <= y <= pud["y"][1]):
+                bad.append(f"布丁盒 ({x:.3f},{y:.3f}) 抽到了区域外")
+            adr = sess.model.jnt_qposadr[sess.model.joint("chocolate_pudding_joint").id]
+            q, q0 = sess.data.qpos[adr:adr + 7], sess.model.qpos0[adr:adr + 7]
+            # 立着 + 纯绕世界 Z 的朝向：高度不变、四元数只有 z 分量与 w
+            if abs(q[2] - q0[2]) > 1e-9:
+                bad.append("布丁盒那局的 z 变了（纯绕 Z 转不该改高度）")
+            if bp.quat is not None and not np.allclose(q[3:7], bp.quat, atol=1e-6):
+                bad.append("布丁盒的随机朝向没写进自由关节")
+            if abs(float(q[4])) > 1e-6 or abs(float(q[5])) > 1e-6:
+                bad.append(f"布丁盒朝向不是纯绕 Z（quat={np.round(q[3:7], 3)}）")
+            # 立着才该夹 27.4mm 薄边
+            thin = skills_mod.thin_axis_world(sess, "chocolate_pudding")
+            wide = skills_mod.width_along_dir(sess, "chocolate_pudding", thin) * 1000
+            if abs(wide - 27.4) > 1.5:
+                bad.append(f"布丁盒闭合轴方向量到的宽度 {wide:.1f}mm ≠ 27.4mm（夹错方向）")
+            dish = sess.spawn.get("glazed_rim_porcelain_ramekin")
+            if dish is not None:
+                seen_dish.add((round(dish.xy[0], 4), round(dish.xy[1], 4)))
+        check("t3 复位会重新随机摆位（布丁盒与小碟位置都变）",
+              len(seen) >= 5 and len(seen_dish) >= 5,
+              f"布丁盒 {len(seen)} 种 / 小碟 {len(seen_dish)} 种")
+        rng = np.random.default_rng(7)
+        yaws = {p.detail for p in (tasks_mod.sample_spawn(sess.task, rng, sess.catalog)["chocolate_pudding"]
+                                   for _ in range(20))}
+        check("t3 朝向整圆周随机（20 局抽到多个不同 yaw）", len(yaws) >= 8,
+              f"{len(yaws)} 个：" + " ".join(sorted(yaws)[:6]) + " …")
+        check("t3 摆位（位置+朝向+高度+闭合轴）都合规", not bad, "；".join(bad) if bad else "6 局都合规")
+
     # 12) 让主循环再跑一会，统计 FPS 并报告
     def s9():
         check("主循环无异常", not ERRORS, f"{len(ERRORS)} 个异常")
 
-    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11):
+    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s11b):
         step(fn)
 
     QTimer.singleShot(900, run_next)

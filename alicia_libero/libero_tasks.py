@@ -139,9 +139,25 @@ TASKS: list[dict] = [
             {"key": "stable_scanned_objects/glazed_rim_porcelain_ramekin",
              "xy": [0.21, 0.09], "yaw": 0.0},
         ],
+        # 任务多样化（与 t1/t2 同一套机制，见 README §8.9）：**布丁盒位置/朝向随机、小碟位置随机**。
+        # 与 t2 的差别（每条都实测过，脚本在 ``E:\deepenv\_tools\diag_t3_poses.py``）：
+        #   ① 布丁盒 27.4×46.3×80.2mm（又高又轻，`grasp_axis=x` = 夹 27.4mm 薄边）。
+        #      立姿**没有第二种可选姿态** —— 躺下后最短水平投影是 80.2mm，而小碟内腔只有
+        #      ~70mm（89mm 外径 − 两圈瓷壁），塞不进去：实测悬空落到碟心，最低点停在
+        #      +37mm（骑在碟沿上），3 次里还有 1 次直接滑到桌面。所以这里只做
+        #      "立着 + 随机朝向"（``upright_yaws``），不提供平放。
+        #   ② 抓取点 = 物体中心 + catalog 的 ``grasp_tcp_offset``(−25.5mm) ≈ 814mm（和 t2 的
+        #      807~810mm 一样低），所以位置区域同样收紧，不放 t1 立姿那样的 x=0.18。
+        "spawn_region": {
+            "chocolate_pudding": {"x": [0.00, 0.09], "y": [-0.20, -0.10],
+                                  "upright_yaws": None},
+            "glazed_rim_porcelain_ramekin": {"x": [0.14, 0.24], "y": [0.02, 0.16]},
+        },
         "grasp_object": "chocolate_pudding",
         "target_object": "glazed_rim_porcelain_ramekin",
-        "success": {"xy": [0.21, 0.09], "xy_tol": 0.035, "z_ref": "table", "z_band": [0.0, 0.05]},
+        # ``xy_ref="target"``：小碟随机安放 → 判分取**小碟当前实际中心**（与 t1/t2 同理）
+        "success": {"xy": [0.21, 0.09], "xy_ref": "target", "xy_tol": 0.035,
+                    "z_ref": "table", "z_band": [0.0, 0.05]},
     },
     {
         "id": "t4_popcorn_onto_plate",

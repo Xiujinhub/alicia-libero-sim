@@ -680,6 +680,7 @@ def calibrated_yaw(sess, obj: str, yaw0: float | None = None,
 STABLE_GRASP_WIDTH_TASKS = {"t3_pudding_into_ramekin"}
 """开口判据改用 catalog 里**建场景时量好的** ``grasp_width``，而不是"实时 AABB 宽度"。
 
+
 ⚠ 为什么只给 t3 开（实测记录）：夹取过程里"实时宽度"会被自己的手指污染 ——
 布丁盒 27.4mm 宽，指尖一压就歪，实测闭合那一刻的实时宽度依次是 **65.7 / 56.0 / 52.9mm**，
 而**开口**却是 26.4 / 31.9 / 32.1mm、**夹持力** 2.8~3.2N，且抬起后物体底分别跟随了
@@ -689,6 +690,33 @@ STABLE_GRASP_WIDTH_TASKS = {"t3_pudding_into_ramekin"}
 
 改用 catalog 的 ``grasp_width``（27.4mm，与三次实测开口 26.4/31.9/32.1 都吻合，而与
 空夹的 -0.2mm 差 27mm）后，四次判定全部正确。其它任务按实时宽度已能过，就不动它们。"""
+
+
+WIDE_YAW_SCAN_TASKS = {"t3_pudding_into_ramekin"}
+"""候选闭合朝向**按实测单边间隙排序、不够时再补扫 ±45° 家族**的任务（只给 t3 开）。
+
+⚠ 为什么（实测，脚本 ``_tools\\diag_t3_poses.py`` / ``diag_t3_flow.py``）：布丁盒
+27.4×46.3mm 的矩形截面几乎塞满爪口（沿闭合轴投影 = 27.4·cosθ + 46.3·sinθ，θ=40° 时
+51.4mm > 爪口 50mm），而 IK 姿态是**软约束**、实测闭合轴偏航误差 0~40° **随臂的姿态变**
+—— 同一个朝向换个摆位、同一个摆位换个朝向，误差都不一样。于是"只扫 0°/90°/180° 三个候选、
+按固定顺序试"会漏掉唯一能夹住的那个分支。隔离实验（同一位置 (48,−190) 换朝向、
+同一朝向 138° 换位置）：
+
+| 配置 | 只扫 {0,+90,+180}（旧） | 排序 + 补扫 ±45°（新） |
+| --- | --- | --- |
+| θ=138° @ (48,−190) | **0/2 ✗**（三个候选都夹空，布丁留在桌上） | **2/2 ✓** |
+| θ=0° / θ=228° @ (48,−190) | 2/2 ✓ / 2/2 ✓ | 2/2 ✓ / 2/2 ✓ |
+| θ=138° @ (30,−120) | 2/2 ✓ | 2/2 ✓ |
+
+实现：先用 ``plan_clear_yaw`` 把三个 90° 家族候选都量一遍并按**实测单边间隙**从大到小排序
+（同一把爪子的真实投影宽，最"套得进去"的先试）；只有当三个都量到 **≤0**（都套不进去）时，
+才再花 4 次探测补扫 ±45° 家族 —— 所以 90° 家族够用的局不会多付帧数。
+
+其它任务保持原来的 3 个候选 + 原顺序，行为一字不改。"""
+WIDE_YAW_SCAN_OFFSETS = (0.0, 90.0, 180.0)
+"""t3 先扫的候选偏航偏移（相对 ``yaw_for_axis``）。"""
+WIDE_YAW_SCAN_FALLBACK = (45.0, -45.0, 135.0, -135.0)
+"""三个 90° 家族候选实测都"套不进去"时，t3 再补扫的 ±45° 家族。"""
 
 
 def jaws_clearance(sess, obj: str, axis) -> tuple[float, float]:
@@ -759,9 +787,18 @@ def grasp_object(sess, obj: str) -> tuple[bool, str]:
     yaw_seq: list = [yaw_fixed]
     yaw_clear: dict = {}
     if watch:
-        # 扫 0°/90°/180°：既把末端摆到对齐高度，又量出每个朝向的"预计单边间隙"
+        # 扫 0°/90°/180°（t3 见 WIDE_YAW_SCAN_TASKS：按实测间隙排序、不够再补 ±45° 家族）：
+        # 既把末端摆到对齐高度，又量出每个朝向的"预计单边间隙"
         # （实测 t3：0° 真实闭合轴与盒子窄边差 40° → 沿轴投影 51.4mm ≈ 爪口 50mm）
-        plan = yield from plan_clear_yaw(sess, obj)
+        wide = task_id in WIDE_YAW_SCAN_TASKS
+        plan = yield from plan_clear_yaw(
+            sess, obj, offsets=(WIDE_YAW_SCAN_OFFSETS if wide else (0.0, 90.0, 180.0)))
+        if wide:
+            plan.sort(key=lambda item: -item[1])       # 实测间隙大的先试
+            if max(gap for _, gap, _ in plan) <= 0.0:  # 三个都套不进去 → 补扫 ±45° 家族
+                plan += (yield from plan_clear_yaw(sess, obj,
+                                                   offsets=WIDE_YAW_SCAN_FALLBACK))
+                plan.sort(key=lambda item: -item[1])
         yaw_seq = [cand for cand, _, _ in plan]
         yaw_clear = {cand: gap for cand, gap, _ in plan}
     for yaw_sel in yaw_seq:
