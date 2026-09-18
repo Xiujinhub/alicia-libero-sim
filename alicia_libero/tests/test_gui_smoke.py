@@ -125,28 +125,31 @@ def main() -> int:
         check("复位场景", abs(window.session.joint_target[0]) < 1e-6 and z > 0.80,
               f"J1={np.degrees(window.session.joint_target[0]):.1f}° {grasp} z={z:.3f}")
 
-    # 8) 规划已删除的确认：界面与仿真会话里不应再有任何"动作规划"入口
+    # 8) 自动执行（闭环技能库）已接好：界面/会话里应有对应接口，且不再有旧的 libero_plan
     def s8():
         import importlib.util
 
-        check("动作规划模块已删除", importlib.util.find_spec("libero_plan") is None,
-              "libero_plan 已不可导入")
-        check("会话里没有规划状态",
-              not any(hasattr(window.session, name) for name in
-                      ("plan", "plan_mode", "script", "grasp_status", "home_ee",
-                       "grasp_tcp_offset_actual")),
-              "session 无 plan/script/grasp_status/home_ee")
-        check("会话里没有自动夹取/放置方法",
-              not any(hasattr(window.session, name) for name in
-                      ("assisted_grasp", "assisted_place", "move_via_safe_height",
-                       "queue_action", "step_script", "grasp_tcp_z", "release_tcp_z",
-                       "target_xy", "go_home")),
-              "session 无自动夹取/放置相关方法")
-        check("界面里没有规划按钮",
-              not any(hasattr(window, name) for name in
-                      ("plan_button", "plan_text", "align_grasp_button",
-                       "callback_execute_plan", "callback_grasp", "callback_release")),
-              "控制面板里没有 ①②③④⑤ / ▶ 按钮")
+        check("旧规划模块仍未复活", importlib.util.find_spec("libero_plan") is None,
+              "libero_plan 不存在")
+        check("技能库可导入", importlib.util.find_spec("skills") is not None,
+              "alicia_libero/skills.py 可用")
+        check("会话带闭环技能所需接口",
+              all(hasattr(window.session, name) for name in
+                  ("set_ee_target", "tcp_position", "gripper", "step", "task")),
+              "set_ee_target/tcp_position/gripper/step/task 齐备")
+        check("界面有自动执行控件",
+              all(hasattr(window, name) for name in
+                  ("auto_button", "auto_step_button", "auto_status", "auto_result")),
+              "▶ 自动完成本关 / 单步 / 状态 / 明细")
+        check("SkillRunner 已挂到会话",
+              window.auto is not None and window.auto.sess is window.session,
+              "window.auto 指向当前 session")
+        # 单步一次：应能推进技能状态且不抛异常
+        window.auto.start()
+        window.callback_auto_single()
+        check("自动执行可单步推进", window.auto.status not in ("", "就绪"),
+              f"status={window.auto.status}")
+        window.auto.stop()
 
     # 10) 让主循环再跑一会，统计 FPS 并报告
     def s9():

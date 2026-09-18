@@ -55,8 +55,10 @@ from alicia_ik import AliciaIK, finger_targets  # noqa: E402
 from libero_catalog import catalog_object, load_catalog  # noqa: E402
 from libero_scene import TABLE_TOP_Z  # noqa: E402
 from libero_tasks import TASKS, build_task_scene, check_success  # noqa: E402
+import skills  # noqa: E402  （闭环技能库：接触/跟随判据驱动的自动执行）
 
 VIEW_W, VIEW_H = 900, 640          # 离屏渲染分辨率
+JOINT_STEP_MAX_DEG = 8.0           # 一帧内单个关节最多动多少度（IK 限速，防"换臂形甩臂"）
 CAMERAS = ["cam_front", "cam_top", "cam_side", "cam_wrist"]
 CAMERA_LABELS = ["斜前方", "正上方", "侧前方", "腕部相机"]
 
@@ -64,7 +66,8 @@ CAMERA_LABELS = ["斜前方", "正上方", "侧前方", "腕部相机"]
 class SimSession:
     """一次任务场景的仿真会话：模型 / 数据 / IK / 渲染器 / 目标点。"""
 
-    def __init__(self, task: dict, catalog: dict) -> None:
+    def __init__(self, task: dict, catalog: dict, render: bool = True) -> None:
+        """``render=False`` 时不建 MuJoCo 离屏渲染器（无头批量试验用，快很多）。"""
         self.task = task
         self.catalog = catalog
         xml, _ = build_task_scene(task, catalog=catalog)
@@ -72,8 +75,8 @@ class SimSession:
         self.model = mujoco.MjModel.from_xml_path(str(xml))
         self.data = mujoco.MjData(self.model)
         self.ik = AliciaIK(self.model)
-        self.renderer = mujoco.Renderer(
-            self.model, height=VIEW_H, width=VIEW_W)
+        self.renderer = (mujoco.Renderer(self.model, height=VIEW_H, width=VIEW_W)
+                         if render else None)
         # 物体碰撞盒在 group 3：界面里默认不渲染（不然会看到一堆灰色方块套在物体外面）
         self.scene_option = mujoco.MjvOption()
         self.scene_option.geomgroup[3] = 0
@@ -127,8 +130,11 @@ class SimSession:
     def tcp_position(self) -> np.ndarray:
         return self.data.site_xpos[self.ik.site_id].copy()
 
-    def set_ee_target(self, target) -> None:
+    def set_ee_target(self, target, yaw: float | None = None) -> None:
         """给末端目标点做 IK，并把解写进关节目标。
+
+        ``yaw``：夹爪闭合方向的偏航角（度）；None = 用本任务的 ``self.grasp_yaw``。
+        技能库在抓取/推滑时会传入自己算的偏航角（例如"闭合轴沿推进方向"）。
 
         ⚠ 踩坑 1：IK 从"上一帧解"做种子时可能陷进局部极小（实测目标 z=0.892 只走到 0.948），
         所以位置误差偏大时改用多个种子重试，取误差最小的解。
@@ -142,16 +148,29 @@ class SimSession:
             target[:2] = base_xy + direction * 0.62
         self.ee_target = target
 
-        orientation = self.ik.down_orientation(self.grasp_yaw)
-        # 最基本的 6 轴 IK：两种子取误差最小的解。
-        best_q, best_err = None, np.inf
-        for seed in (self.joint_target, np.zeros(6)):
-            q, err = self.ik.solve(target, orientation, q_seed=seed, iters=60)
-            if err < best_err:
-                best_q, best_err = q, err
-            if err < 1e-3:
-                break
-        self.joint_target = best_q
+        orientation = self.ik.down_orientation(self.grasp_yaw if yaw is None else yaw)
+        q_prev = self.joint_target.copy()
+        # ⚠ 性能：IK 每轮迭代都调 mj_forward，而 mj_forward 会做**完整碰撞检测**
+        # （2 种子 × 2 阶段 × 60 轮 ≈ 240 次/帧，实测 4~13 fps 的元凶）。
+        # IK 只要运动学，所以整段求解期间临时关掉接触生成，算完立刻恢复。
+        flags = self.model.opt.disableflags
+        self.model.opt.disableflags = flags | mujoco.mjtDisableBit.mjDSBL_CONTACT
+        try:
+            best_q, best_score = None, np.inf
+            for seed in (q_prev, np.zeros(6)):
+                q, err = self.ik.solve(target, orientation, q_seed=seed, iters=60)
+                # 代价 = 位置误差 + 关节空间偏离。
+                # ⚠ 踩坑 2：零位附近是奇异点，**只按位置误差挑解会跳到"另一个臂形"**
+                # （实测 J6 甩到 ±180°），整条臂跟着甩过去 —— "抬臂准备"时 TCP 反而先掉
+                # 74mm、手指蹭到桌面再慢慢爬回来。加上关节偏离项后能稳定挑到连续解。
+                score = float(err + 0.05 * float(np.linalg.norm(q - q_prev)))
+                if score < best_score:
+                    best_q, best_score = q, score
+        finally:
+            self.model.opt.disableflags = flags
+        # 关节限速：一帧最多 8°，即使 IK 换臂形也不会让整条臂"甩"过去
+        limit = np.radians(JOINT_STEP_MAX_DEG)
+        self.joint_target = np.clip(best_q, q_prev - limit, q_prev + limit)
         if self.marker_body >= 0:
             self.data.mocap_pos[0] = target
 
@@ -218,6 +237,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Alicia-D × LIBERO 桌面操作仿真台")
         self.catalog = load_catalog()
         self.session: SimSession | None = None
+        self.auto: skills.SkillRunner | None = None
+        self._auto_reported = False
         self.mode = "drag"
         self.selected_joint = 0
         self.success_count = 0
@@ -252,6 +273,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(8)
         layout.addWidget(self._build_task_box())
         layout.addWidget(self._build_control_box())
+        layout.addWidget(self._build_auto_box())
         layout.addWidget(self._build_view_box())
         layout.addWidget(self._build_help_box())
         layout.addStretch(1)
@@ -314,6 +336,32 @@ class MainWindow(QMainWindow):
 
         return box
 
+    def _build_auto_box(self) -> QGroupBox:
+        """自动执行面板：一条按钮 + 状态行 + 每步明细。
+
+        背后的 ``skills`` 是**闭环**的：每帧读实际接触/位置决定下一步，
+        因此按钮只有"开始/暂停/单步"，没有"执行固定脚本"的说法。
+        """
+        box = QGroupBox("自动执行（闭环技能库 skills.py）")
+        layout = QVBoxLayout(box)
+        row = QHBoxLayout()
+        self.auto_button = QPushButton("▶ 自动完成本关")
+        self.auto_button.clicked.connect(self.callback_auto_toggle)
+        row.addWidget(self.auto_button)
+        self.auto_step_button = QPushButton("单步")
+        self.auto_step_button.clicked.connect(self.callback_auto_single)
+        row.addWidget(self.auto_step_button)
+        layout.addLayout(row)
+        self.auto_status = QLabel("就绪")
+        self.auto_status.setWordWrap(True)
+        self.auto_status.setStyleSheet("color:#7fd1ff; font-size:11px;")
+        layout.addWidget(self.auto_status)
+        self.auto_result = QLabel("")
+        self.auto_result.setWordWrap(True)
+        self.auto_result.setStyleSheet("color:#cfd8e3; font-size:11px;")
+        layout.addWidget(self.auto_result)
+        return box
+
     def _build_view_box(self) -> QGroupBox:
         box = QGroupBox("视图 / 场景")
         layout = QVBoxLayout(box)
@@ -340,7 +388,7 @@ class MainWindow(QMainWindow):
             "滚轮 = 升降夹爪    Shift+滚轮 = 夹爪开合\n"
             "1..6 选关节    , / . 关节 ±2°    O / C 夹爪开合\n"
             "R 复位场景    T 切换相机\n"
-            "⚠ 动作规划已移除：自动接近/夹取/搬运/放置待重写"
+            "自动执行 = 闭环技能库（接触/跟随判据），手动操作会自动暂停它"
         )
         help_text.setWordWrap(True)
         help_text.setStyleSheet("color:#9fb3c8; font-size:11px;")
@@ -352,9 +400,14 @@ class MainWindow(QMainWindow):
         task = TASKS[index]
         self.statusBar().showMessage(f"正在加载任务 {task['id']} ……")
         try:
-            if self.session is not None:
+            if self.session is not None and self.session.renderer is not None:
                 self.session.renderer.close()
             self.session = SimSession(task, self.catalog)
+            self.auto = skills.SkillRunner(self.session)
+            self._auto_reported = False
+            self.auto_status.setText("就绪（点 ▶ 自动完成本关）")
+            self.auto_result.setText("")
+            self.auto_button.setText("▶ 自动完成本关")
         except Exception as exc:  # noqa: BLE001
             self.result_text.setText(f"❌ 场景加载失败：{exc}")
             return
@@ -407,12 +460,52 @@ class MainWindow(QMainWindow):
 
     def callback_reset(self) -> None:
         if self.session is not None:
+            if self.auto is not None:
+                self.auto.stop()
+                self.auto_status.setText("已停止（场景复位）")
+                self.auto_button.setText("▶ 自动完成本关")
             self.session.reset()
             self._sync_controls()
             self.was_success = False
             self.result_text.setStyleSheet("font-size:13px; font-weight:bold; color:#d7e3f4;")
             self.result_text.setText("状态：进行中")
             self.statusBar().showMessage("场景已复位")
+
+    # ────────────────── 自动执行（闭环技能库） ──────────────────
+    def _pause_auto(self) -> None:
+        """手动接管（拖拽/微调/滑块/夹爪）时自动暂停，避免和技能抢控制权。"""
+        if self.auto is not None and self.auto.active and not self.auto.paused:
+            self.auto.pause()
+            self.auto_button.setText("▶ 继续自动")
+            self.statusBar().showMessage("检测到手动操作：自动执行已暂停")
+
+    def callback_auto_toggle(self) -> None:
+        if self.auto is None:
+            return
+        if not self.auto.active:
+            self.auto.start()
+            self._auto_reported = False
+            self.auto_button.setText("⏸ 暂停自动")
+            self.auto_status.setText("开始")
+            self.auto_result.setText("")
+            self.statusBar().showMessage("自动执行开始（每帧读接触/位置决定下一步）")
+        elif self.auto.paused:
+            self.auto.resume()
+            self.auto_button.setText("⏸ 暂停自动")
+        else:
+            self.auto.pause()
+            self.auto_button.setText("▶ 继续自动")
+
+    def callback_auto_single(self) -> None:
+        """单步：暂停状态下推进一帧，便于逐步观察每个判据。"""
+        if self.auto is None:
+            return
+        if not self.auto.active:
+            self.auto.start()
+        self.auto.pause()
+        self.auto.step()
+        self.auto_button.setText("▶ 继续自动")
+        self.auto_status.setText("单步：" + self.auto.status)
 
     # ────────────────── 鼠标拖拽 → IK ──────────────────
     def _screen_axes(self):
@@ -430,6 +523,7 @@ class MainWindow(QMainWindow):
     def drag_end_effector(self, dx_px: float, dy_px: float, disp_w: int, disp_h: int) -> None:
         if self.session is None or self.mode != "drag" or disp_w <= 0:
             return
+        self._pause_auto()
         right, up, meters_per_px = self._screen_axes()
         meters_per_px *= VIEW_W / float(disp_w)        # 显示缩放折算回渲染像素
         delta = right * (dx_px * meters_per_px) + up * (-dy_px * meters_per_px)
@@ -438,6 +532,7 @@ class MainWindow(QMainWindow):
     def nudge_end_effector(self, steps: float) -> None:
         if self.session is None or self.mode != "drag":
             return
+        self._pause_auto()
         target = self.session.ee_target.copy()
         target[2] += 0.012 * steps
         self.session.set_ee_target(target)
@@ -446,11 +541,13 @@ class MainWindow(QMainWindow):
         """键盘/滚轮调夹爪：同样直接改 session 再同步控件，避免只动滑块漏改状态。"""
         if self.session is None:
             return
+        self._pause_auto()
         self.session.gripper = float(np.clip(self.session.gripper + delta, 0.0, 1.0))
         self._sync_controls()
 
     def _nudge_joint(self, delta_deg: float) -> None:
         sess = self.session
+        self._pause_auto()
         q_deg = np.degrees(sess.joint_target.copy())
         q_deg[self.selected_joint] += delta_deg
         sess.joint_target = np.radians(q_deg)
@@ -493,6 +590,15 @@ class MainWindow(QMainWindow):
         sess = self.session
         if sess is None:
             return
+        if self.auto is not None:                     # 闭环技能：先按当前状态定目标，再跑物理
+            self.auto.step()
+            self.auto_status.setText("自动：" + self.auto.status)
+            if self.auto.finished and not self._auto_reported:
+                self._auto_reported = True
+                self.auto_result.setText(self.auto.summary())
+                self.auto_button.setText("▶ 自动完成本关")
+                self.statusBar().showMessage(
+                    "自动执行结束：" + ("成功 ✅" if self.auto.ok else "未完成 ❌"))
         sess.step(8)                                  # dt=2ms × 8 ≈ 1/60 s
         frame = sess.render()
         image = QImage(frame.data, VIEW_W, VIEW_H, 3 * VIEW_W, QImage.Format_RGB888).copy()
