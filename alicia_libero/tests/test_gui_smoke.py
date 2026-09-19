@@ -2,12 +2,24 @@
 
 运行：python tests/test_gui_smoke.py    （期望输出：全部 PASS、0 异常；结尾会打印"通过 N/N"）
 """
+import json
+import os
+import shutil
 import sys
+import time
 import traceback
 from pathlib import Path
 
+import pandas as pd
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
+
+# 数据集采集（s12）写到本项目的 Datasets/_smoke 沙盒里（跑完自动清理，别脏了真数据集）
+REC_ROOT = HERE.parents[1] / "Datasets" / "_smoke"
+shutil.rmtree(REC_ROOT, ignore_errors=True)
+REC_ROOT.mkdir(parents=True, exist_ok=True)
+os.environ["ALICIA_DATASETS_DIR"] = str(REC_ROOT)
 
 from PySide6.QtCore import QPointF, Qt, QTimer  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
@@ -20,8 +32,13 @@ def _hook(exc_type, exc, tb):
 sys.excepthook = _hook
 
 import alicia_libero_app as app_mod  # noqa: E402
+import dataset_recorder as rec_mod  # noqa: E402
 import libero_tasks as tasks_mod  # noqa: E402  （算"随机安放的占地间隙"用）
 import skills as skills_mod  # noqa: E402  （量"闭合轴方向上的宽度"用）
+
+# 保险：冒烟测试**只准**往沙盒目录写数据集，绝不碰用户的 Datasets/（s12 会真的录一小段）
+assert rec_mod.datasets_dir() == REC_ROOT, \
+    f"冒烟测试必须只写沙盒目录，实际 = {rec_mod.datasets_dir()}"
 
 results = []
 
@@ -68,6 +85,13 @@ def main() -> int:
               f"ketchup z={kz:.3f}（{kp.label}，期望 {want:.3f}）")
         check("渲染出图", window.view.pixmap() is not None and not window.view.pixmap().isNull(),
               f"{window.view.pixmap().width()}x{window.view.pixmap().height()}")
+        # 连续任务面板的**构造默认值**（放在这里查最稳：后面的步骤会切模式/勾选表）
+        check("连续任务默认单任务模式、勾选表不可点、采集未开始",
+              window.cont_mode_combo.currentIndex() == 0
+              and not window.cont_task_list.isEnabled()
+              and not window.rec_check.isChecked() and not window.recorder.active,
+              f"模式={window.cont_mode_combo.currentText()}、"
+              f"勾选表 enabled={window.cont_task_list.isEnabled()}")
 
     # 2) 鼠标拖动 → IK 移动
     def s2():
@@ -119,6 +143,160 @@ def main() -> int:
         window.joint_sliders[0].setValue(25)
         check("滑块驱动关节", abs(np.degrees(window.session.joint_target[0]) - 25.0) < 0.6,
               f"J1={np.degrees(window.session.joint_target[0]):.1f}°")
+
+    # 12) 数据集采集（LeRobot 格式）：勾选即采 / 一局=复位边界 / 每相机一个 mp4 / 断点续采
+    def s12():
+        import json
+        import os
+        import dataset_recorder as dsmod
+
+        root = Path(os.environ["ALICIA_DATASETS_DIR"])
+        window.rec_name.setText("smoke_ds")
+        window.rec_fps.setValue(60)                   # 60Hz：一 tick 一帧，测试里攒帧最快
+        window.rec_only_ok.setChecked(False)          # 这一局不判成功也要存，方便验证
+        window.rec_resume.setChecked(False)
+        window.rec_check.setChecked(True)             # 勾选 = 只是"要不要采"的开关
+        check("勾选「数据采集」只是开关：不建库、不记录",
+              (not window.recorder.active) and window.recorder.path is None
+              and window.recorder.wanted,
+              window.rec_status.text().replace("\n", " "))
+        check("状态行提示已就绪（等着点连续任务）",
+              "就绪" in window.rec_status.text(),
+              window.rec_status.text().replace("\n", " "))
+
+        # 点「开始连续任务」→ 才真正开录（用假技能流走完这一局，不真跑物理，秒级）
+        window.cont_mode_combo.setCurrentIndex(0)
+        window.cont_count_spin.setValue(1)
+        window.task_combo.setCurrentIndex(0)
+        window.start_continuous()
+        rec = window.recorder
+        first = rec.path
+        check("点「开始连续任务」才开始采集（后台建库）", rec.active and first is not None,
+              f"path={first.name if first else None}")
+        check("不勾断点续采 → 用带时间戳的新名字",
+              first is not None and first.name.startswith("smoke_ds_") and first.parent == root,
+              f"{first.name if first else None} @ {root.name}")
+
+        end = time.perf_counter() + 240               # 等后台把 lerobot 建库打开（首次导入较慢）
+        while time.perf_counter() < end and not window.recorder.error:
+            if window.recorder._dataset is not None:  # noqa: SLF001（测试里允许看内部）
+                break
+            window.tick()
+            app.processEvents()
+            time.sleep(0.02)
+        check("数据集在后台打开成功", not window.recorder.error, window.recorder.error or "ok")
+
+        for _ in range(12):                           # 攒几帧（60Hz + 每 tick 16ms 仿真 ≈ 一 tick 一帧）
+            window.tick()
+            app.processEvents()
+            QTest.qWait(10)
+        check("连续任务进行中才记录", rec.frames + rec.buffered > 0,
+              f"{rec.frames + rec.buffered} 帧")
+
+        def slow_gen(ok=True):                        # 假技能流：多 yield 几下，够攒几帧
+            for _ in range(6):
+                yield "假执行"
+            return [skills_mod.Step(skills_mod.JUDGE_LABEL, ok, "假判分")]
+
+        window.auto.gen = slow_gen(True)              # 换掉真技能，秒级走完这一局
+        end = time.perf_counter() + 120
+        while time.perf_counter() < end and window.cont_active:
+            window.tick()
+            app.processEvents()
+        end = time.perf_counter() + 180               # 等这一局写完（视频编码在后台）
+        while time.perf_counter() < end:
+            app.processEvents()
+            if rec.episodes >= 1 and rec.queued == 0:
+                break
+            time.sleep(0.02)
+        check("连跑 1 局 = 数据集里 1 个 episode", rec.episodes == 1 and rec.frames >= 3,
+              f"{rec.episodes} 局 / {rec.frames} 帧")
+        check("连跑结束后数据集仍打开（下次连跑继续追加）",
+              rec.active and not window.cont_active, f"active={rec.active}")
+        frames_after = rec.frames
+        for _ in range(10):                           # 不在连续任务里 → 不应再记录
+            window.tick()
+            app.processEvents()
+        check("不在连续任务里就不记录", rec.frames == frames_after and rec.buffered == 0,
+              f"{frames_after} → {rec.frames} 帧")
+
+        window.rec_check.setChecked(False)            # 取消勾选 = 收尾 + 关闭数据集
+        check("取消勾选后收尾、无错误", (not rec.active) and not rec.error, rec.error or "ok")
+
+        info = json.loads((first / "meta" / "info.json").read_text(encoding="utf-8"))
+        video_keys = sorted(k for k, v in info["features"].items() if v["dtype"] == "video")
+        check("LeRobot 元数据：四路相机都是 video 特征",
+              video_keys == sorted(f"observation.images.{c}" for c in app_mod.CAMERAS),
+              f"fps={info['fps']} 帧={info['total_frames']} 局={info['total_episodes']}")
+        mp4s = {c: len(list((first / "videos" / f"observation.images.{c}"
+                              / "chunk-000").glob("*.mp4"))) for c in app_mod.CAMERAS}
+        check("一个相机一个 mp4", set(mp4s.values()) == {1}, str(mp4s))
+        check("录像尺寸 = 320×228（h264 要偶数边、和声明一致）",
+              tuple(info["features"][video_keys[0]]["shape"]) == (*dsmod.record_shape(), 3),
+              str(tuple(info["features"][video_keys[0]]["shape"])))
+        check("parquet 帧数 = 落盘帧数",
+              len(pd.read_parquet(first / "data" / "chunk-000" / "file-000.parquet")) == rec.frames,
+              f"{rec.frames} 帧")
+        top = sorted(p.name for p in first.iterdir() if p.is_dir())
+        check("数据集里只留 data/meta/videos（编视频的临时 images/ 已清）",
+              top == ["data", "meta", "videos"] and not (first / "images").exists(),
+              f"顶层目录={top}")
+
+        # 断点续采：勾上 → 再点一次连跑 → 回到同名目录继续追加
+        window.rec_resume.setChecked(True)            # 名称框里已经是实际生效的名字
+        window.rec_check.setChecked(True)
+        window.start_continuous()
+        check("断点续采 → 回到同名目录、且识别为续采",
+              window.recorder.path == first and window.recorder.resumed,
+              f"{window.recorder.path.name} resumed={window.recorder.resumed}")
+        window.auto.gen = slow_gen(True)
+        end = time.perf_counter() + 120
+        while time.perf_counter() < end and window.cont_active:
+            window.tick()
+            app.processEvents()
+        window.rec_check.setChecked(False)
+        check("续采收尾无错误", not window.recorder.error, window.recorder.error or "ok")
+
+        # 视角勾选决定录哪几路：只勾前两路 → 数据集里就只有两路视频（没勾的连目录都没有）
+        window.view_checks["cam_side"].setChecked(False)
+        window.view_checks["cam_wrist"].setChecked(False)
+        check("取消勾选的视角不参与采集（渲染名单同步）",
+              window.checked_cameras() == ["cam_front", "cam_top"]
+              or window.visible_cameras() == ["cam_front", "cam_top"],
+              f"勾选={window.checked_cameras()}")
+        window.rec_resume.setChecked(False)
+        window.rec_name.setText("smoke_cams")
+        window.rec_check.setChecked(True)
+        window.start_continuous()
+        two = window.recorder.path
+        check("建库时按勾选集录（2 路）", window.recorder.cameras == ["cam_front", "cam_top"],
+              f"{two.name if two else None} ← {window.recorder.cameras}")
+        window.view_checks["cam_top"].setChecked(False)     # 中途改勾选：只提示，不换名单
+        check("录的中途改勾选 → 状态行提示仍按开录名单（重开才生效）",
+              "视角勾选已改" in window.rec_status.text(),
+              window.rec_status.text().replace("\n", " ")[-40:])
+        window.view_checks["cam_top"].setChecked(True)
+        window.auto.gen = slow_gen(True)
+        end = time.perf_counter() + 120
+        while time.perf_counter() < end and window.cont_active:
+            window.tick()
+            app.processEvents()
+        end = time.perf_counter() + 180
+        while time.perf_counter() < end:
+            app.processEvents()
+            if window.recorder.episodes >= 1 and window.recorder.queued == 0:
+                break
+            time.sleep(0.02)
+        window.rec_check.setChecked(False)
+        info2 = json.loads((two / "meta" / "info.json").read_text(encoding="utf-8"))
+        keys2 = sorted(k for k, v in info2["features"].items() if v["dtype"] == "video")
+        dirs2 = sorted(p.name for p in (two / "videos").iterdir())
+        check("数据集里只有勾选的两路视频特征",
+              keys2 == ["observation.images.cam_front", "observation.images.cam_top"],
+              str(keys2))
+        check("没勾的视角连 videos 目录/mp4 都没有", dirs2 == keys2, str(dirs2))
+        for cam in app_mod.CAMERAS:                         # 复原勾选，免得影响后面的步骤
+            window.view_checks[cam].setChecked(True)
 
     # 7) 多视角显示（2×2 网格 / 逐格放大 / 逐格勾选）+ 复位
     def s7():
@@ -213,7 +391,7 @@ def main() -> int:
         if region is None:
             return
         seen, bad, seen_basket, poses = set(), [], set(), set()
-        for _ in range(6):
+        for _ in range(20):        # 20 局：概率判据（立着/平放都出现过）要稳
             window.callback_reset()                   # 复位 = 换一局新摆位
             sess = window.session
             kp = sess.spawn["ketchup"]
@@ -278,13 +456,13 @@ def main() -> int:
         check("复位会重新随机摆位（多次复位位置不同）", len(seen) >= 5,
               f"{len(seen)} 种：" + " ".join(f"({px * 1000:+.0f},{py * 1000:+.0f})"
                                             for px, py in sorted(seen)))
-        check("复位也会随机姿态（6 局里立着/平放都出现过）", len(poses) == 2,
+        check("复位也会随机姿态（20 局里立着/平放都出现过）", len(poses) == 2,
               f"抽到 {sorted(poses)}")
         check("篮子复位也会重新随机摆位", len(seen_basket) >= 5,
               f"{len(seen_basket)} 种：" + " ".join(f"({px * 1000:+.0f},{py * 1000:+.0f})"
                                                    for px, py in sorted(seen_basket)))
         check("摆位（位置+姿态+闭合轴+贴桌+不重叠）都合规", not bad,
-              "；".join(bad) if bad else "6 局都合规")
+              "；".join(bad) if bad else "各局都合规")
 
     # 11) t2 抓取物（黄油：位置+姿态）与盘子随机安放（与 t1 同一套机制，见 README §8.9）
     def s11():
@@ -308,7 +486,7 @@ def main() -> int:
         if region is None:
             return
         seen, bad, seen_plate, poses, flats = set(), [], set(), set(), set()
-        for _ in range(6):
+        for _ in range(20):        # 20 局：概率判据（立着/平放都出现过）要稳
             window.callback_reset()
             sess = window.session
             bp = sess.spawn["butter"]
@@ -359,7 +537,7 @@ def main() -> int:
                 bad.append("盘子的 z 或姿态被改了")
         check("t2 复位会重新随机摆位（黄油与盘子位置都变）", len(seen) >= 5 and len(seen_plate) >= 5,
               f"黄油 {len(seen)} 种 / 盘子 {len(seen_plate)} 种")
-        check("t2 复位也会随机姿态（6 局里立着/平放都出现过）", len(poses) == 2,
+        check("t2 复位也会随机姿态（20 局里立着/平放都出现过）", len(poses) == 2,
               f"抽到 {sorted(poses)}")
         # 立着的朝向也随机：用固定种子的采样器直查（不受"6 局里刚好几局立着"的随机性影响）
         rng = np.random.default_rng(7)
@@ -367,7 +545,7 @@ def main() -> int:
                                       for _ in range(20)) if p.pose == "upright"}
         check("t2 立着的朝向也随机（20 局抽到多个不同 yaw）", len(up_yaws) >= 8,
               f"{len(up_yaws)} 个：" + " ".join(sorted(up_yaws)[:6]) + " …")
-        check("t2 摆位（位置+姿态+闭合轴+贴桌）都合规", not bad, "；".join(bad) if bad else "6 局都合规")
+        check("t2 摆位（位置+姿态+闭合轴+贴桌）都合规", not bad, "；".join(bad) if bad else "各局都合规")
 
     # 11b) t3 抓取物（布丁盒：位置+朝向）与小碟随机安放（照 t2 同一套机制，见 README §8.9.2）
     def s11b():
@@ -392,7 +570,7 @@ def main() -> int:
         if pud is None:
             return
         seen, seen_dish, bad, poses = set(), set(), [], set()
-        for _ in range(6):
+        for _ in range(20):        # 20 局：概率判据（立着/平放都出现过）要稳
             window.callback_reset()
             sess = window.session
             bp = sess.spawn["chocolate_pudding"]
@@ -426,7 +604,7 @@ def main() -> int:
                                    for _ in range(20))}
         check("t3 朝向整圆周随机（20 局抽到多个不同 yaw）", len(yaws) >= 8,
               f"{len(yaws)} 个：" + " ".join(sorted(yaws)[:6]) + " …")
-        check("t3 摆位（位置+朝向+高度+闭合轴）都合规", not bad, "；".join(bad) if bad else "6 局都合规")
+        check("t3 摆位（位置+朝向+高度+闭合轴）都合规", not bad, "；".join(bad) if bad else "各局都合规")
 
     # 11c) t5 抓取物（瓶子：位置+姿态）与木托盘随机安放（照 t1 同一套机制，见 README §8.9.3）
     def s11c():
@@ -453,7 +631,7 @@ def main() -> int:
         if bot is None:
             return
         seen, seen_tray, bad, poses = set(), set(), [], set()
-        for _ in range(6):
+        for _ in range(20):        # 20 局：概率判据（立着/平放都出现过）要稳
             window.callback_reset()
             sess = window.session
             bp = sess.spawn["new_salad_dressing"]
@@ -492,7 +670,7 @@ def main() -> int:
                                    for _ in range(20))}
         check("t5 朝向整圆周随机（20 局抽到多个不同 yaw）", len(yaws) >= 8,
               f"{len(yaws)} 个：" + " ".join(sorted(yaws)[:6]) + " …")
-        check("t5 摆位（位置+姿态+高度+闭合轴）都合规", not bad, "；".join(bad) if bad else "6 局都合规")
+        check("t5 摆位（位置+姿态+高度+闭合轴）都合规", not bad, "；".join(bad) if bad else "各局都合规")
 
     # 11d) t9 三件物体都随机：瓶子（锚在托盘里 + 整圆周朝向）、木托盘、盘子（见 README §8.9.4）
     def s11d():
@@ -560,10 +738,13 @@ def main() -> int:
         check("t9 朝向整圆周随机（20 局抽到多个不同 yaw）", len(yaws) >= 8,
               f"{len(yaws)} 个：" + " ".join(sorted(yaws)[:6]) + " …")
         check("t9 摆位（锚定+区域+不重叠+贴桌面）都合规", not bad,
-              "；".join(bad) if bad else "6 局都合规")
+              "；".join(bad) if bad else "各局都合规")
 
     # 11e) 连续任务：单任务连跑 N 局 / 多任务轮转 R 轮（每局重制场景，见 README §4、§8.12）
     def s11e():
+        # 构造时的默认（单任务、勾选表不可点）在 s1 里查过；这里显式回到单任务再验行为，
+        # 免得受前面步骤影响（曾经偶发地在"默认"检查上翻车）
+        window.cont_mode_combo.setCurrentIndex(0)
         check("界面有连续任务控件",
               all(hasattr(window, n) for n in
                   ("cont_mode_combo", "cont_count_spin", "cont_task_list", "cont_button",
@@ -577,9 +758,11 @@ def main() -> int:
               window.cont_task_list.count() == len(tasks_mod.TASKS),
               f"{window.cont_task_list.count()} 项；默认模式 = "
               f"{window.cont_mode_combo.currentText()}")
-        check("默认单任务模式：勾选表不可点",
+        check("单任务模式：勾选表不可点（多任务模式才可点）",
               window.cont_mode_combo.currentIndex() == 0
-              and not window.cont_task_list.isEnabled())
+              and not window.cont_task_list.isEnabled(),
+              f"模式={window.cont_mode_combo.currentText()}、"
+              f"勾选表 enabled={window.cont_task_list.isEnabled()}")
         orig_dwell = app_mod.CONT_DWELL_FRAMES
         app_mod.CONT_DWELL_FRAMES = 0        # 测试里不要"结束停留"，省帧（真跑那局会还原）
 
@@ -718,7 +901,7 @@ def main() -> int:
     def s9():
         check("主循环无异常", not ERRORS, f"{len(ERRORS)} 个异常")
 
-    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s11b, s11c, s11d, s11e, s11f):
+    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s11b, s11c, s11d, s11e, s11f):
         step(fn)
 
     QTimer.singleShot(900, run_next)
@@ -731,6 +914,10 @@ def main() -> int:
         print("失败项:", failed)
     if ERRORS:
         print(f"\n捕获到 {len(ERRORS)} 个异常，第一个：\n{ERRORS[0]}")
+    if not failed and not ERRORS:
+        shutil.rmtree(REC_ROOT, ignore_errors=True)      # 冒烟写的数据集只是验证用
+    else:
+        print(f"（保留冒烟数据集供排查：{REC_ROOT}）")
     return 1 if (failed or ERRORS) else 0
 
 

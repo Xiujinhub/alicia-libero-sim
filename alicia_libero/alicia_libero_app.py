@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -60,6 +61,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 from alicia_ik import AliciaIK, finger_targets  # noqa: E402
+import dataset_recorder  # noqa: E402  （LeRobot 数据集采集：后台线程写盘）
 from libero_catalog import (  # noqa: E402
     catalog_object,
     load_catalog,
@@ -419,6 +421,10 @@ class MainWindow(QMainWindow):
         self.cont_wall = 0.0               # 上一局耗时（秒）
         self.cont_started = 0.0            # 本局开始时刻（算每局耗时）
         self._cont_internal = False        # 连跑自己在切关/复位时别把自己停掉
+        # ── 数据集采集（LeRobot）状态 ──
+        self.recorder = dataset_recorder.DatasetRecorder()
+        self.last_frames: dict[str, np.ndarray] = {}   # 本帧渲染出的各路画面（采集复用）
+        self._rec_status_t = 0.0           # 采集状态行的刷新节流（别每帧刷）
         self._fps_t = time.perf_counter()
         self._fps = 0.0
 
@@ -603,6 +609,49 @@ class MainWindow(QMainWindow):
         self.cont_status.setWordWrap(True)
         self.cont_status.setStyleSheet("color:#7fd1ff; font-size:11px;")
         layout.addWidget(self.cont_status)
+
+        # ── 数据集采集（LeRobot 格式）──
+        # "数据采集"勾选框**只表示要不要采**（不建库、不记录）；真正的采集在点「▶ 开始连续任务」
+        # 时开始（start_continuous → _rec_begin_session），一局（两次复位之间）= 一个 episode。
+        # 写入在**后台线程**（dataset_recorder），不卡仿真。
+        layout.addWidget(QLabel("── 数据集采集（LeRobot 格式，每路相机一个 mp4）──"))
+        rec_row = QHBoxLayout()
+        self.rec_check = QCheckBox("数据采集")
+        self.rec_check.toggled.connect(self.callback_rec_toggle)
+        self.rec_check.setToolTip("只表示\"本次要不要采集\"：勾上不会立刻建库、也不记录任何东西；\n"
+                                  "真正的采集在**点「▶ 开始连续任务」时开始**（一局 = 一个 episode，\n"
+                                  "下一轮连跑继续往同一个数据集里追加）；取消勾选 = 收尾并关闭数据集")
+        self.rec_only_ok = QCheckBox("仅成功局")
+        self.rec_only_ok.setChecked(True)
+        self.rec_only_ok.setToolTip("只把判分成功的局写进数据集（失败局直接丢弃）")
+        self.rec_resume = QCheckBox("断点续采")
+        self.rec_resume.setToolTip("勾选 = 往**同名**数据集继续追加（没有就地新建）；\n"
+                                   "不勾选 = 自动加时间戳另建新名字，老数据一点不动")
+        rec_row.addWidget(self.rec_check)
+        rec_row.addWidget(self.rec_only_ok)
+        rec_row.addWidget(self.rec_resume)
+        rec_row.addStretch(1)
+        layout.addLayout(rec_row)
+
+        rec_row2 = QHBoxLayout()
+        rec_row2.addWidget(QLabel("名称"))
+        self.rec_name = QLineEdit(dataset_recorder.DEFAULT_NAME)
+        self.rec_name.setToolTip("数据集目录 = 本项目 Datasets/<名称>（可在采集前改）")
+        rec_row2.addWidget(self.rec_name, stretch=1)
+        rec_row2.addWidget(QLabel("帧率"))
+        self.rec_fps = QSpinBox()
+        self.rec_fps.setRange(1, 60)
+        self.rec_fps.setValue(int(dataset_recorder.DEFAULT_FPS))
+        self.rec_fps.setSuffix(" Hz")
+        self.rec_fps.setToolTip("按仿真时钟抽帧（与界面帧率无关）；"
+                                "4 路 320×228 视频 ≈ 0.9MB/帧，10Hz 够用")
+        rec_row2.addWidget(self.rec_fps)
+        layout.addLayout(rec_row2)
+
+        self.rec_status = QLabel("未采集")
+        self.rec_status.setWordWrap(True)
+        self.rec_status.setStyleSheet("color:#a8e6a3; font-size:11px;")
+        layout.addWidget(self.rec_status)
         return box
 
     def _build_view_box(self) -> QGroupBox:
@@ -622,7 +671,8 @@ class MainWindow(QMainWindow):
         for camera, label in zip(CAMERAS, CAMERA_LABELS):
             box_ = QCheckBox(label.replace("相机", ""))       # 斜前方 / 正上方 / 侧前方 / 腕部
             box_.setChecked(True)
-            box_.setToolTip(f"显示 {label}（{camera}）")
+            box_.setToolTip(f"显示 {label}（{camera}）；\n"
+                            f"**数据采集也按这份名单录**：没勾的视角不进数据集（也就不会渲染它）")
             box_.toggled.connect(self.callback_view_checked)
             self.view_checks[camera] = box_
             check_row.addWidget(box_)
@@ -658,7 +708,13 @@ class MainWindow(QMainWindow):
             "（左上角那个「放大」下拉也能选；勾选框控制显示哪几路，默认全开）\n"
             "自动执行 = 闭环技能库（接触/跟随判据），手动操作会自动暂停它\n"
             "连续任务 = 单任务连跑 N 局 / 多任务轮转 R 轮；每局都重制场景（随机化的关\n"
-            "          每局换新摆位），手动拖拽会暂停，R 复位或切任务则结束连跑"
+            "          每局换新摆位），手动拖拽会暂停，R 复位或切任务则结束连跑\n"
+            "数据集采集 = 勾「数据采集」只表示**要不要采**（不建库、不记录）；点\n"
+            "          「▶ 开始连续任务」才真正开录，一局（两次复位之间）= 一个 episode，\n"
+            "          **录哪几路 = 当时「显示的视角」勾中的那几路**（没勾的不进数据集，\n"
+            "          也就不会渲染它），各自一个 mp4，写到本项目 Datasets\\<名称> 下\n"
+            "          （后台线程写，不卡仿真）；本次会话的连跑都追加到同一个数据集，\n"
+            "          取消勾选才收尾关闭；「断点续采」= 同名继续追加，否则自动加时间戳另建"
         )
         help_text.setWordWrap(True)
         help_text.setStyleSheet("color:#9fb3c8; font-size:11px;")
@@ -671,6 +727,7 @@ class MainWindow(QMainWindow):
         # 手动切关时把连跑停掉（连跑自己切关会置 _cont_internal，不会被误停）
         if self.cont_active and not self._cont_internal:
             self.stop_continuous("手动切换任务")
+        self.recorder.end_episode()          # 换关 = 采集里的一局边界（老这一局先收掉）
         self.statusBar().showMessage(f"正在加载任务 {task['id']} ……")
         try:
             if self.session is not None and self.session.renderer is not None:
@@ -730,11 +787,15 @@ class MainWindow(QMainWindow):
             self.session.gripper = value / 100.0
 
     # ────────────────── 多视角显示（2×2 网格 + 逐格放大） ──────────────────
+    def checked_cameras(self) -> list[str]:
+        """界面「显示的视角」勾选表里勾中的机位（按固定顺序）——**数据采集也按这份名单录**。"""
+        return [cam for cam in CAMERAS if self.view_checks[cam].isChecked()]
+
     def visible_cameras(self) -> list[str]:
         """当前要渲染哪几路：放大时只有它；否则是勾选的那几路（按固定顺序）。"""
         if self.view_maximized in CAMERAS:
             return [self.view_maximized]
-        return [cam for cam in CAMERAS if self.view_checks[cam].isChecked()]
+        return self.checked_cameras()
 
     def compose_view(self, frames: dict[str, np.ndarray]) -> np.ndarray:
         """把各路画面拼成 2×2（每格 1/4，中间 2px 分隔线；不足 4 格留黑）。
@@ -772,8 +833,11 @@ class MainWindow(QMainWindow):
             self.set_view_maximize(None)
         self.statusBar().showMessage(
             f"视角：显示 {len(checked)} 路 —— "
-            + "、".join(CAMERA_LABELS[CAMERAS.index(c)] for c in checked))
+            + "、".join(CAMERA_LABELS[CAMERAS.index(c)] for c in checked)
+            + ("；数据采集也按这份名单录" if self.recorder.active else ""))
         self.refresh_view()
+        if self.recorder.active:                       # 采集中：状态行也把"名单已改"提示出来
+            self.rec_status.setText(self._rec_status_text())
 
     def callback_view_zoom(self, index: int) -> None:
         """下拉框选放大哪一格（0 = 不放大，回到 2×2 网格）。"""
@@ -823,6 +887,7 @@ class MainWindow(QMainWindow):
     def _render_view(self, sess) -> None:
         """按当前设置渲染 + 拼成 2×2 + 贴到视图控件（tick 与"设置变了立刻重画"共用）。"""
         frames = {camera: sess.render(camera) for camera in self.visible_cameras()}
+        self.last_frames = frames                     # 采集按帧率复用这几张（不重复渲染）
         canvas = self.compose_view(frames)
         self.view_image_size = (canvas.shape[1], canvas.shape[0])
         image = QImage(canvas.data, canvas.shape[1], canvas.shape[0],
@@ -859,6 +924,9 @@ class MainWindow(QMainWindow):
 
     def callback_reset(self) -> None:
         if self.session is not None:
+            # ⚡ 数据集采集：一局 = 两次复位之间 —— 先把上一局收掉（按「仅成功局」落盘/丢弃），
+            # 复位之后的下一次抓帧就自动开新的一局。
+            self.recorder.end_episode()
             # 手动复位 = 宣布接管：把连跑停掉（连跑自己每局都会复位，走 _cont_internal 分支）
             if self.cont_active and not self._cont_internal:
                 self.stop_continuous("手动复位")
@@ -961,6 +1029,10 @@ class MainWindow(QMainWindow):
         self.cont_done = self.cont_ok = 0
         self.cont_counts = {}
         self.cont_dwell = 0
+        # ⚡ 数据采集的**触发点就是这里**：勾了「数据采集」才在开始连跑时建库/续采并开始记录
+        # （勾选框本身只表示"要不要采"，见 callback_rec_toggle）
+        if self.rec_check.isChecked():
+            self._rec_begin_session()
         self.cont_button.setText("⏹ 停止连跑")
         self.statusBar().showMessage(f"连续任务开始：共 {len(plan)} 局")
         self._cont_begin_run()
@@ -1026,6 +1098,10 @@ class MainWindow(QMainWindow):
         total = len(self.cont_plan)
         self.cont_active = False
         self.cont_dwell = 0
+        # ⚠ 收尾这一局也要**收进数据集**：调度表跑完时不会再走 callback_reset（那里才是常规的
+        # 一局边界），所以这里补一刀 —— 否则最后一局会一直挂在缓冲里等差一次复位。
+        # 数据集**保持打开**：本次会话里再点连跑就继续往同一个数据集追加（关数据集 = 取消勾选）。
+        self.recorder.end_episode()
         self.cont_button.setText("▶ 开始连续任务")
         rate = 100.0 * self.cont_ok / max(total, 1)
         per_task = "，".join(f"{tid.split('_')[0]} {o}/{n}"
@@ -1042,6 +1118,7 @@ class MainWindow(QMainWindow):
             return
         self.cont_active = False
         self.cont_dwell = 0
+        self.recorder.end_episode()        # 连跑被中断 → 当前这一局也收进数据集（数据集不关）
         if self.auto is not None:
             self.auto.stop()
             self.auto_button.setText("▶ 自动完成本关")
@@ -1063,6 +1140,120 @@ class MainWindow(QMainWindow):
             self.stop_continuous("点停止")
             return
         self.start_continuous()
+
+    # ────────────────── 数据集采集（LeRobot） ──────────────────
+    def _rec_task_text(self) -> str:
+        """写进数据集的"任务"文本 = 本关的中文指令（多任务连跑时每帧跟着当前关走）。"""
+        task = None if self.session is None else self.session.task
+        return "" if task is None else str(task.get("task_text", task.get("id", "")))
+
+    def _rec_state_action(self) -> tuple[np.ndarray, np.ndarray]:
+        """(observation.state, action)：6 关节 + 夹爪开口。
+
+        * state = 关节 **实测** qpos + 夹爪归一化开口（1=张开）；
+        * action = 关节 **目标**角 + 夹爪指令（技能库/界面本帧下发的量）。
+        """
+        sess = self.session
+        model, data = sess.model, sess.data
+        arm_qadr = [model.jnt_qposadr[model.actuator_trnid[act, 0]] for act in sess.arm_act]
+        qpos = np.array([float(data.qpos[adr]) for adr in arm_qadr], dtype=np.float32)
+        travel = float(model.jnt_range[model.joint("left_finger").id][1]) or 1.0
+        finger = float(data.qpos[model.joint("left_finger").qposadr[0]])
+        opening = float(np.clip(1.0 - finger / travel, 0.0, 1.0))
+        return (np.concatenate([qpos, [opening]]).astype(np.float32),
+                np.concatenate([sess.joint_target, [sess.gripper]]).astype(np.float32))
+
+    def _record_frame(self, sess, ok: bool) -> None:
+        """按采集帧率抓一帧：**只录本次数据集选定的那几路**（界面上没渲的现场补渲一次）。
+
+        ⚠ 两件事：① 只有"数据集已打开 **且 连续任务正在进行**（含暂停）"才记录 —— 勾选框本身
+        不产生数据；② 录哪几路 = **建库时「显示的视角」勾中的那几路**（没勾的视角不进数据集，
+        也就不会去渲染它），录像名单在开库时定死，中途改勾选要重开采集才生效。
+        """
+        rec = self.recorder
+        if not rec.active or not self.cont_active or not rec.due(float(sess.data.time)):
+            return
+        images = {}
+        for camera in rec.cameras:                     # ← 只录选定的机位
+            frame = self.last_frames.get(camera)
+            images[camera] = frame if frame is not None else sess.render(camera)
+        state, action = self._rec_state_action()
+        rec.add_frame(images, state, action, self._rec_task_text(), ok)
+
+    def _rec_begin_session(self) -> bool:
+        """真正开始采集（后台建库/续采并记录）。**只在开始连续任务时调用。**
+
+        * 录哪几路 = 此刻「显示的视角」**勾中的那几路**（没勾的不进数据集）；
+        * 本次会话内重复点连跑不会重开数据集 —— 继续往同一个里追加 episode。
+        """
+        if self.session is None:
+            return False
+        if self.recorder.active:
+            return True
+        cameras = self.checked_cameras()
+        if not cameras:
+            self._rec_uncheck("至少要勾选一路视角才能采集")
+            return False
+        try:
+            self.recorder.start(self.rec_name.text(), self._rec_task_text(),
+                                float(self.rec_fps.value()), cameras,
+                                resume=self.rec_resume.isChecked(),
+                                only_success=self.rec_only_ok.isChecked())
+        except Exception as exc:                       # noqa: BLE001
+            self._rec_uncheck(f"无法开始采集：{exc}")
+            return False
+        # 把**实际生效的名字**写回名称框：不勾续采时会带时间戳，写回来之后下次勾"断点续采"
+        # 就能直接接上同一个数据集（否则用户得自己照抄那个时间戳）
+        self.rec_name.setText(self.recorder.name)
+        self.statusBar().showMessage(
+            f"数据采集已开始：{self.recorder.path}（{len(cameras)} 路相机："
+            + "、".join(c.replace("cam_", "") for c in cameras) + "）"
+            + ("（断点续采）" if self.rec_resume.isChecked() else "（新数据集）"))
+        return True
+
+    def callback_rec_toggle(self, checked: bool) -> None:
+        """勾选框只表示"要不要做数据采集"；**开录在点「开始连续任务」时**（见 _rec_begin_session）。
+
+        例外：正在连跑时把它勾上 → 立刻开录（已经跑起来的这一局也录进来）。
+        """
+        self.recorder.wanted = checked
+        if not checked:
+            if self.recorder.active:
+                self.recorder.stop()           # 收掉当前局 + 关数据集（写入线程收尾）
+            self.rec_status.setText(
+                "已停止采集 · " + self.recorder.stats_text()
+                if self.recorder.path is not None else "未采集")
+            return
+        if self.cont_active:
+            self._rec_begin_session()
+        self.rec_status.setText(self._rec_status_text())
+
+    def _rec_uncheck(self, reason: str) -> None:
+        """把采集勾选框拨回去（不触发 callback，避免二次 stop）。"""
+        self.recorder.wanted = False
+        self.rec_check.blockSignals(True)
+        self.rec_check.setChecked(False)
+        self.rec_check.blockSignals(False)
+        self.rec_status.setText("❌ " + reason)
+
+    def _rec_status_text(self) -> str:
+        """采集状态行：未开始 / 采集中 / 连跑结束待命 / 后台报错。"""
+        rec = self.recorder
+        if rec.error:
+            return "❌ " + rec.error
+        if not rec.active:                             # 勾了但还没开始（勾选框本身不开录）
+            if self.rec_check.isChecked():
+                return ("⚪ 已就绪 —— 点「▶ 开始连续任务」后开始采集\n"
+                        "（一局 = 一个 episode；本次会话的连跑都追加到同一个数据集）")
+            return ("已停止 · " + rec.stats_text()) if rec.path is not None else "未采集"
+        head = ("🟢 采集中（连续任务进行中）" if self.cont_active
+                else "🟡 已暂停 —— 本次连跑结束，再点连跑继续追加")
+        tag = "续采" if rec.resumed else "新建"
+        cams = "、".join(c.replace("cam_", "") for c in rec.cameras)
+        extra = "" if set(self.checked_cameras()) == set(rec.cameras) else (
+            "\n⚠ 视角勾选已改：本次数据集仍按开录时的名单录（重开采集才生效）")
+        return (f"{head} · {tag} {rec.path.name} · {len(rec.cameras)} 路（{cams}） · "
+                f"{rec.stats_text()}\n{rec.path}{extra}")
 
     # ────────────────── 鼠标拖拽 → IK ──────────────────
     def _screen_axes(self, camera: str | None = None):
@@ -1147,6 +1338,12 @@ class MainWindow(QMainWindow):
         else:
             super().keyPressEvent(event)
 
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
+        """关窗口前把采集收尾：当前这一局落盘 + 关掉 parquet / 视频写入。"""
+        if getattr(self, "recorder", None) is not None:
+            self.recorder.stop()
+        super().closeEvent(event)
+
     # ────────────────── 主循环 ──────────────────
     def tick(self) -> None:
         sess = self.session
@@ -1205,6 +1402,15 @@ class MainWindow(QMainWindow):
                 "font-size:13px; font-weight:bold; color:#ffd479;")
             self.result_text.setText("状态：进行中（物体被挪动了）")
         self.was_success = ok
+
+        # 数据集采集：按设定帧率抓一帧（复用本帧渲染；没显示的机位现场补渲）
+        self._record_frame(sess, ok)
+        now = time.perf_counter()
+        if (self.recorder.active or self.rec_check.isChecked()) and now - self._rec_status_t > 0.5:
+            self._rec_status_t = now
+            self.rec_status.setText(self._rec_status_text())
+            if self.recorder.error:                    # 后台出错：把开关拨回去并提示
+                self._rec_uncheck(self.recorder.error)
 
         now = time.perf_counter()
         if now - self._fps_t >= 0.5:
