@@ -4,7 +4,7 @@
 
 | 目录 | 内容 | 说明 |
 | --- | --- | --- |
-| [`alicia_libero/`](alicia_libero/README.md) | **LIBERO 桌面操作仿真台**（PySide6 界面） | 9 个桌面任务；鼠标拖拽 IK、键盘虚拟示教臂、关节滑块；每帧实时判分 |
+| [`alicia_libero/`](alicia_libero/README.md) | **LIBERO 桌面操作仿真台**（PySide6 界面） | 9 个桌面任务；鼠标拖拽 IK、键盘虚拟示教臂、关节滑块、**示教臂（手摇跟随：真机 leader → 仿真 follower，见 `leader_arm.py`）**；每帧实时判分 |
 | [`alicia_teleop/`](alicia_teleop/README.md) | **虚拟示教臂 / 遥操作** | `alicia_virtual_teleop.py`（真机 leader ↔ MuJoCo follower 同步 + 相机 + CSV 录制）、`make_follower_xml.py`（给原始 MJCF 补 actuator） |
 
 ## 1. 快速开始

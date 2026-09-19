@@ -4,15 +4,19 @@
 
 功能
 ----
-* 左侧下拉框选择任务（任务来自对 ``Datasets/libero_assets`` 的自动分析），
+* 控制面板下拉框选择任务（任务来自对 ``Datasets/libero_assets`` 的自动分析），
   切换任务即重新生成并加载 MuJoCo 场景
-* 中间 3D 视图：用 ``mujoco.Renderer`` 离屏渲染成 QImage 显示（不另开窗口）
-* 三种操作方式：
+* 画面（3D 视图）：用 ``mujoco.Renderer`` 离屏渲染成 QImage 显示（不另开窗口）
+* 四种操作方式：
   1. **鼠标拖拽**（推荐）：按住鼠标左键在视图里拖动 = 拖动夹爪目标点，IK 实时求解
   2. **键盘虚拟示教臂**：``1..6`` 选关节、``,`` ``.`` 微调、``o``/``c`` 开关夹爪
   3. **关节滑块**：6 个滑块直接给关节目标角
+  4. **示教臂（手摇跟随）**：接真机示教臂（USB 串口），**用手拖着示教臂**走，
+     仿真里的机械臂就跟到哪（含夹爪/扳机）；链路复用上一个工程
+     ``..\\alicia_teleop`` 的 SDK 轮询线程，见 ``leader_arm.py``。
+     没有硬件时把数据源切「模拟（无硬件自测）」即可把整条界面链路跑通（回归测试也用它）
 * 实时判据：任务的完成条件（目标区域、水平偏差、落座高度）每帧计算并显示
- * 相机切换、目标区域显示开关、场景复位
+* **「视图 / 场景（多视角）」工具条在画面上方**：逐格勾选显示哪几路、逐格放大、场景复位
 * **连续任务（自动连跑）**：单任务连跑 N 局 / 多任务轮转（勾选若干关，一轮跑完再下一轮），
   每局自动重制场景（带随机安放的任务**重新抽摆位**），跑完给出逐局明细与成功率
 
@@ -62,6 +66,7 @@ sys.path.insert(0, str(HERE))
 
 from alicia_ik import AliciaIK, finger_targets  # noqa: E402
 import dataset_recorder  # noqa: E402  （LeRobot 数据集采集：后台线程写盘）
+import leader_arm  # noqa: E402  （示教臂（手摇）链路：真机 SDK / 模拟源 + 映射）
 from libero_catalog import (  # noqa: E402
     catalog_object,
     load_catalog,
@@ -85,7 +90,10 @@ GRID_GAP = 2                       # 多视角拼接时格子之间的分隔线�
 JOINT_STEP_MAX_DEG = 8.0           # 一帧内单个关节最多动多少度（IK 限速，防"换臂形甩臂"）
 CAMERAS = ["cam_front", "cam_top", "cam_side", "cam_wrist"]
 CAMERA_LABELS = ["斜前方", "正上方", "侧前方", "腕部相机"]
-PANEL_W = 400                      # 左侧面板宽度
+PANEL_W = 400                      # 侧栏（3D 视图右边那一列）宽度
+# 「操作方式」下拉框 ↔ self.mode（顺序必须一致；示教臂模式见 leader_arm.py）
+MODE_KEYS = ("drag", "keyboard", "slider", "leader")
+MODE_LABELS = ("鼠标拖拽（IK 跟随）", "键盘虚拟示教臂", "关节滑块", "示教臂（手摇跟随）")
 CONT_DWELL_FRAMES = 15             # 连续任务：一局跑完后停留多少帧再重制场景
                                    # （≈0.25s，让画面停在"结束状态"上，肉眼看得见成绩）
 CONT_MAX_RUNS = 999                # 连续任务：次数/轮数上限（防手滑把界面卡死）
@@ -391,7 +399,7 @@ class SimView(QLabel):
 
 
 class MainWindow(QMainWindow):
-    """主窗口：左侧任务/操作面板，中间 3D 视图。"""
+    """主窗口：**画面上方**「视图/场景」工具条 + 左侧 3D 视图 + 右侧控制面板。"""
 
     def __init__(self) -> None:
         super().__init__()
@@ -425,11 +433,17 @@ class MainWindow(QMainWindow):
         self.recorder = dataset_recorder.DatasetRecorder()
         self.last_frames: dict[str, np.ndarray] = {}   # 本帧渲染出的各路画面（采集复用）
         self._rec_status_t = 0.0           # 采集状态行的刷新节流（别每帧刷）
+        # ── 示教臂（手摇跟随）状态 ──
+        # link = 真机/模拟示教臂链路（None=未连）；mapper = 快照→关节目标/夹爪的映射
+        self.leader_link: leader_arm.LeaderLink | None = None
+        self.leader_mapper = leader_arm.LeaderFollowMapper()
+        self._leader_status_t = 0.0        # 示教臂状态行的刷新节流（0.5s 一次）
         self._fps_t = time.perf_counter()
         self._fps = 0.0
 
         self._build_ui()
         self.callback_load_task(0)
+        self.callback_leader_refresh_ports()         # 开软件就把串口列出来（没装 pyserial 只提示）
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
@@ -437,29 +451,45 @@ class MainWindow(QMainWindow):
 
     # ────────────────── 界面搭建 ──────────────────
     def _build_ui(self) -> None:
+        """整体布局：**上面一条「视图/场景（多视角）」工具条** + 下面一行「3D 视图 | 右侧栏」。
+
+        ⚠ 布局变更（按需求）：原来「视图/场景（多视角）」挂在左侧栏最下面（滚到才看得见），
+        现在**挪到画面上方**（整窗宽一条，横向一行）；左右一行里仍是「3D 视图（左，撑满）
+        + 右侧栏（右，定宽）」，所有控件的属主/回调一个字没改，冒烟测试逐项照旧。
+        """
         central = QWidget()
-        root = QHBoxLayout(central)
+        root = QVBoxLayout(central)
         root.setContentsMargins(10, 10, 10, 10)
         root.setSpacing(10)
 
+        # 画面**上方**：视图/场景（多视角）工具条（横向一行，不占竖向空间）
+        root.addWidget(self._build_view_box(), stretch=0)
+
+        body = QHBoxLayout()
+        body.setSpacing(10)
         self.view = SimView()
-        root.addWidget(self.view, stretch=1)
-        root.addWidget(self._build_side_panel(), stretch=0)
+        body.addWidget(self.view, stretch=1)
+        body.addWidget(self._build_side_panel(), stretch=0)
+        root.addLayout(body, stretch=1)
+
         self.setCentralWidget(central)
         self.statusBar().showMessage("就绪")
 
     def _build_side_panel(self) -> QWidget:
-        """左侧面板。⚠ 控件变多之后 800px 高的窗口装不下，套一层滚动区（不滚动就看不到
-        「视图/场景」「快捷键」两组，实测窗口缩到 800px 时最下面一组被压扁）。"""
+        """画面**右侧**的面板（任务 / 操作方式 / 示教臂 / 自动执行 / 连续任务 / 数据集采集 / 快捷键）。
+
+        ⚠ 控件变多之后 800px 高的窗口装不下，套一层滚动区（不滚动就看不到最下面一组，
+        实测窗口缩到 800px 时最下面一组被压扁）；**「视图/场景（多视角）」已移到画面上方**
+        （见 ``_build_view_box``），这里不再有它。"""
         panel = QWidget()
         panel.setFixedWidth(PANEL_W)
         layout = QVBoxLayout(panel)
         layout.setSpacing(8)
         layout.addWidget(self._build_task_box())
         layout.addWidget(self._build_control_box())
+        layout.addWidget(self._build_leader_box())
         layout.addWidget(self._build_auto_box())
         layout.addWidget(self._build_cont_box())
-        layout.addWidget(self._build_view_box())
         layout.addWidget(self._build_help_box())
         layout.addStretch(1)
 
@@ -497,7 +527,7 @@ class MainWindow(QMainWindow):
         box = QGroupBox("操作方式")
         layout = QVBoxLayout(box)
         self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["鼠标拖拽（IK 跟随）", "键盘虚拟示教臂", "关节滑块"])
+        self.mode_combo.addItems(list(MODE_LABELS))
         self.mode_combo.currentIndexChanged.connect(self.callback_mode_changed)
         layout.addWidget(self.mode_combo)
 
@@ -525,6 +555,101 @@ class MainWindow(QMainWindow):
         grip_row.addWidget(self.grip_slider, stretch=1)
         layout.addLayout(grip_row)
 
+        return box
+
+    def _build_leader_box(self) -> QGroupBox:
+        """示教臂（手摇跟随）面板：**真机示教臂 → 本界面里的 Alicia follower**。
+
+        * 数据源：``真机示教臂（串口）``（SDK + USB 串口）/ ``模拟（无硬件自测）``；
+        * 串口：可编辑下拉（「刷新」用 pyserial 枚举；本机有两个 CH343 时务必分清哪个是示教臂）；
+        * 「连接时关力矩」**手摇必须勾**（关掉示教臂力矩才能用手拖着走，官方同款）；
+        * 「使能跟随」= 死人开关：等价于**按住示教臂左键**（真机按键同样生效）；
+          未使能时**什么都不下发**，机械臂保持当前目标，鼠标/键盘/滑块照常可用；
+        * 「对齐」把此刻当零点（相对模式：机械臂原地不动；绝对模式：目标=示教臂姿态）；
+        * 「方向 / 偏置」是现场校准：6 轴方向系数（±1）与角度偏置（度）。
+
+        ⚠ 手摇走的是 ``session.joint_target`` / ``session.gripper``，所以**判分、连续任务、
+        数据集采集全都自动复用**（采集里的 action 就是手摇下发的目标角）——不需要另写一套。
+        """
+        box = QGroupBox("示教臂（手摇跟随）")
+        layout = QVBoxLayout(box)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("数据源"))
+        self.leader_source = QComboBox()
+        self.leader_source.addItems(list(leader_arm.SOURCE_LABELS))
+        self.leader_source.currentIndexChanged.connect(self.callback_leader_source)
+        self.leader_source.setToolTip("真机示教臂（USB 串口 + alicia_d_sdk）/ 模拟示教臂（无硬件自测）")
+        row.addWidget(self.leader_source, stretch=1)
+        layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("串口"))
+        self.leader_port = QComboBox()
+        self.leader_port.setEditable(True)          # 认手输的 COMx，也认「刷新」列出来的
+        self.leader_port.setToolTip("示教臂的 USB 串口（例 COM5）；点「刷新」列出本机串口")
+        row.addWidget(self.leader_port, stretch=1)
+        self.leader_port_button = QPushButton("刷新")
+        self.leader_port_button.clicked.connect(self.callback_leader_refresh_ports)
+        row.addWidget(self.leader_port_button)
+        layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("机型"))
+        self.leader_variant = QComboBox()
+        self.leader_variant.addItems(list(leader_arm.VARIANTS))
+        self.leader_variant.setToolTip("示教臂机型变体；不确定就用默认 leader")
+        row.addWidget(self.leader_variant, stretch=1)
+        self.leader_torque = QCheckBox("连接时关力矩")
+        self.leader_torque.setChecked(True)
+        self.leader_torque.setToolTip("手摇必须勾：关掉示教臂力矩才能用手拖着它走（关闭后请先扶住机械臂）")
+        row.addWidget(self.leader_torque)
+        layout.addLayout(row)
+
+        row = QHBoxLayout()
+        self.leader_connect_button = QPushButton("🔌 连接示教臂")
+        self.leader_connect_button.clicked.connect(self.callback_leader_connect)
+        row.addWidget(self.leader_connect_button, stretch=1)
+        self.leader_enable = QCheckBox("使能跟随")
+        self.leader_enable.toggled.connect(self.callback_leader_enable)
+        self.leader_enable.setToolTip("死人开关：等价于按住示教臂左键；未使能时示教臂不会动仿真里的机械臂")
+        row.addWidget(self.leader_enable)
+        self.leader_align_button = QPushButton("对齐")
+        self.leader_align_button.clicked.connect(lambda: self.callback_leader_align())
+        self.leader_align_button.setToolTip("把此刻当零点：相对模式=机械臂原地不动（记偏置）；"
+                                            "绝对模式本来就在追示教臂姿态（每帧限速 8°）")
+        row.addWidget(self.leader_align_button)
+        layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("同步"))
+        self.leader_sync = QComboBox()
+        self.leader_sync.addItems(["相对（不跳变）", "绝对（完全镜像）"])
+        self.leader_sync.setToolTip("相对：只镜像增量，使能瞬间不跳变（默认，推荐手摇）；绝对：完全镜像示教臂姿态")
+        self.leader_sync.currentIndexChanged.connect(self.callback_leader_sync)
+        row.addWidget(self.leader_sync, stretch=1)
+        layout.addLayout(row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("方向"))
+        self.leader_signs = QLineEdit("1,1,1,1,1,1")
+        self.leader_signs.setToolTip("6 轴方向系数（±1）：某轴转反了就把对应位置写成 -1")
+        self.leader_signs.setFixedWidth(96)
+        row.addWidget(self.leader_signs)
+        row.addWidget(QLabel("偏置°"))
+        self.leader_offsets = QLineEdit("0,0,0,0,0,0")
+        self.leader_offsets.setToolTip("6 轴角度偏置（度）：零点不一致时用来粗校准")
+        self.leader_offsets.setFixedWidth(70)
+        row.addWidget(self.leader_offsets)
+        row.addStretch(1)
+        layout.addLayout(row)
+        for widget in (self.leader_signs, self.leader_offsets):
+            widget.editingFinished.connect(self.callback_leader_calibration)
+
+        self.leader_status = QLabel("未连接")
+        self.leader_status.setWordWrap(True)
+        self.leader_status.setStyleSheet("color:#a8e6a3; font-size:11px;")
+        layout.addWidget(self.leader_status)
         return box
 
     def _build_auto_box(self) -> QGroupBox:
@@ -657,16 +782,24 @@ class MainWindow(QMainWindow):
     def _build_view_box(self) -> QGroupBox:
         """视图/场景：**多视角**（最多 2×2 四个机位，各占 1/4）+ 逐格勾选 + 逐格放大。
 
+        **界面位置：画面上方**（``_build_ui`` 里挂在 3D 视图这一行**上面**，横向一条）——
+        从左到右：`显示的视角` 四个勾选框 → 弹簧 → `放大` 下拉 + `重新开始（复位场景）`。
+
         * 勾选框：默认四个全开；只勾一个时它自动占满整块画面；
         * 放大：下拉选一格（或**双击 / 右键**画面里的格子）→ 该格占满、其它三格隐藏，
           再操作一次还原成网格；
         * 鼠标拖动按**光标所在那一格**的机位换算（每格自己的方位角），互不干扰。
+
+        ⚠ 控件名（``view_checks`` / ``zoom_combo``）与信号连接都没变，只是从竖排改成横排。
         """
         box = QGroupBox("视图 / 场景（多视角）")
-        layout = QVBoxLayout(box)
+        layout = QHBoxLayout(box)
+        layout.setSpacing(8)
 
-        layout.addWidget(QLabel("显示的视角（默认全开，各自可关）"))
-        check_row = QHBoxLayout()
+        view_label = QLabel("显示的视角")
+        view_label.setToolTip("默认四路全开、各自可关；\n只勾一路时它自动占满整块画面")
+        layout.addWidget(view_label)
+
         self.view_checks: dict[str, QCheckBox] = {}
         for camera, label in zip(CAMERAS, CAMERA_LABELS):
             box_ = QCheckBox(label.replace("相机", ""))       # 斜前方 / 正上方 / 侧前方 / 腕部
@@ -675,25 +808,21 @@ class MainWindow(QMainWindow):
                             f"**数据采集也按这份名单录**：没勾的视角不进数据集（也就不会渲染它）")
             box_.toggled.connect(self.callback_view_checked)
             self.view_checks[camera] = box_
-            check_row.addWidget(box_)
-        layout.addLayout(check_row)
+            layout.addWidget(box_)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("放大"))
+        layout.addStretch(1)                     # 勾选框靠左、放大与复位靠右
+        layout.addWidget(QLabel("放大"))
         self.zoom_combo = QComboBox()
         self.zoom_combo.addItem("无（2×2 网格）")
         self.zoom_combo.addItems(CAMERA_LABELS)
         self.zoom_combo.currentIndexChanged.connect(self.callback_view_zoom)
         self.zoom_combo.setToolTip("选一格放大：它占满画面、其它三格隐藏；"
                                    "也可以直接双击 / 右键画面里的格子")
-        row.addWidget(self.zoom_combo, stretch=1)
-        layout.addLayout(row)
+        layout.addWidget(self.zoom_combo)
 
-        buttons = QHBoxLayout()
         reset_btn = QPushButton("重新开始（复位场景）")
         reset_btn.clicked.connect(self.callback_reset)
-        buttons.addWidget(reset_btn)
-        layout.addLayout(buttons)
+        layout.addWidget(reset_btn)
         return box
 
     def _build_help_box(self) -> QGroupBox:
@@ -705,8 +834,11 @@ class MainWindow(QMainWindow):
             "1..6 选关节    , / . 关节 ±2°    O / C 夹爪开合\n"
             "R 复位场景    T 依次放大四格（再按回到 2×2 网格）\n"
             "视图=2×2 多视角：拖动按**光标所在那一格**换算；双击/右键某格=放大占满\n"
-            "（左上角那个「放大」下拉也能选；勾选框控制显示哪几路，默认全开）\n"
+            "（画面上方工具条里那个「放大」下拉也能选；勾选框控制显示哪几路，默认全开）\n"
             "自动执行 = 闭环技能库（接触/跟随判据），手动操作会自动暂停它\n"
+            "示教臂（手摇）= 接真机示教臂（串口）后勾「使能跟随」（= 按住示教臂左键），\n"
+            "          用手拖着示教臂走，仿真里的机械臂就跟到哪；没硬件就选「模拟」当虚拟示教臂，\n"
+            "          这时 1..6 / , . / o c 摇的是虚拟示教臂（真机模式下这些键仍直接管关节）\n"
             "连续任务 = 单任务连跑 N 局 / 多任务轮转 R 轮；每局都重制场景（随机化的关\n"
             "          每局换新摆位），手动拖拽会暂停，R 复位或切任务则结束连跑\n"
             "数据集采集 = 勾「数据采集」只表示**要不要采**（不建库、不记录）；点\n"
@@ -748,8 +880,11 @@ class MainWindow(QMainWindow):
         self.result_text.setText("状态：进行中")
         self.result_text.setStyleSheet("font-size:13px; font-weight:bold; color:#d7e3f4;")
         self.was_success = False
-        self.mode_combo.setCurrentIndex(0)
-        self.callback_mode_changed(0)
+        # 手摇示教时切关/连跑换关不该把操作方式重置回"鼠标拖拽"（否则手摇会突然失灵）
+        keep_mode = (len(MODE_KEYS) - 1) if (self.leader_link is not None
+                                             and self.leader_link.connected) else 0
+        self.mode_combo.setCurrentIndex(keep_mode)
+        self.callback_mode_changed(keep_mode)
         self._sync_controls()
         self.statusBar().showMessage(
             f"已加载 {task['id']}（{task['kind']}，难度 {task['difficulty']}）"
@@ -772,9 +907,12 @@ class MainWindow(QMainWindow):
         self.grip_slider.blockSignals(False)
 
     def callback_mode_changed(self, index: int) -> None:
-        self.mode = ["drag", "keyboard", "slider"][index]
+        self.mode = MODE_KEYS[index]
         for slider in self.joint_sliders:
             slider.setEnabled(self.mode == "slider")
+        if self.mode == "leader" and (self.leader_link is None or not self.leader_link.connected):
+            self.statusBar().showMessage(
+                "示教臂模式：先在「示教臂（手摇跟随）」面板里连接（没硬件就选「模拟（无硬件自测）」）")
 
     def callback_joint_slider(self, _value: int) -> None:
         if self.session is None or self.mode != "slider":
@@ -785,6 +923,169 @@ class MainWindow(QMainWindow):
     def callback_grip_slider(self, value: int) -> None:
         if self.session is not None:
             self.session.gripper = value / 100.0
+
+    # ────────────────── 示教臂（手摇跟随）──────────────────
+    def leader_source_key(self) -> str:
+        """当前选的数据源键：``leader`` = 真机串口 / ``virtual`` = 模拟（无硬件）。"""
+        index = max(0, min(self.leader_source.currentIndex(), len(leader_arm.SOURCES) - 1))
+        return leader_arm.SOURCES[index]
+
+    def callback_leader_source(self, index: int) -> None:
+        """切数据源：只有真机才用得上串口/机型；切走时把已连链路断掉（免得两套状态打架）。"""
+        source = leader_arm.SOURCES[max(0, min(index, len(leader_arm.SOURCES) - 1))]
+        real = source == "leader"
+        for widget in (self.leader_port, self.leader_port_button, self.leader_variant):
+            widget.setEnabled(real)
+        if (self.leader_link is not None and self.leader_link.connected
+                and self.leader_link.source != source):
+            self._leader_disconnect("切换数据源")
+        self.leader_status.setText(leader_arm.SOURCE_HINTS[source])
+
+    def callback_leader_refresh_ports(self) -> None:
+        """枚举本机串口填进下拉框（手输过的串口号会被保留）。"""
+        typed = self.leader_port.currentText().strip()
+        try:
+            ports = leader_arm.list_ports()
+        except leader_arm.LeaderError as exc:
+            self.leader_status.setText("❌ " + str(exc))
+            return
+        self.leader_port.clear()
+        self.leader_port.addItems([device for device, _desc in ports])
+        if typed:
+            self.leader_port.setCurrentText(typed)
+        if not ports:
+            self.leader_status.setText("⚠ 没有检测到串口设备：确认 USB 线插好（换一根数据线试试）")
+            return
+        self.leader_status.setText(
+            "检测到串口：" + "、".join(f"{dev}（{desc.split(' (')[0]}）" for dev, desc in ports))
+
+    def _leader_disconnect(self, reason: str) -> None:
+        """收掉链路（幂等）：停轮询线程 + 断真机 + 清映射状态 + 取消使能。"""
+        if self.leader_link is not None:
+            self.leader_link.close()
+            self.leader_link = None
+        self.leader_mapper.reset(None if self.session is None else self.session.joint_target)
+        self.leader_enable.blockSignals(True)             # 取消使能但别再触发一遍回调
+        self.leader_enable.setChecked(False)
+        self.leader_enable.blockSignals(False)
+        self.leader_connect_button.setText("🔌 连接示教臂")
+        self.leader_status.setText(f"已断开（{reason}）")
+
+    def callback_leader_connect(self) -> None:
+        """连接 / 断开示教臂（真机走 SDK+串口，模拟源零硬件）。"""
+        if self.leader_link is not None and self.leader_link.connected:
+            self._leader_disconnect("手动断开")
+            self.statusBar().showMessage("示教臂已断开（机械臂保持当前姿态）")
+            return
+        link = leader_arm.LeaderLink(
+            source=self.leader_source_key(),
+            port=self.leader_port.currentText().strip(),
+            variant=self.leader_variant.currentText(),
+            disable_torque=self.leader_torque.isChecked())
+        try:
+            link.connect()
+        except leader_arm.LeaderError as exc:
+            self.leader_status.setText("❌ " + str(exc))
+            self.statusBar().showMessage("示教臂连接失败（详见侧栏提示）")
+            return
+        self.leader_link = link
+        self.leader_connect_button.setText("⏏ 断开示教臂")
+        self.leader_status.setText(f"🟢 已连接 {link.describe()}\n{link.note}")
+        self.statusBar().showMessage(
+            f"示教臂已连接（{link.describe()}）—— 勾「使能跟随」（或按住示教臂左键）即可手摇")
+
+    def callback_leader_enable(self, checked: bool) -> None:
+        """「使能跟随」= 死人开关；没连上不许使能（避免"以为在跟随、其实没链路"）。"""
+        if not checked:
+            self.statusBar().showMessage("示教臂停止跟随：机械臂保持当前姿态")
+            return
+        if self.leader_link is None or not self.leader_link.connected:
+            self.leader_enable.blockSignals(True)
+            self.leader_enable.setChecked(False)
+            self.leader_enable.blockSignals(False)
+            self.leader_status.setText("❌ 先点「连接示教臂」再使能")
+            return
+        self.mode_combo.setCurrentIndex(len(MODE_KEYS) - 1)      # 顺手切到示教臂模式
+        self.callback_leader_align(quiet=True)                   # 使能瞬间先对齐，避免跳变
+        self.statusBar().showMessage("示教臂已使能：拖着示教臂走，仿真里的机械臂就跟着走")
+
+    def callback_leader_align(self, quiet: bool = False) -> None:
+        """对齐（零点）：相对模式=机械臂原地不动；绝对模式=目标立刻对准示教臂姿态。"""
+        link = self.leader_link
+        if self.session is None or link is None or not link.connected:
+            if not quiet:
+                self.leader_status.setText("❌ 先连接示教臂")
+            return
+        offset = self.leader_mapper.align(link.snapshot(), self.session.joint_target)
+        if quiet:
+            return
+        if self.leader_mapper.mode == "relative":
+            deg = " ".join(f"{math.degrees(v):+6.1f}" for v in offset)
+            self.leader_status.setText(f"已对齐（相对模式，偏置(deg){deg}）")
+        else:
+            self.leader_status.setText("绝对模式：目标一直在追示教臂姿态（每帧限速 8°，不用手动对齐）")
+        self.statusBar().showMessage("示教臂已对齐")
+
+    def callback_leader_sync(self, index: int) -> None:
+        """切换相对 / 绝对同步（相对模式顺手重采一次偏置，免得旧偏置把机械臂拽走）。"""
+        try:
+            self.leader_mapper.set_mode("relative" if index == 0 else "absolute")
+        except leader_arm.LeaderError as exc:
+            self.leader_status.setText("❌ " + str(exc))
+            return
+        if self.leader_mapper.mode == "relative":
+            self.callback_leader_align(quiet=True)
+        self.statusBar().showMessage(
+            "同步方式：相对（只镜像增量，使能不跳变）" if index == 0
+            else "同步方式：绝对（完全镜像示教臂姿态，建议先点「对齐」）")
+
+    def callback_leader_calibration(self) -> None:
+        """方向 / 偏置文本框改完即生效（解析失败只提示，不动当前值）。"""
+        try:
+            self.leader_mapper.set_calibration(self.leader_signs.text(),
+                                              self.leader_offsets.text())
+        except leader_arm.LeaderError as exc:
+            self.leader_status.setText("❌ " + str(exc))
+            return
+        self.statusBar().showMessage(
+            f"示教臂校准已更新：方向 {self.leader_signs.text()}、偏置 {self.leader_offsets.text()}°")
+
+    def _leader_status_text(self) -> str:
+        """状态行（0.5s 刷一次，别每帧刷）：连接 / 使能 / 频率 / 按键 / 关节角。"""
+        link = self.leader_link
+        if link is None or not link.connected:
+            return leader_arm.SOURCE_HINTS[self.leader_source_key()]
+        snapshot = link.snapshot()
+        head = f"🟢 {link.describe()}"
+        if link.stale():
+            head += f" ⚠ 已 {link.age():.1f}s 没有新数据（串口被占用 / 线松了？）"
+        enabled = self.leader_enable.isChecked() or bool(snapshot.get("button1"))
+        head += f" · 使能 {'ON' if enabled else 'OFF'}"
+        if self.mode != "leader":
+            head += "（操作方式还没切到「示教臂（手摇跟随）」）"
+        return head + "\n" + leader_arm.describe_snapshot(snapshot)
+
+    def _apply_leader(self, sess) -> None:
+        """示教臂（手摇）模式：把这一帧的快照映射成关节目标 + 夹爪开口。
+
+        * 只有「模式=示教臂 **且** 已连接 **且** 使能（勾选 or 真机左键）」才下发；
+        * 刚使能那一帧顺手把自动执行 / 连跑暂停掉（手摇接管）；
+        * 对齐在使能那一刻做：相对模式只记偏置 → **机械臂不会突然跳**。
+
+        ⚠ 下发的是 ``session.joint_target`` / ``session.gripper``（与滑块、键盘模式同一处），
+        所以判分、连续任务、数据集采集都自动复用，不用另写一套。
+        """
+        link = self.leader_link
+        if self.mode != "leader" or link is None or not link.connected or sess is None:
+            return
+        command = self.leader_mapper.step(link.snapshot(), sess.joint_target,
+                                         manual_enable=self.leader_enable.isChecked())
+        if not command.enabled:
+            return                    # 未使能：什么都不下发（其它操作方式照常可用）
+        if command.just_enabled:
+            self._pause_auto()        # 手摇接管 → 暂停自动执行 / 连跑（只在使能那一帧）
+        sess.joint_target = command.target
+        sess.gripper = float(np.clip(command.gripper, 0.0, 1.0))
 
     # ────────────────── 多视角显示（2×2 网格 + 逐格放大） ──────────────────
     def checked_cameras(self) -> list[str]:
@@ -1317,6 +1618,12 @@ class MainWindow(QMainWindow):
         # 而 Python 里 "" in "123456" 恒为 True，会误入数字分支并 int("") 崩掉。
         if not text and 0x20 <= key < 0x7F:
             text = chr(key).lower()
+        # 示教臂模式 + 模拟源：这几个键摇的是**虚拟示教臂**（走与真机一样的映射路径）。
+        # ⚠ 不接管 t（界面里 t = 依次放大四格）：模拟源的"死人开关"用面板上的「使能跟随」勾选框。
+        if self.mode == "leader" and self.leader_link is not None and text in ("123456", ",", ".", "o", "c", "0"):
+            if self.leader_link.virtual_key(text):
+                self.statusBar().showMessage("虚拟示教臂：" + self._leader_status_text().splitlines()[-1])
+                return
         if text and text in "123456":
             self.selected_joint = int(text) - 1
             self.statusBar().showMessage(f"已选中 Joint{self.selected_joint + 1}")
@@ -1339,9 +1646,12 @@ class MainWindow(QMainWindow):
             super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt 命名)
-        """关窗口前把采集收尾：当前这一局落盘 + 关掉 parquet / 视频写入。"""
+        """关窗口前把采集收尾（落盘 + 关 parquet/视频写入）并收掉示教臂链路。"""
         if getattr(self, "recorder", None) is not None:
             self.recorder.stop()
+        if getattr(self, "leader_link", None) is not None:
+            self.leader_link.close()          # 停轮询线程 + 断开真机（别把串口留着）
+            self.leader_link = None
         super().closeEvent(event)
 
     # ────────────────── 主循环 ──────────────────
@@ -1375,6 +1685,7 @@ class MainWindow(QMainWindow):
         sess = self.session
         if sess is None:
             return
+        self._apply_leader(sess)                      # 示教臂（手摇）：本帧目标来自示教臂
         sess.step(8)                                  # dt=2ms × 8 ≈ 1/60 s
         self._render_view(sess)                       # 多视角：各路各渲一帧 → 2×2 拼图 → 贴到控件
 
@@ -1411,6 +1722,10 @@ class MainWindow(QMainWindow):
             self.rec_status.setText(self._rec_status_text())
             if self.recorder.error:                    # 后台出错：把开关拨回去并提示
                 self._rec_uncheck(self.recorder.error)
+
+        if now - self._leader_status_t > 0.5:          # 示教臂状态行（同样别每帧刷）
+            self._leader_status_t = now
+            self.leader_status.setText(self._leader_status_text())
 
         now = time.perf_counter()
         if now - self._fps_t >= 0.5:

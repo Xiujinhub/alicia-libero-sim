@@ -897,11 +897,116 @@ def main() -> int:
         check("标记球挪到地下画面也看不出差别（真的看不见）", int((delta > 8).sum()) == 0,
               f"Δ>8 的像素 {int((delta > 8).sum())} 个（噪声级 {int((delta > 0).sum())} 个）")
 
+    # 13) 示教臂（手摇跟随）：模拟源走通整条界面链路（真机链路见 tests/test_leader_arm.py）
+    def s13():
+        window.mode_combo.setCurrentIndex(3)
+        check("操作方式多了「示教臂（手摇跟随）」",
+              window.mode == "leader" and window.mode_combo.count() == 4,
+              window.mode_combo.currentText())
+        window.leader_enable.setChecked(True)                # 没连接就先勾 → 应被拒绝并弹回
+        check("没连接时使能被拒（不会假装在跟随）",
+              not window.leader_enable.isChecked() and "先" in window.leader_status.text(),
+              window.leader_status.text().replace("\n", " ")[:30])
+        window.leader_source.setCurrentIndex(1)              # 模拟（无硬件自测）
+        window.callback_leader_connect()
+        link = window.leader_link
+        check("模拟示教臂已连接（不碰串口/硬件）",
+              link is not None and link.connected and link.source == "virtual"
+              and link.age() == 0.0 and not link.stale(),
+              link.describe() if link else "None")
+
+        # ① 未使能 = 死人开关松开：手摇不该动仿真里的机械臂
+        base = window.session.joint_target.copy()
+        link.push_virtual(angles=[0.4] * 6)
+        window.tick()
+        check("未使能时手摇不动机械臂（死人开关）",
+              np.allclose(window.session.joint_target, base),
+              f"J1={np.degrees(window.session.joint_target[0]):.2f}°")
+
+        # ② 使能 → 先对齐（相对模式原地不动）；之后示教臂转 0.2 rad 就跟 0.2 rad
+        window.leader_enable.setChecked(True)
+        window.tick()
+        check("使能那一帧不跳变（相对模式先对齐）",
+              np.allclose(window.session.joint_target, base),
+              f"偏差 {np.degrees(np.abs(window.session.joint_target - base).max()):.2f}°")
+        link.push_virtual(angles=[0.6] * 6)
+        for _ in range(6):
+            window.tick()
+        moved = window.session.joint_target - base
+        check("示教臂转 0.2 rad → 机械臂跟着转 0.2 rad",
+              np.allclose(moved, 0.2, atol=0.01), f"实测 {np.round(moved, 3)}")
+
+        # ③ 夹爪：SDK 0 = 闭合 / 1000 = 张开（并与滑块回显对上）
+        link.push_virtual(gripper=0.0)
+        window.tick()
+        closed = window.session.gripper
+        link.push_virtual(gripper=1000.0)
+        window.tick()
+        check("夹爪跟随（SDK 0→闭合 / 1000→张开）",
+              closed < 0.05 and window.session.gripper > 0.95,
+              f"闭合 {closed:.2f} → 张开 {window.session.gripper:.2f}")
+        check("夹爪滑块回显手摇结果",
+              abs(window.grip_slider.value() - 100) <= 2, f"滑块 {window.grip_slider.value()}")
+
+        # ④ 真机死人开关的等价物：直接注入 button1（没勾选框也会跟 / 松开立刻冻结）
+        window.leader_enable.setChecked(False)
+        window.tick()
+        link.push_virtual(angles=[0.8] * 6, buttons={"button1": True})
+        window.tick()                                        # 按下那一帧 = 对齐
+        held = window.session.joint_target.copy()
+        link.push_virtual(angles=[1.0] * 6, buttons={"button1": True})
+        for _ in range(6):
+            window.tick()
+        check("按住示教臂左键 = 使能（不用勾选框）",
+              np.allclose(window.session.joint_target - held, 0.2, atol=0.01),
+              f"实测 {np.round(window.session.joint_target - held, 3)}")
+        link.push_virtual(angles=[1.2] * 6, buttons={"button1": False})
+        for _ in range(3):
+            window.tick()
+        frozen = window.session.joint_target.copy()
+        link.push_virtual(angles=[1.6] * 6)
+        for _ in range(3):
+            window.tick()
+        check("松开左键立刻冻结（再晃示教臂也不动）",
+              np.allclose(window.session.joint_target, frozen),
+              f"J1={np.degrees(window.session.joint_target[0]):.2f}°")
+
+        # ⑤ 键盘摇虚拟示教臂（走同一套映射，不是直接改关节）
+        window.leader_enable.setChecked(True)
+        window.tick()
+        before = float(np.degrees(link.snapshot()["joint_angles"])[0])
+        QTest.keyClick(window, Qt.Key_1)
+        QTest.keyClick(window, Qt.Key_Period)
+        after = float(np.degrees(link.snapshot()["joint_angles"])[0])
+        check("键盘摇的是虚拟示教臂（Joint1 +2°）", abs(after - before - 2.0) < 1e-6,
+              f"{before:.1f}° → {after:.1f}°")
+
+        # ⑥ 对齐按钮 / 校准文本框 / 断开
+        window.callback_leader_align()
+        check("点「对齐」有反馈", "对齐" in window.leader_status.text(),
+              window.leader_status.text().replace("\n", " ")[:26])
+        window.leader_signs.setText("1,1,1,1,1,1,1")         # 故意写错：只提示、不崩
+        window.callback_leader_calibration()
+        check("方向框写错只提示不崩", "❌" in window.leader_status.text(),
+              window.leader_status.text()[:34])
+        window.leader_signs.setText("-1,1,1,1,1,1")
+        window.callback_leader_calibration()
+        check("方向系数可现场校准", float(window.leader_mapper.signs[0]) == -1.0,
+              str(window.leader_mapper.signs[:3]))
+        window.leader_signs.setText("1,1,1,1,1,1")
+        window.callback_leader_calibration()
+        window.callback_leader_connect()                     # 断开
+        check("断开后：使能自动取消 + 链路清空",
+              window.leader_link is None and not window.leader_enable.isChecked(),
+              window.leader_status.text())
+        window.mode_combo.setCurrentIndex(0)
+
     # 12) 让主循环再跑一会，统计 FPS 并报告
     def s9():
         check("主循环无异常", not ERRORS, f"{len(ERRORS)} 个异常")
 
-    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s11b, s11c, s11d, s11e, s11f):
+    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s13, s9, s10, s11,
+               s12, s11b, s11c, s11d, s11e, s11f):
         step(fn)
 
     QTimer.singleShot(900, run_next)
