@@ -9,7 +9,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 
-from PySide6.QtCore import Qt, QTimer  # noqa: E402
+from PySide6.QtCore import QPointF, Qt, QTimer  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
@@ -120,10 +120,44 @@ def main() -> int:
         check("滑块驱动关节", abs(np.degrees(window.session.joint_target[0]) - 25.0) < 0.6,
               f"J1={np.degrees(window.session.joint_target[0]):.1f}°")
 
-    # 7) 相机 / 复位
+    # 7) 多视角显示（2×2 网格 / 逐格放大 / 逐格勾选）+ 复位
     def s7():
-        window.camera_combo.setCurrentIndex(1)
-        check("切相机", window.session.camera == "cam_top", window.session.camera)
+        cams = app_mod.CAMERAS
+        check("默认四个视角全部显示（4 个勾选框）",
+              [c for c in cams if window.view_checks[c].isChecked()] == cams,
+              f"{len(window.view_checks)} 个勾选框："
+              + "、".join(c.replace("cam_", "") for c in window.visible_cameras()))
+        window.tick()
+        check("2×2 拼图：四格、每格占 1/4（含 2px 分隔线）",
+              len(window.view_cells) == 4
+              and all(w * h == app_mod.VIEW_W * app_mod.VIEW_H
+                      for _c, (_x, _y, w, h) in window.view_cells)
+              and window.view_image_size == (2 * app_mod.VIEW_W + 2,
+                                             2 * app_mod.VIEW_H + 2),
+              f"拼图 {window.view_image_size[0]}×{window.view_image_size[1]}、"
+              f"{len(window.view_cells)} 格、单格 {app_mod.VIEW_W}×{app_mod.VIEW_H}")
+        pixmap = window.view.pixmap()
+        image_w, image_h = window.view_image_size
+        ox = (window.view.width() - pixmap.width()) / 2.0
+        oy = (window.view.height() - pixmap.height()) / 2.0
+        centers = [window.view_camera_at(QPointF(
+            ox + (x + w / 2) * pixmap.width() / image_w,
+            oy + (y + h / 2) * pixmap.height() / image_h))
+            for _c, (x, y, w, h) in window.view_cells]
+        check("点哪一格就是哪一路机位（拖动按格换算）", centers == cams, str(centers))
+        window.toggle_view_maximize("cam_top")
+        check("放大一格：它占满、其它三格隐藏",
+              window.visible_cameras() == ["cam_top"] and len(window.view_cells) == 1,
+              f"visible={window.visible_cameras()}")
+        window.toggle_view_maximize("cam_top")
+        check("再操作一次还原成 2×2 网格",
+              window.view_maximized is None and len(window.visible_cameras()) == 4,
+              str(window.visible_cameras()))
+        window.view_checks["cam_wrist"].setChecked(False)
+        check("取消勾选后该视角不再渲染显示",
+              "cam_wrist" not in window.visible_cameras(),
+              str(window.visible_cameras()))
+        window.view_checks["cam_wrist"].setChecked(True)
         window.joint_sliders[0].setValue(60)
         window.callback_reset()
         grasp = window.session.task["grasp_object"]
@@ -528,11 +562,163 @@ def main() -> int:
         check("t9 摆位（锚定+区域+不重叠+贴桌面）都合规", not bad,
               "；".join(bad) if bad else "6 局都合规")
 
+    # 11e) 连续任务：单任务连跑 N 局 / 多任务轮转 R 轮（每局重制场景，见 README §4、§8.12）
+    def s11e():
+        check("界面有连续任务控件",
+              all(hasattr(window, n) for n in
+                  ("cont_mode_combo", "cont_count_spin", "cont_task_list", "cont_button",
+                   "cont_status")),
+              "模式 / 次数 / 勾选表 / 开始按钮 / 一行状态")
+        check("连续任务没有日志栏（不打印逐局运行日志）",
+              not any(hasattr(window, n) for n in
+                      ("cont_detail", "cont_plan_label", "cont_log")),
+              f"cont_status={window.cont_status.text()!r}")
+        check("连续任务勾选表覆盖全部 9 关",
+              window.cont_task_list.count() == len(tasks_mod.TASKS),
+              f"{window.cont_task_list.count()} 项；默认模式 = "
+              f"{window.cont_mode_combo.currentText()}")
+        check("默认单任务模式：勾选表不可点",
+              window.cont_mode_combo.currentIndex() == 0
+              and not window.cont_task_list.isEnabled())
+        orig_dwell = app_mod.CONT_DWELL_FRAMES
+        app_mod.CONT_DWELL_FRAMES = 0        # 测试里不要"结束停留"，省帧（真跑那局会还原）
+
+        def fake_gen(ok):
+            """下一帧就出判分结果的假技能流水线（不跑物理，只验证调度/记账）。"""
+            yield "假执行"
+            return [skills_mod.Step(skills_mod.JUDGE_LABEL, ok, "假判分")]
+
+        def wait_run(limit=40):
+            for _ in range(limit):
+                if window.auto.active and not window.auto.finished:
+                    return True
+                window.tick()
+            return False
+
+        def drive(ok=True):
+            wait_run()
+            window.auto.gen = fake_gen(ok)
+            done = window.cont_done
+            for _ in range(40):
+                window.tick()
+                if window.cont_done != done:
+                    break
+
+        # ① 单任务连跑 3 局（t1：抓取物 + 篮子都随机）
+        window.cont_mode_combo.setCurrentIndex(0)
+        window.cont_count_spin.setValue(3)
+        window.task_combo.setCurrentIndex(0)
+        check("单任务计划 = 同一关 N 局", window._cont_build_plan() == [(0, 0)] * 3,
+              f"plan={window._cont_build_plan()}")
+        window.callback_cont_toggle()
+        spawns, baskets = [], []
+        for _ in range(3):
+            wait_run()
+            kp, kb = window.session.spawn["ketchup"], window.session.spawn["basket"]
+            spawns.append((round(kp.xy[0], 5), round(kp.xy[1], 5)))
+            baskets.append((round(kb.xy[0], 5), round(kb.xy[1], 5)))
+            drive(True)
+        check("单任务连跑 3 局逐局记账（3/3 成功）",
+              window.cont_ok == 3 and window.cont_done == 3,
+              f"ok={window.cont_ok} done={window.cont_done}")
+        check("每局都重制场景：抓取物摆位 3 局全不同（随机化每局生效）",
+              len(set(spawns)) == 3,
+              " ".join(f"({x * 1000:+.0f},{y * 1000:+.0f})" for x, y in spawns))
+        check("目标物（篮子）也每局重新随机", len(set(baskets)) == 3,
+              " ".join(f"({x * 1000:+.0f},{y * 1000:+.0f})" for x, y in baskets))
+        check("跑完自动收尾（按钮复位 + 一行汇总）",
+              not window.cont_active and "跑完" in window.cont_status.text()
+              and "\n" not in window.cont_status.text(),
+              window.cont_status.text())
+
+        # ② 多任务轮转 2 轮 × 勾选 t1/t3（一轮跑完再下一轮）
+        window.cont_mode_combo.setCurrentIndex(1)
+        window.callback_cont_clear_all()
+        for idx in (0, 2):
+            window.cont_task_list.item(idx).setCheckState(Qt.Checked)
+        window.cont_count_spin.setValue(2)
+        check("多任务计划按轮展开（轮内按列表顺序）",
+              window._cont_build_plan() == [(0, 0), (0, 2), (1, 0), (1, 2)],
+              f"plan={window._cont_build_plan()}")
+        window.callback_cont_toggle()
+        order = []
+        for run in range(4):
+            wait_run()
+            order.append(window.session.task["id"].split("_")[0])
+            drive(run != 1)                  # 故意让第 2 局判分不过，验证记账
+        check("多任务依次跑完一轮再进下一轮", order == ["t1", "t3", "t1", "t3"],
+              " → ".join(order))
+        check("成绩按局记账（3 成功 / 1 失败）",
+              window.cont_ok == 3 and window.cont_done == 4,
+              f"ok={window.cont_ok} done={window.cont_done}；"
+              f"{window.cont_status.text().replace(chr(10), ' ')}")
+        check("分任务统计", window.cont_counts.get("t1_ketchup_into_basket") == [2, 2]
+              and window.cont_counts.get("t3_pudding_into_ramekin") == [1, 2],
+              f"{window.cont_counts}")
+        check("汇总一行带分任务、且没有逐局日志",
+              "分任务" in window.cont_status.text()
+              and "\n" not in window.cont_status.text(),
+              window.cont_status.text())
+
+        # ③ 打断路径：手动接管 → 暂停；复位 / 切关 → 结束
+        window.cont_mode_combo.setCurrentIndex(0)
+        window.cont_count_spin.setValue(2)
+        window.task_combo.setCurrentIndex(0)
+        window.callback_cont_toggle()
+        window.nudge_gripper(-0.3)
+        check("手动操作 → 连跑暂停（按钮变\"继续连跑\"）",
+              window.cont_active and window.auto.paused
+              and "继续" in window.cont_button.text(), window.cont_button.text())
+        window.callback_cont_toggle()
+        check("再点按钮 → 继续连跑",
+              window.cont_active and not window.auto.paused, window.cont_button.text())
+        window.callback_reset()
+        check("手动复位 → 连跑结束",
+              not window.cont_active and "已停止" in window.cont_status.text(),
+              window.cont_status.text())
+
+        # ④ 真跑一局 t8（真实技能库 + 真的"结束停留"），验证与技能库的集成
+        app_mod.CONT_DWELL_FRAMES = orig_dwell
+        window.cont_count_spin.setValue(1)
+        window.task_combo.setCurrentIndex(7)          # t8：帧数最少的一关
+        window.callback_cont_toggle()
+        frames = 0
+        while window.cont_active and frames < 2000:
+            window.tick()
+            frames += 1
+        check("真跑一局（t8）走完并记账", window.cont_done == 1 and window.cont_ok == 1,
+              window.cont_status.text())
+
+    # 11f) 夹爪上的"小球"全部隐藏：① ik_marker（红）② tool0 绿色球 geom ③ tool0_site（灰）
+    #      真机夹爪中间没有这些球，都是仿真里的可视化标记（物理上都不参与）
+    def s11f():
+        import mujoco
+
+        sess = window.session
+        model, data = sess.model, sess.data
+        left = [f"geom:{model.geom(i).name or i}" for i in range(model.ngeom)
+                if model.geom(i).type == mujoco.mjtGeom.mjGEOM_SPHERE
+                and model.geom(i).rgba[3] > 0]
+        left += [f"site:{model.site(i).name or i}" for i in range(model.nsite)
+                 if model.site(i).rgba[3] > 0]
+        check("模型里所有球/site 都已全透明（夹爪上三个球全隐藏）", not left,
+              f"geom {model.ngeom} 个 / site {model.nsite} 个；还看得见的："
+              + ("、".join(left) if left else "无"))
+        # 渲染级验证：把 ik_marker 挪到地下 5m，画面应当看不出任何差别
+        # （用 Δ>8 计数：同状态渲两次也有 1~2 个 Δ≤1 的噪声像素，见 _tools\diag_marker.py）
+        before = sess.render()
+        data.mocap_pos[0] = [0.10, -0.10, -5.0]
+        mujoco.mj_forward(model, data)
+        after = sess.render()
+        delta = np.abs(before.astype(np.int16) - after.astype(np.int16)).max(axis=2)
+        check("标记球挪到地下画面也看不出差别（真的看不见）", int((delta > 8).sum()) == 0,
+              f"Δ>8 的像素 {int((delta > 8).sum())} 个（噪声级 {int((delta > 0).sum())} 个）")
+
     # 12) 让主循环再跑一会，统计 FPS 并报告
     def s9():
         check("主循环无异常", not ERRORS, f"{len(ERRORS)} 个异常")
 
-    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s11b, s11c, s11d):
+    for fn in (s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s11b, s11c, s11d, s11e, s11f):
         step(fn)
 
     QTimer.singleShot(900, run_next)

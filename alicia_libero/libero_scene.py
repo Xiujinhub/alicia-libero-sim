@@ -45,6 +45,13 @@ ARM_BASE_YAW = 0.0
 OBJ_SOLREF = "0.004 1"
 OBJ_SOLIMP = "0.95 0.95 0.001"
 
+# IK 目标点标记（``ik_marker`` 小球）的颜色。
+# ⚠ **默认 alpha=0 = 完全透明**：真机夹爪中间没有这个球（用户要求隐藏）——它只是
+# "鼠标拖拽夹爪"时用来显示**目标点**的调试标记，物理上完全不参与（``contype``/
+# ``conaffinity`` 都是 0，也没有质量/关节），所以隐藏它不影响任何动作与判分。
+# 调试 IK 时把 alpha 改回 0.55（例如 "1.0 0.25 0.25 0.55"）再跑一次 build_all_scenes.py 就能看见。
+IK_MARKER_RGBA = "1.0 0.25 0.25 0"
+
 
 def indent(elem: ET.Element, level: int = 0) -> None:
     """给 ElementTree 加缩进，输出更易读。"""
@@ -93,6 +100,22 @@ class SceneBuilder:
         asset = root.find("asset")
         worldbody = root.find("worldbody")
 
+        # 0) 隐藏骨架自带的"调试小球"（真机夹爪中间没有球，用户要求）：
+        #    ``tool0`` 里有一个**绿色球 geom**（``size=0.01``、``rgba 0 1 0 1``、
+        #    contype/conaffinity/density 全 0 = 纯可视）和一个 ``tool0_site``
+        #    （site 型球，默认渲染色是 0.5 灰 → 界面上看到的就是这个**灰色小球**）。
+        #    两个都只是标记：前者不参与任何物理，后者只是坐标系标记
+        #    （IK 取的是它的位姿 site_xpos，与渲染无关）。统一改成全透明即可，
+        #    不改尺寸/位置/类型，所以模型结构与求解结果逐字不变。
+        for body in root.iter("body"):
+            for child in list(body):
+                if child.tag == "site":
+                    child.set("rgba", "0 0 0 0")
+                elif (child.tag == "geom" and child.get("type") == "sphere"
+                      and child.get("contype") == "0" and child.get("conaffinity") == "0"
+                      and child.get("density") == "0"):
+                    child.set("rgba", "0 0 0 0")
+
         # 1) 场地：地面 + 桌面
         ET.SubElement(asset, "material", {"name": "scene_floor_mat", "rgba": "0.55 0.57 0.60 1",
                                           "reflectance": "0.15"})
@@ -127,10 +150,13 @@ class SceneBuilder:
             ET.SubElement(worldbody, "geom", {k: str(v) for k, v in geom.items()})
 
         # 4b) IK 目标点标记（mocap 体，界面上拖动夹爪时显示目标位置）
+        #     颜色默认全透明（IK_MARKER_RGBA 的 alpha=0）：真机里夹爪中间没有这个球，
+        #     所以只让它"存在但看不见"——mocap 体仍照常接收 data.mocap_pos，
+        #     想调试 IK 就把 IK_MARKER_RGBA 的 alpha 改回 0.55。
         marker = ET.SubElement(worldbody, "body", {"name": "ik_marker", "mocap": "true",
                                                    "pos": "0 0 0"})
         ET.SubElement(marker, "geom", {"name": "ik_marker_geom", "type": "sphere",
-                                       "size": "0.012", "rgba": "1.0 0.25 0.25 0.55",
+                                       "size": "0.012", "rgba": IK_MARKER_RGBA,
                                        "contype": "0", "conaffinity": "0", "group": "1",
                                        "condim": "1"})
 

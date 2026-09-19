@@ -13,6 +13,8 @@
   3. **关节滑块**：6 个滑块直接给关节目标角
 * 实时判据：任务的完成条件（目标区域、水平偏差、落座高度）每帧计算并显示
  * 相机切换、目标区域显示开关、场景复位
+* **连续任务（自动连跑）**：单任务连跑 N 局 / 多任务轮转（勾选若干关，一轮跑完再下一轮），
+  每局自动重制场景（带随机安放的任务**重新抽摆位**），跑完给出逐局明细与成功率
 
 动作规划状态
 ------------
@@ -33,17 +35,23 @@ from pathlib import Path
 
 import mujoco
 import numpy as np
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QPoint, Qt, QTimer
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QPushButton,
+    QScrollArea,
     QSlider,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -70,10 +78,15 @@ from libero_tasks import (  # noqa: E402
 )
 import skills  # noqa: E402  （闭环技能库：接触/跟随判据驱动的自动执行）
 
-VIEW_W, VIEW_H = 900, 640          # 离屏渲染分辨率
+VIEW_W, VIEW_H = 900, 640          # 离屏渲染分辨率（单格；2×2 时整图是 2 倍加分隔线）
+GRID_GAP = 2                       # 多视角拼接时格子之间的分隔线宽度（像素）
 JOINT_STEP_MAX_DEG = 8.0           # 一帧内单个关节最多动多少度（IK 限速，防"换臂形甩臂"）
 CAMERAS = ["cam_front", "cam_top", "cam_side", "cam_wrist"]
 CAMERA_LABELS = ["斜前方", "正上方", "侧前方", "腕部相机"]
+PANEL_W = 400                      # 左侧面板宽度
+CONT_DWELL_FRAMES = 15             # 连续任务：一局跑完后停留多少帧再重制场景
+                                   # （≈0.25s，让画面停在"结束状态"上，肉眼看得见成绩）
+CONT_MAX_RUNS = 999                # 连续任务：次数/轮数上限（防手滑把界面卡死）
 
 
 class SimSession:
@@ -283,8 +296,13 @@ class SimSession:
 
     # ── 渲染与判分 ──
 
-    def render(self) -> np.ndarray:
-        self.renderer.update_scene(self.data, camera=self.camera,
+    def render(self, camera: str | None = None) -> np.ndarray:
+        """渲染一帧（``camera=None`` = 本会话当前相机）。
+
+        多视角模式（界面的 2×2 网格）就是**对每个机位各调一次**这个函数再把图拼起来，
+        所以这里把相机名做成参数；单视角 / 各测试脚本的老用法（不传参）逐字不变。
+        """
+        self.renderer.update_scene(self.data, camera=camera or self.camera,
                                    scene_option=self.scene_option)
         return self.renderer.render()
 
@@ -315,7 +333,11 @@ class SimSession:
 
 
 class SimView(QLabel):
-    """把 MuJoCo 渲染结果显示出来，并把鼠标拖动/滚轮转成末端目标点移动。"""
+    """把 MuJoCo 渲染结果显示出来，并把鼠标拖动/滚轮转成末端目标点移动。
+
+    多视角模式下画面是 2×2（或放大的单格）拼图：按下时记下**那一格的机位**
+    （``drag_camera``），拖动就按该机位的屏幕方向换算；双击 / 右键 = 放大该格。
+    """
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -324,17 +346,32 @@ class SimView(QLabel):
         self.setMouseTracking(True)
         self.setStyleSheet("background:#1b1e24; border:1px solid #333a45;")
         self._last = None
+        self.drag_camera: str | None = None     # 当前拖动对应的机位（None = 用 session.camera）
+        self.hover_camera: str | None = None    # 鼠标底下是哪一格（状态栏提示用）
 
     def mousePressEvent(self, event) -> None:
+        camera = self.window().view_camera_at(event.position())
+        if event.button() == Qt.RightButton:            # 右键 = 放大/还原该格
+            self.window().toggle_view_maximize(camera)
+            return
         if event.button() == Qt.LeftButton:
+            self.drag_camera = camera
             self._last = event.position()
             self.setCursor(Qt.ClosedHandCursor)
 
+    def mouseDoubleClickEvent(self, event) -> None:      # 双击 = 放大/还原该格
+        if event.button() == Qt.LeftButton:
+            self.window().toggle_view_maximize(self.window().view_camera_at(event.position()))
+            self._last = None
+            self.setCursor(Qt.ArrowCursor)
+
     def mouseReleaseEvent(self, event) -> None:
         self._last = None
+        self.drag_camera = None
         self.setCursor(Qt.ArrowCursor)
 
     def mouseMoveEvent(self, event) -> None:
+        self.hover_camera = self.window().view_camera_at(event.position())
         if self._last is None or self.pixmap() is None:
             return
         pos = event.position()
@@ -365,6 +402,23 @@ class MainWindow(QMainWindow):
         self.selected_joint = 0
         self.success_count = 0
         self.was_success = False
+        # ── 多视角显示（2×2 网格）状态 ──
+        self.view_maximized: str | None = None     # 放大的机位名；None = 按勾选拼网格
+        self.view_cells: list[tuple[str, tuple[int, int, int, int]]] = []
+        self.view_image_size = (VIEW_W, VIEW_H)    # 当前拼图（未缩放）的尺寸
+        # ── 连续任务（自动连跑）状态 ──
+        # cont_plan：调度表，元素 = (第几轮, TASKS 下标)；单任务 = 同一关排 N 次，
+        # 多任务 = **按轮展开**（一轮里把勾选的关按列表顺序跑一遍，再进下一轮）
+        self.cont_plan: list[tuple[int, int]] = []
+        self.cont_active = False           # 连跑进行中（暂停时仍为 True）
+        self.cont_done = 0                 # 已经跑完几局
+        self.cont_ok = 0                   # 其中成功几局
+        self.cont_counts: dict[str, list[int]] = {}   # 任务 id → [成功, 局数]
+        self.cont_dwell = 0                # 本局结束后还要停留几帧
+        self.cont_frames = 0               # 本局已经跑了多少帧
+        self.cont_wall = 0.0               # 上一局耗时（秒）
+        self.cont_started = 0.0            # 本局开始时刻（算每局耗时）
+        self._cont_internal = False        # 连跑自己在切关/复位时别把自己停掉
         self._fps_t = time.perf_counter()
         self._fps = 0.0
 
@@ -389,17 +443,26 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("就绪")
 
     def _build_side_panel(self) -> QWidget:
+        """左侧面板。⚠ 控件变多之后 800px 高的窗口装不下，套一层滚动区（不滚动就看不到
+        「视图/场景」「快捷键」两组，实测窗口缩到 800px 时最下面一组被压扁）。"""
         panel = QWidget()
-        panel.setFixedWidth(400)
+        panel.setFixedWidth(PANEL_W)
         layout = QVBoxLayout(panel)
         layout.setSpacing(8)
         layout.addWidget(self._build_task_box())
         layout.addWidget(self._build_control_box())
         layout.addWidget(self._build_auto_box())
+        layout.addWidget(self._build_cont_box())
         layout.addWidget(self._build_view_box())
         layout.addWidget(self._build_help_box())
         layout.addStretch(1)
-        return panel
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setFixedWidth(PANEL_W + 16)
+        scroll.setWidget(panel)
+        return scroll
 
     def _build_task_box(self) -> QGroupBox:
         box = QGroupBox("任务（来自 libero_assets 素材分析）")
@@ -484,15 +547,96 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.auto_result)
         return box
 
-    def _build_view_box(self) -> QGroupBox:
-        box = QGroupBox("视图 / 场景")
+    def _build_cont_box(self) -> QGroupBox:
+        """连续任务面板：单任务连跑 N 局 / 多任务轮转 R 轮。
+
+        两条要求都能满足：
+        * **单任务**：次数 = 局数，一局跑完自动"重新开始"，走 ``callback_reset()`` →
+          ``sample_spawn`` 重新抽一次摆位，所以带随机安放的任务**每局都不一样**；
+        * **多任务**：在下面列表里勾选若干关，次数 = **轮数**；调度表按轮展开
+          （一轮把勾选的关依次跑完，再进下一轮）。
+        """
+        box = QGroupBox("连续任务（自动连跑）")
         layout = QVBoxLayout(box)
+
         row = QHBoxLayout()
-        self.camera_combo = QComboBox()
-        self.camera_combo.addItems(CAMERA_LABELS)
-        self.camera_combo.currentIndexChanged.connect(self.callback_camera)
-        row.addWidget(QLabel("相机"))
-        row.addWidget(self.camera_combo, stretch=1)
+        self.cont_mode_combo = QComboBox()
+        self.cont_mode_combo.addItems(["单任务连跑", "多任务轮转"])
+        self.cont_mode_combo.currentIndexChanged.connect(self.callback_cont_mode)
+        row.addWidget(QLabel("模式"))
+        row.addWidget(self.cont_mode_combo, stretch=1)
+        self.cont_count_label = QLabel("次数（局）")
+        self.cont_count_spin = QSpinBox()
+        self.cont_count_spin.setRange(1, CONT_MAX_RUNS)
+        self.cont_count_spin.setValue(5)
+        row.addWidget(self.cont_count_label)
+        row.addWidget(self.cont_count_spin)
+        layout.addLayout(row)
+
+        self.cont_task_list = QListWidget()
+        self.cont_task_list.setMaximumHeight(84)      # 约 3 行高：够点，又不太占侧栏
+        self.cont_task_list.setStyleSheet("font-size:11px;")
+        for task in TASKS:
+            item = QListWidgetItem(task["name"])
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            self.cont_task_list.addItem(item)
+        self.cont_task_list.setEnabled(False)          # 单任务模式用不到这张表
+        layout.addWidget(self.cont_task_list)
+
+        row2 = QHBoxLayout()
+        self.cont_all_button = QPushButton("全选")
+        self.cont_all_button.clicked.connect(self.callback_cont_check_all)
+        self.cont_none_button = QPushButton("全不选")
+        self.cont_none_button.clicked.connect(self.callback_cont_clear_all)
+        self.cont_button = QPushButton("▶ 开始连续任务")
+        self.cont_button.clicked.connect(self.callback_cont_toggle)
+        row2.addWidget(self.cont_all_button)
+        row2.addWidget(self.cont_none_button)
+        row2.addWidget(self.cont_button, stretch=1)
+        layout.addLayout(row2)
+
+        # ⚠ 连跑**不打印逐局运行日志**（用户要求）：所以这里既没有"计划：…"这种说明行、
+        # 也没有"✅ 第 k/N 局 … 帧 / 秒"的历史明细，只有**一行**实时状态（跑完时换成汇总）。
+        # 逐局的账仍然在记（cont_ok / cont_done / cont_counts），只是不往界面上刷。
+        self.cont_status = QLabel("就绪")
+        self.cont_status.setWordWrap(True)
+        self.cont_status.setStyleSheet("color:#7fd1ff; font-size:11px;")
+        layout.addWidget(self.cont_status)
+        return box
+
+    def _build_view_box(self) -> QGroupBox:
+        """视图/场景：**多视角**（最多 2×2 四个机位，各占 1/4）+ 逐格勾选 + 逐格放大。
+
+        * 勾选框：默认四个全开；只勾一个时它自动占满整块画面；
+        * 放大：下拉选一格（或**双击 / 右键**画面里的格子）→ 该格占满、其它三格隐藏，
+          再操作一次还原成网格；
+        * 鼠标拖动按**光标所在那一格**的机位换算（每格自己的方位角），互不干扰。
+        """
+        box = QGroupBox("视图 / 场景（多视角）")
+        layout = QVBoxLayout(box)
+
+        layout.addWidget(QLabel("显示的视角（默认全开，各自可关）"))
+        check_row = QHBoxLayout()
+        self.view_checks: dict[str, QCheckBox] = {}
+        for camera, label in zip(CAMERAS, CAMERA_LABELS):
+            box_ = QCheckBox(label.replace("相机", ""))       # 斜前方 / 正上方 / 侧前方 / 腕部
+            box_.setChecked(True)
+            box_.setToolTip(f"显示 {label}（{camera}）")
+            box_.toggled.connect(self.callback_view_checked)
+            self.view_checks[camera] = box_
+            check_row.addWidget(box_)
+        layout.addLayout(check_row)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("放大"))
+        self.zoom_combo = QComboBox()
+        self.zoom_combo.addItem("无（2×2 网格）")
+        self.zoom_combo.addItems(CAMERA_LABELS)
+        self.zoom_combo.currentIndexChanged.connect(self.callback_view_zoom)
+        self.zoom_combo.setToolTip("选一格放大：它占满画面、其它三格隐藏；"
+                                   "也可以直接双击 / 右键画面里的格子")
+        row.addWidget(self.zoom_combo, stretch=1)
         layout.addLayout(row)
 
         buttons = QHBoxLayout()
@@ -509,8 +653,12 @@ class MainWindow(QMainWindow):
             "鼠标左键拖动 = 移动夹爪目标点（IK 实时求解）\n"
             "滚轮 = 升降夹爪    Shift+滚轮 = 夹爪开合\n"
             "1..6 选关节    , / . 关节 ±2°    O / C 夹爪开合\n"
-            "R 复位场景    T 切换相机\n"
-            "自动执行 = 闭环技能库（接触/跟随判据），手动操作会自动暂停它"
+            "R 复位场景    T 依次放大四格（再按回到 2×2 网格）\n"
+            "视图=2×2 多视角：拖动按**光标所在那一格**换算；双击/右键某格=放大占满\n"
+            "（左上角那个「放大」下拉也能选；勾选框控制显示哪几路，默认全开）\n"
+            "自动执行 = 闭环技能库（接触/跟随判据），手动操作会自动暂停它\n"
+            "连续任务 = 单任务连跑 N 局 / 多任务轮转 R 轮；每局都重制场景（随机化的关\n"
+            "          每局换新摆位），手动拖拽会暂停，R 复位或切任务则结束连跑"
         )
         help_text.setWordWrap(True)
         help_text.setStyleSheet("color:#9fb3c8; font-size:11px;")
@@ -520,6 +668,9 @@ class MainWindow(QMainWindow):
     # ────────────────── 回调 ──────────────────
     def callback_load_task(self, index: int) -> None:
         task = TASKS[index]
+        # 手动切关时把连跑停掉（连跑自己切关会置 _cont_internal，不会被误停）
+        if self.cont_active and not self._cont_internal:
+            self.stop_continuous("手动切换任务")
         self.statusBar().showMessage(f"正在加载任务 {task['id']} ……")
         try:
             if self.session is not None and self.session.renderer is not None:
@@ -578,12 +729,139 @@ class MainWindow(QMainWindow):
         if self.session is not None:
             self.session.gripper = value / 100.0
 
-    def callback_camera(self, index: int) -> None:
-        if self.session is not None:
-            self.session.camera = CAMERAS[index]
+    # ────────────────── 多视角显示（2×2 网格 + 逐格放大） ──────────────────
+    def visible_cameras(self) -> list[str]:
+        """当前要渲染哪几路：放大时只有它；否则是勾选的那几路（按固定顺序）。"""
+        if self.view_maximized in CAMERAS:
+            return [self.view_maximized]
+        return [cam for cam in CAMERAS if self.view_checks[cam].isChecked()]
+
+    def compose_view(self, frames: dict[str, np.ndarray]) -> np.ndarray:
+        """把各路画面拼成 2×2（每格 1/4，中间 2px 分隔线；不足 4 格留黑）。
+
+        同时把每格在**图像坐标系**下的矩形记进 ``self.view_cells``，
+        供鼠标换算（拖动按格子机位、双击放大哪一格）使用。只有一路时直接返回它。
+        """
+        cams = [c for c in self.visible_cameras() if c in frames]
+        if not cams:                                   # 理论上不会（勾选回调会兜底）
+            self.view_cells = []
+            return np.zeros((VIEW_H, VIEW_W, 3), dtype=np.uint8)
+        if len(cams) == 1:
+            self.view_cells = [(cams[0], (0, 0, VIEW_W, VIEW_H))]
+            return frames[cams[0]]
+        canvas = np.zeros((2 * VIEW_H + GRID_GAP, 2 * VIEW_W + GRID_GAP, 3), dtype=np.uint8)
+        cells: list[tuple[str, tuple[int, int, int, int]]] = []
+        for i, cam in enumerate(cams[:4]):
+            row, col = divmod(i, 2)
+            x = col * (VIEW_W + GRID_GAP)
+            y = row * (VIEW_H + GRID_GAP)
+            canvas[y:y + VIEW_H, x:x + VIEW_W] = frames[cam]
+            cells.append((cam, (x, y, VIEW_W, VIEW_H)))
+        self.view_cells = cells
+        return canvas
+
+    def callback_view_checked(self, *_args) -> None:
+        """勾选/取消某一路视角。至少要留一路；放大中的那路被取消时退回网格。"""
+        checked = [cam for cam in CAMERAS if self.view_checks[cam].isChecked()]
+        if not checked:                                # 全关掉就没画面了 → 兜底留第一路
+            self.view_checks[CAMERAS[0]].setChecked(True)
+            self.statusBar().showMessage("至少保留一路视角，已自动勾回「斜前方」")
+            self.refresh_view()
+            return
+        if self.view_maximized is not None and self.view_maximized not in checked:
+            self.set_view_maximize(None)
+        self.statusBar().showMessage(
+            f"视角：显示 {len(checked)} 路 —— "
+            + "、".join(CAMERA_LABELS[CAMERAS.index(c)] for c in checked))
+        self.refresh_view()
+
+    def callback_view_zoom(self, index: int) -> None:
+        """下拉框选放大哪一格（0 = 不放大，回到 2×2 网格）。"""
+        self.set_view_maximize(None if index == 0 else CAMERAS[index - 1])
+
+    def set_view_maximize(self, camera: str | None) -> None:
+        """放大某一格（占满画面、其它三格隐藏）或还原成网格；同步下拉框与提示。"""
+        self.view_maximized = camera if camera in CAMERAS else None
+        index = 0 if self.view_maximized is None else CAMERAS.index(self.view_maximized) + 1
+        self.zoom_combo.blockSignals(True)
+        self.zoom_combo.setCurrentIndex(index)
+        self.zoom_combo.blockSignals(False)
+        self.statusBar().showMessage(
+            "视图：2×2 网格" if camera is None
+            else f"视图：{CAMERA_LABELS[CAMERAS.index(camera)]} 放大占满（其它三格已隐藏）")
+        self.refresh_view()
+
+    def toggle_view_maximize(self, camera: str | None) -> None:
+        """双击 / 右键某一格：放大它；再操作一次还原成网格。"""
+        if camera not in CAMERAS:
+            return
+        self.set_view_maximize(None if self.view_maximized == camera else camera)
+
+    def view_camera_at(self, pos) -> str | None:
+        """视图控件里的一个点 → 落在哪一格（返回机位名）。"""
+        if not self.view_cells:
+            return None
+        pixmap = self.view.pixmap()
+        if pixmap is None or pixmap.isNull():
+            return self.view_cells[0][0]
+        width = max(self.view.width(), 1)
+        height = max(self.view.height(), 1)
+        # QLabel 把按 KeepAspectRatio 缩放后的图**居中**，先减掉居中留白再折算回图像坐标
+        ox = (width - pixmap.width()) / 2.0
+        oy = (height - pixmap.height()) / 2.0
+        px, py = pos.x() - ox, pos.y() - oy
+        if not (0 <= px < pixmap.width() and 0 <= py < pixmap.height()):
+            return None
+        image_w, image_h = self.view_image_size
+        ix = px * image_w / pixmap.width()
+        iy = py * image_h / pixmap.height()
+        for camera, (x, y, w, h) in self.view_cells:
+            if x <= ix < x + w and y <= iy < y + h:
+                return camera
+        return None
+
+    def _render_view(self, sess) -> None:
+        """按当前设置渲染 + 拼成 2×2 + 贴到视图控件（tick 与"设置变了立刻重画"共用）。"""
+        frames = {camera: sess.render(camera) for camera in self.visible_cameras()}
+        canvas = self.compose_view(frames)
+        self.view_image_size = (canvas.shape[1], canvas.shape[0])
+        image = QImage(canvas.data, canvas.shape[1], canvas.shape[0],
+                       3 * canvas.shape[1], QImage.Format_RGB888).copy()
+        pixmap = QPixmap.fromImage(image).scaled(
+            self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.draw_view_labels(pixmap)                # 每格左上角标机位名（多格时才画）
+        self.view.setPixmap(pixmap)
+
+    def refresh_view(self) -> None:
+        """勾选 / 放大之后**立刻**重画一次（不等下一帧，双击手感更跟手）。"""
+        if self.session is not None and self.session.renderer is not None:
+            self._render_view(self.session)
+
+    def draw_view_labels(self, pixmap: QPixmap) -> None:
+        """在放大的 QPixmap 上给每格左上角标机位名（只在多格时画）。"""
+        if len(self.view_cells) < 2:
+            return
+        font = QFont()
+        font.setPointSize(9)
+        painter = QPainter(pixmap)
+        try:
+            painter.setFont(font)
+            scale = pixmap.width() / max(self.view_image_size[0], 1)
+            for camera, (x, y, _w, _h) in self.view_cells:
+                text = CAMERA_LABELS[CAMERAS.index(camera)]
+                rect = painter.fontMetrics().boundingRect(text).adjusted(-3, -2, 3, 2)
+                rect.moveTopLeft(QPoint(int(x * scale) + 4, int(y * scale) + 4))
+                painter.fillRect(rect, QColor(0, 0, 0, 130))
+                painter.setPen(QColor(230, 238, 248))
+                painter.drawText(rect, Qt.AlignCenter, text)
+        finally:
+            painter.end()
 
     def callback_reset(self) -> None:
         if self.session is not None:
+            # 手动复位 = 宣布接管：把连跑停掉（连跑自己每局都会复位，走 _cont_internal 分支）
+            if self.cont_active and not self._cont_internal:
+                self.stop_continuous("手动复位")
             if self.auto is not None:
                 self.auto.stop()
                 self.auto_status.setText("已停止（场景复位）")
@@ -603,11 +881,18 @@ class MainWindow(QMainWindow):
         if self.auto is not None and self.auto.active and not self.auto.paused:
             self.auto.pause()
             self.auto_button.setText("▶ 继续自动")
+            if self.cont_active:                       # 连跑也一起暂停（点按钮接着跑）
+                self.cont_button.setText("▶ 继续连跑")
+                self.cont_status.setText(
+                    "已暂停（手动接管）—— 点「▶ 继续连跑」接着跑；"
+                    "按 R 复位或切任务则结束连跑")
             self.statusBar().showMessage("检测到手动操作：自动执行已暂停")
 
     def callback_auto_toggle(self) -> None:
         if self.auto is None:
             return
+        if self.cont_active and not (self.auto.active and self.auto.paused):
+            self.stop_continuous("改为单局自动")        # 单局自动与连跑互斥
         if not self.auto.active:
             self.auto.start()
             self._auto_reported = False
@@ -632,12 +917,159 @@ class MainWindow(QMainWindow):
         self.auto.step()
         self.auto_button.setText("▶ 继续自动")
         self.auto_status.setText("单步：" + self.auto.status)
+        if self.cont_active:                    # 连跑被单步暂停：按钮改成"继续连跑"
+            self.cont_button.setText("▶ 继续连跑")
+
+    # ────────────────── 连续任务（自动连跑） ──────────────────
+    def callback_cont_mode(self, index: int) -> None:
+        """切换单任务 / 多任务：只有多任务模式才用得上那张任务勾选表。"""
+        self.cont_task_list.setEnabled(index == 1)
+        self.cont_count_label.setText("轮数" if index == 1 else "次数（局）")
+
+    def callback_cont_check_all(self, *_args) -> None:
+        self._cont_set_all_checked(True)
+
+    def callback_cont_clear_all(self, *_args) -> None:
+        self._cont_set_all_checked(False)
+
+    def _cont_set_all_checked(self, checked: bool) -> None:
+        for i in range(self.cont_task_list.count()):
+            self.cont_task_list.item(i).setCheckState(Qt.Checked if checked else Qt.Unchecked)
+
+    def _cont_checked_indices(self) -> list[int]:
+        """多任务模式下勾选的关（按列表顺序 = 一轮里的执行顺序）。"""
+        return [i for i in range(self.cont_task_list.count())
+                if self.cont_task_list.item(i).checkState() == Qt.Checked]
+
+    def _cont_build_plan(self) -> list[tuple[int, int]]:
+        count = int(self.cont_count_spin.value())
+        if self.cont_mode_combo.currentIndex() == 0:          # 单任务：同一关排 N 局
+            return [(0, self.task_combo.currentIndex())] * count
+        # 多任务：**按轮展开** —— 一轮里依次跑完勾选的关，再进下一轮
+        return [(r, i) for r in range(count) for i in self._cont_checked_indices()]
+
+    def start_continuous(self) -> bool:
+        """按当前设置开始连跑；返回是否真的开始了。"""
+        if self.session is None or self.auto is None:
+            return False
+        plan = self._cont_build_plan()
+        if not plan:
+            self.cont_status.setText("❌ 多任务模式至少要勾选一个任务")
+            return False
+        self.cont_plan = plan
+        self.cont_active = True
+        self.cont_done = self.cont_ok = 0
+        self.cont_counts = {}
+        self.cont_dwell = 0
+        self.cont_button.setText("⏹ 停止连跑")
+        self.statusBar().showMessage(f"连续任务开始：共 {len(plan)} 局")
+        self._cont_begin_run()
+        return True
+
+    def _cont_begin_run(self) -> None:
+        """开始调度表里的下一局：需要时切任务 → **复位重制场景**（重新随机摆位）→ 启动技能库。"""
+        if not self.cont_active:
+            return
+        if self.cont_done >= len(self.cont_plan):
+            self._cont_finish()
+            return
+        round_idx, task_idx = self.cont_plan[self.cont_done]
+        # ⚠ 连跑自己切关/复位时不能把自己停掉（callback_load_task / callback_reset 里会检查它）
+        self._cont_internal = True
+        try:
+            if task_idx != self.task_combo.currentIndex():
+                self.task_combo.setCurrentIndex(task_idx)      # 重建场景 + 新的 SkillRunner
+            self.callback_reset()                             # 每局都重制：resample=True 换新摆位
+        finally:
+            self._cont_internal = False
+        self.cont_frames = 0
+        self.cont_started = time.perf_counter()
+        self._auto_reported = False
+        self.auto.start()
+        self.auto_button.setText("⏸ 暂停自动")
+        self.auto_status.setText("连跑中")
+        self.auto_result.setText("")
+        self.cont_dwell = 0                                # 本局刚开跑，还没有"结束停留"
+        self.cont_status.setText(self._cont_status_text(round_idx))
+        self.statusBar().showMessage(
+            f"连续任务 第 {self.cont_done + 1}/{len(self.cont_plan)} 局：{self.session.task['id']}")
+
+    def _cont_status_text(self, round_idx: int | None = None) -> str:
+        """一行实时状态（不打印逐局日志）。"""
+        head = f"第 {self.cont_done + 1}/{len(self.cont_plan)} 局"
+        if self.cont_mode_combo.currentIndex() == 1:
+            head += f"（第 {(round_idx if round_idx is not None else 0) + 1} 轮）"
+        return (f"{head} · {self.session.task['id']} · 累计成功 {self.cont_ok}/{self.cont_done}")
+
+    def _cont_record_run(self) -> None:
+        """一局跑完：**只记账**（成功/失败、帧数），不往界面写运行日志。"""
+        task_id = self.session.task["id"]
+        ok = bool(self.auto.ok)                       # auto.ok = 技能库"判分"那一步的结论
+        entry = self.cont_counts.setdefault(task_id, [0, 0])
+        entry[0] += int(ok)
+        entry[1] += 1
+        self.cont_ok += int(ok)
+        self.cont_done += 1
+        self.cont_wall = time.perf_counter() - self.cont_started      # 供汇总里的平均用时
+        self.cont_dwell = CONT_DWELL_FRAMES           # 停一会儿，让画面留在结束状态上
+
+    def _cont_advance(self) -> None:
+        """结束停留走完：开下一局；整张调度表跑完就收尾。"""
+        if not self.cont_active:
+            return
+        if self.cont_done >= len(self.cont_plan):
+            self._cont_finish()
+        else:
+            self._cont_begin_run()
+
+    def _cont_finish(self) -> None:
+        total = len(self.cont_plan)
+        self.cont_active = False
+        self.cont_dwell = 0
+        self.cont_button.setText("▶ 开始连续任务")
+        rate = 100.0 * self.cont_ok / max(total, 1)
+        per_task = "，".join(f"{tid.split('_')[0]} {o}/{n}"
+                             for tid, (o, n) in self.cont_counts.items())
+        self.cont_status.setText(
+            f"✅ 跑完 {self.cont_ok}/{total} 成功（{rate:.0f}%）"
+            + (f"·分任务 {per_task}" if per_task else ""))
+        self.statusBar().showMessage(
+            f"连续任务结束：{self.cont_ok}/{total} 成功（{rate:.0f}%）")
+
+    def stop_continuous(self, reason: str = "手动停止") -> None:
+        """停掉连跑（不清场）：手动接管/复位/切关，或按停止按钮时调用。"""
+        if not self.cont_active:
+            return
+        self.cont_active = False
+        self.cont_dwell = 0
+        if self.auto is not None:
+            self.auto.stop()
+            self.auto_button.setText("▶ 自动完成本关")
+        self.cont_button.setText("▶ 开始连续任务")
+        self.cont_status.setText(
+            f"已停止（{reason}）· 已完成 {self.cont_done}/{len(self.cont_plan)} 局，"
+            f"成功 {self.cont_ok}")
+        self.auto_status.setText(f"已停止（{reason}）")
+
+    def callback_cont_toggle(self) -> None:
+        """开始 / 继续 / 停止连跑。"""
+        if self.cont_active and self.auto is not None and self.auto.paused:
+            self.auto.resume()                       # 被手动操作暂停过 → 接着跑
+            self.auto_button.setText("⏸ 暂停自动")
+            self.cont_button.setText("⏹ 停止连跑")
+            self.cont_status.setText(self._cont_status_text())
+            return
+        if self.cont_active:
+            self.stop_continuous("点停止")
+            return
+        self.start_continuous()
 
     # ────────────────── 鼠标拖拽 → IK ──────────────────
-    def _screen_axes(self):
-        """返回相机在世界系下的右/上方向，以及渲染图上"每像素多少米"。"""
+    def _screen_axes(self, camera: str | None = None):
+        """返回相机在世界系下的右/上方向，以及渲染图上"每像素多少米"（多视角时传格子机位）。"""
         sess = self.session
-        cam_id = mujoco.mj_name2id(sess.model, mujoco.mjtObj.mjOBJ_CAMERA, sess.camera)
+        camera = camera or sess.camera
+        cam_id = mujoco.mj_name2id(sess.model, mujoco.mjtObj.mjOBJ_CAMERA, camera)
         rot = np.zeros(9)
         mujoco.mju_quat2Mat(rot, sess.model.cam_quat[cam_id])
         rot = rot.reshape(3, 3)
@@ -650,8 +1082,9 @@ class MainWindow(QMainWindow):
         if self.session is None or self.mode != "drag" or disp_w <= 0:
             return
         self._pause_auto()
-        right, up, meters_per_px = self._screen_axes()
-        meters_per_px *= VIEW_W / float(disp_w)        # 显示缩放折算回渲染像素
+        # 按"拖动起点那一格"的机位换算（每格的屏幕方向不同）；单视角时就是 session.camera
+        right, up, meters_per_px = self._screen_axes(self.view.drag_camera)
+        meters_per_px *= VIEW_W / float(disp_w)         # 显示缩放折算回渲染像素
         delta = right * (dx_px * meters_per_px) + up * (-dy_px * meters_per_px)
         self.session.set_ee_target(self.session.ee_target + delta)
 
@@ -706,8 +1139,11 @@ class MainWindow(QMainWindow):
             self.nudge_gripper(-0.2)
         elif text == "r":
             self.callback_reset()
-        elif text == "t":
-            self.camera_combo.setCurrentIndex((self.camera_combo.currentIndex() + 1) % len(CAMERAS))
+        elif text == "t":                              # 依次放大四格（再按一次回到网格）
+            nxt = CAMERAS[0] if self.view_maximized is None else (
+                None if self.view_maximized == CAMERAS[-1]
+                else CAMERAS[CAMERAS.index(self.view_maximized) + 1])
+            self.set_view_maximize(nxt)
         else:
             super().keyPressEvent(event)
 
@@ -717,20 +1153,33 @@ class MainWindow(QMainWindow):
         if sess is None:
             return
         if self.auto is not None:                     # 闭环技能：先按当前状态定目标，再跑物理
+            if self.cont_active and not self.auto.finished:
+                self.cont_frames += 1                 # 连跑：统计本局帧数（与 bench 口径一致）
             self.auto.step()
             self.auto_status.setText("自动：" + self.auto.status)
             if self.auto.finished and not self._auto_reported:
                 self._auto_reported = True
-                self.auto_result.setText(self.auto.summary())
+                if not self.cont_active:              # 连跑不打印逐局运行日志，只更新状态
+                    self.auto_result.setText(self.auto.summary())
                 self.auto_button.setText("▶ 自动完成本关")
                 self.statusBar().showMessage(
                     "自动执行结束：" + ("成功 ✅" if self.auto.ok else "未完成 ❌"))
+                if self.cont_active:                  # 连跑：记下这一局的成绩
+                    self._cont_record_run()
+            # 连跑调度：停留 CONT_DWELL_FRAMES 帧 → 重制场景 → 下一局（或收尾）
+            if self.cont_active and self.auto.finished and self._auto_reported:
+                if self.cont_dwell > 0:
+                    self.cont_dwell -= 1
+                else:
+                    self._cont_advance()
+        # ⚠ 连跑会**在这一帧里切任务**（_cont_advance → callback_load_task 重建 session 并
+        # close 掉旧 renderer），上面那个 sess 可能已经被关掉了 —— 必须重新取一次，
+        # 否则本帧接着 render 旧 session 会抛 "render cannot be called after close"。
+        sess = self.session
+        if sess is None:
+            return
         sess.step(8)                                  # dt=2ms × 8 ≈ 1/60 s
-        frame = sess.render()
-        image = QImage(frame.data, VIEW_W, VIEW_H, 3 * VIEW_W, QImage.Format_RGB888).copy()
-        pixmap = QPixmap.fromImage(image).scaled(
-            self.view.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.view.setPixmap(pixmap)
+        self._render_view(sess)                       # 多视角：各路各渲一帧 → 2×2 拼图 → 贴到控件
 
         if self.mode != "slider":                     # 关节滑块回显当前关节角
             for i, (slider, label) in enumerate(zip(self.joint_sliders, self.joint_labels)):
@@ -762,7 +1211,9 @@ class MainWindow(QMainWindow):
             self._fps = 1.0 / max(now - self._fps_t, 1e-6)
             self._fps_t = now
         self.statusBar().showMessage(
-            f"渲染 {self._fps:.0f} FPS | 任务 {sess.task['id']} | 已完成 {self.success_count}")
+            f"渲染 {self._fps:.0f} FPS | 任务 {sess.task['id']} | 已完成 {self.success_count}"
+            + (f" | 连跑 第 {min(self.cont_done + 1, len(self.cont_plan))}/{len(self.cont_plan)} 局"
+               f"（成功 {self.cont_ok}）" if self.cont_active else ""))
 
 
 def main() -> int:
