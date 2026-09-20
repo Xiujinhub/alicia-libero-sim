@@ -91,6 +91,16 @@ DEFAULT_INTRINSIC = CALIB_DIR / "calib_intrinsic_1st.xml"
 # 这份数据拍摄时的真机 TCP 位姿：mm + 外旋 XYZ 欧拉角[deg]（= 真机 pose 字段）
 DEFAULT_POSE = (110.862, -5.474, 396.436, 196.64, 34.89, 111.77)
 DEFAULT_CART_HEIGHT_M = 1.10          # 机械臂装在小车上，基座离地约 1.1 m
+# 小车外形（**半**尺寸[m]）与它在基座系里的位置（mm）。
+# 真机上机械臂是贴着车**前缘**装的（要够得着前面），所以默认把小车往 (+x, +y) 挪：
+# 等价于"基座沿 −x 挪 150 mm、朝前 −y 挪 150 mm，落到小车的**左前缘**附近"。
+#   小车 x ∈ [−0.150, +0.450]、y ∈ [−0.110, +0.410] → 基座离前缘 110 mm、离左缘 150 mm。
+CART_SIZE_M = (0.30, 0.26)
+CART_TOP_SIZE_M = (0.31, 0.27)
+DEFAULT_CART_CENTER_MM = (150.0, 150.0)
+# 点云场景里默认**不画**"名义作业点"那个绿圆盘（target_pad）：
+# 它本来是基场景里标在**地面**上的作业点，挪到点云场景的车顶平面后会像机械臂旁多出来的绿块。
+DEFAULT_SHOW_TARGET_PAD = False
 DEFAULT_MAX_POINTS = 60000            # 超过就抽稀（整云 78721 点也能跑，只是文件大）
 DEFAULT_POINT_R_MM = 4.0              # 每个点画成多大的八面体
 DEFAULT_BANDS = 6                     # 按深度分几带颜色（0/1 = 单色）
@@ -646,6 +656,8 @@ class CloudScene:
     points_used: int
     bands: list[dict] = field(default_factory=list)   # [{n, rgba, mm}]
     cart_height: float = 0.0
+    cart_center: np.ndarray = field(default_factory=lambda: np.zeros(2))   # 小车中心（基座系 mm）
+    show_target_pad: bool = False
     ms: float = 0.0
 
     @property
@@ -654,14 +666,25 @@ class CloudScene:
 
     def summary(self) -> str:
         b = "、".join(f"{x['n']}点" for x in self.bands) or "—"
+        cc = np.asarray(self.cart_center, dtype=float).ravel()
+        if cc.size == 2:
+            hx, hy = CART_SIZE_M[0] * 1000.0, CART_SIZE_M[1] * 1000.0
+            edge = (f"，基座离车沿：前 {abs(hy - cc[1]):.0f} / 后 {abs(hy + cc[1]):.0f}"
+                    f" / 左 {abs(cc[0] - hx):.0f} / 右 {abs(hx + cc[0]):.0f} mm")
+        else:
+            edge = ""
         return (f"场景 {self.scene.name}：用 {self.points_used}/{self.points_total} 点，"
                 f"分 {len(self.meshes)} 组（{b}），网格 {self.mesh_mb:.1f} MB，"
-                f"生成 {self.ms:.0f} ms")
+                f"生成 {self.ms:.0f} ms；小车中心在基座系 "
+                f"({cc[0]:.0f}, {cc[1]:.0f}) mm{edge}"
+                f"{'，画了作业点标记' if self.show_target_pad else ''}")
 
 
 def build_scene(points_base_m, depth_mm=None, *, scene_out=OUT_SCENE, mesh_dir=MESH_DIR,
                 base_scene=BASE_SCENE, cart_height: float = DEFAULT_CART_HEIGHT_M,
-                show_cart: bool = True, point_mm: float = DEFAULT_POINT_R_MM,
+                show_cart: bool = True, cart_center_mm=DEFAULT_CART_CENTER_MM,
+                show_target_pad: bool = DEFAULT_SHOW_TARGET_PAD,
+                point_mm: float = DEFAULT_POINT_R_MM,
                 bands: int = DEFAULT_BANDS, max_points: int = DEFAULT_MAX_POINTS,
                 prefix: str = DEFAULT_MESH_PREFIX, color=None) -> CloudScene:
     """把（基座系）点云写成网格，并生成一份**带点云的世界场景 XML**。
@@ -670,6 +693,10 @@ def build_scene(points_base_m, depth_mm=None, *, scene_out=OUT_SCENE, mesh_dir=M
 
     * ``assets/meshes/pc_cloud_*.obj`` —— 每个深度带一个网格（场景的 ``meshdir`` 指向这里）；
     * ``assets/revA1_pc_scene.xml`` —— 基场景 + 点云几何 + 小车 + 地面下移到小车脚下。
+
+    ``cart_center_mm``：小车中心在**基座系**里的位置（mm）。默认 ``(+150, +150)`` 表示
+    "基座在小车上靠**左前缘**"；想让基座回正中就传 ``(0, 0)``。
+    ``show_target_pad``：要不要保留基场景那个"名义作业点"绿圆盘（默认**不要**）。
     """
     t0 = time.perf_counter()
     pts = np.asarray(points_base_m, dtype=float).reshape(-1, 3)
@@ -714,13 +741,21 @@ def build_scene(points_base_m, depth_mm=None, *, scene_out=OUT_SCENE, mesh_dir=M
         + "\n  </asset>", 1)
 
     body: list[str] = []
+    cart = np.asarray(cart_center_mm, dtype=float).ravel() if cart_center_mm is not None \
+        else np.zeros(2)
+    if cart.size != 2:
+        raise PointCloudError(f"cart_center_mm 要 2 个数（x y，mm）：{cart_center_mm!r}")
+    cx, cy = cart / 1000.0
     if show_cart and float(cart_height) > 1e-6:
         h = float(cart_height)
-        body.append(f'    <geom name="pc_cart" type="box" size="0.30 0.26 {h / 2:.4f}" '
-                    f'pos="0 0 {-h / 2:.4f}" rgba="0.30 0.32 0.36 1" '
+        sx, sy = CART_SIZE_M
+        tsx, tsy = CART_TOP_SIZE_M
+        body.append(f'    <geom name="pc_cart" type="box" size="{sx:.4f} {sy:.4f} {h / 2:.4f}" '
+                    f'pos="{cx:.4f} {cy:.4f} {-h / 2:.4f}" rgba="0.30 0.32 0.36 1" '
                     f'contype="0" conaffinity="0"/>')
-        body.append('    <geom name="pc_cart_top" type="box" size="0.31 0.27 0.008" '
-                    'pos="0 0 -0.008" rgba="0.46 0.48 0.53 1" contype="0" conaffinity="0"/>')
+        body.append(f'    <geom name="pc_cart_top" type="box" size="{tsx:.4f} {tsy:.4f} 0.008" '
+                    f'pos="{cx:.4f} {cy:.4f} -0.008" rgba="0.46 0.48 0.53 1" '
+                    f'contype="0" conaffinity="0"/>')
     for i, band in enumerate(band_info):
         r, g, b, a = band["rgba"]
         body.append(f'    <geom name="pc_pts_{i}" type="mesh" mesh="{prefix}_{i}" '
@@ -732,6 +767,11 @@ def build_scene(points_base_m, depth_mm=None, *, scene_out=OUT_SCENE, mesh_dir=M
                      lambda m: f'{m.group(1)}pos="0 0 {-float(cart_height):.4f}"', txt, count=1)
         txt = re.sub(r'(<geom name="target_pad"[^>]*?)pos="[^"]*"',
                      r'\1pos="0.4 0 0.002"', txt, count=1)
+    if not show_target_pad:
+        # 这个绿圆盘（直径 10 cm）在点云场景里会像"机械臂旁多出来的一块"：默认整条去掉，
+        # 连它上面的注释一起（`--show-target-pad` / 界面「作业点标记」可以留着）
+        txt = re.sub(r'[ \t]*<!--[^\n]*名义作业点标记[^\n]*-->\n', "", txt, count=1)
+        txt = re.sub(r'[ \t]*<geom name="target_pad"[^>]*/>\n', "", txt, count=1)
     txt = re.sub(r'<statistic[^>]*/>',
                  '<statistic center="0 -0.45 -0.15" extent="2.8"/>', txt, count=1)
 
@@ -740,7 +780,8 @@ def build_scene(points_base_m, depth_mm=None, *, scene_out=OUT_SCENE, mesh_dir=M
     scene_out.write_text(txt, encoding="utf-8")
     return CloudScene(scene=scene_out, meshes=meshes, points_total=total,
                       points_used=int(pts.shape[0]), bands=band_info,
-                      cart_height=float(cart_height),
+                      cart_height=float(cart_height), cart_center=cart.copy(),
+                      show_target_pad=bool(show_target_pad),
                       ms=(time.perf_counter() - t0) * 1000.0)
 
 
@@ -812,6 +853,8 @@ def build_cloud_scene(cloud_path=None, *, cloud: Cloud | None = None, pose=DEFAU
                       extrinsic=DEFAULT_EXTRINSIC, intrinsic=DEFAULT_INTRINSIC,
                       frame: str = "auto", ref: str = "tcp", tool_offset_mm: float | None = None,
                       cart_height: float = DEFAULT_CART_HEIGHT_M, show_cart: bool = True,
+                      cart_center_mm=DEFAULT_CART_CENTER_MM,
+                      show_target_pad: bool = DEFAULT_SHOW_TARGET_PAD,
                       max_points: int = DEFAULT_MAX_POINTS, point_mm: float = DEFAULT_POINT_R_MM,
                       bands: int = DEFAULT_BANDS, stride: int = 1,
                       depth_min_mm: float = MIN_DEPTH_MM, depth_max_mm=None,
@@ -848,6 +891,7 @@ def build_cloud_scene(cloud_path=None, *, cloud: Cloud | None = None, pose=DEFAU
                               offset_mm=offset_mm, yaw_deg=yaw_deg)
     scene = build_scene(pts_base, cloud.depth_mm, scene_out=scene_out, mesh_dir=mesh_dir,
                         base_scene=base_scene, cart_height=cart_height, show_cart=show_cart,
+                        cart_center_mm=cart_center_mm, show_target_pad=show_target_pad,
                         point_mm=point_mm, bands=bands, max_points=max_points)
     report = geometry_report(cloud, pts_base, cam_base, cart_height=cart_height, R=R, t=t,
                              ref=ref, tool_offset_mm=float(tool_offset_mm),
@@ -1016,6 +1060,25 @@ def run_selftest(args) -> int:
         scene = res["scene"]
         check("生成了带点云的场景 + 网格", scene.scene.is_file() and len(scene.meshes) == 6,
               scene.summary())
+        # 小车位置（基座在小车上靠前缘）＋那个"绿色圆盘"（名义作业点标记）
+        xml = Path(scene.scene).read_text(encoding="utf-8")
+        m_cart = re.search(r'<geom name="pc_cart"[^>]*pos="([-\d.eE ]+)"', xml)
+        cc = (np.asarray([float(v) for v in m_cart.group(1).split()[:2]]) * 1000.0
+              if m_cart else np.zeros(2))                      # XML 里是 m，换算成 mm
+        check("小车按 cart_center 摆放（基座落在车头左缘附近）",
+              bool(np.allclose(cc, DEFAULT_CART_CENTER_MM, atol=1e-3)),
+              f"小车中心 {np.round(cc, 1).tolist()} mm｜基座离前缘 "
+              f"{abs(CART_SIZE_M[1] * 1000 - cc[1]):.0f} mm、离左缘 "
+              f"{abs(cc[0] - CART_SIZE_M[0] * 1000):.0f} mm")
+        check("点云场景默认**不含**那个绿圆盘（target_pad，直径 10 cm）",
+              "target_pad" not in xml, f"XML 里 target_pad 出现 {xml.count('target_pad')} 次")
+        res_pad = build_scene(base, cloud.depth_mm, scene_out=RUNS / "pc_pad_check.xml",
+                              cart_height=res["scene"].cart_height, show_target_pad=True,
+                              max_points=2000, point_mm=4.0, bands=6)
+        xml_pad = Path(res_pad.scene).read_text(encoding="utf-8")
+        check("要保留时（--show-target-pad / 界面勾上）绿圆盘会写回去",
+              "target_pad" in xml_pad and res_pad.show_target_pad,
+              f"XML 里 target_pad 出现 {xml_pad.count('target_pad')} 次")
         try:
             import mujoco                                         # noqa: PLC0415
             model = mujoco.MjModel.from_xml_path(str(scene.scene))
@@ -1116,6 +1179,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ref", default="tcp", choices=("tcp", "flange"),
                     help="标定的\"末端\"是哪个点：tcp = 工具尖（真机 pose），flange = 法兰盘")
     ap.add_argument("--cart-height", type=float, default=DEFAULT_CART_HEIGHT_M, help="小车高度[m]")
+    ap.add_argument("--cart-center", nargs=2, type=float, default=list(DEFAULT_CART_CENTER_MM),
+                    metavar=("X", "Y"),
+                    help="小车中心在基座系里的位置[mm]：默认 (150, 150) 表示基座靠小车左前缘"
+                         "（等价于把基座沿 −x 挪 150 mm、朝前 −y 挪 150 mm；填 0 0 = 回正中）")
+    ap.add_argument("--show-target-pad", action="store_true",
+                    help="保留基场景那个「名义作业点」绿圆盘（默认在点云场景里去掉）")
     ap.add_argument("--no-cart", action="store_true", help="不画小车、地面也不下移")
     ap.add_argument("--points", type=int, default=DEFAULT_MAX_POINTS, help="点数上限（0 = 不抽稀）")
     ap.add_argument("--point-mm", type=float, default=DEFAULT_POINT_R_MM, help="每个点的尺寸[mm]")
@@ -1145,6 +1214,8 @@ def main(argv: list[str] | None = None) -> int:
     res = build_cloud_scene(cloud_path=args.cloud or None, pose=args.pose,
                             extrinsic=args.extrinsic, intrinsic=args.intrinsic,
                             frame=args.frame, ref=args.ref, cart_height=args.cart_height,
+                            cart_center_mm=args.cart_center,
+                            show_target_pad=args.show_target_pad,
                             show_cart=not args.no_cart, max_points=args.points,
                             point_mm=args.point_mm, bands=args.bands, stride=args.stride,
                             depth_min_mm=args.depth_min,

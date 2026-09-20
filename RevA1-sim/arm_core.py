@@ -425,6 +425,7 @@ class ArmSim:
         self.last_plan: PlannedLine | None = None
         self.ik_target: tuple[np.ndarray, np.ndarray | None, bool] | None = None
         self.path_points: np.ndarray | None = None
+        self.hidden_geoms: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.messages: list[str] = []
         self.sim_time = 0.0
         self.reset_model(log_it=False)
@@ -468,6 +469,42 @@ class ArmSim:
         这样界面上显示的"离地"才还是真的离地。
         """
         return float(self.tip()[2] - self.floor_z)
+
+    def geom_names(self) -> list[str]:
+        """场景里所有 geom 的名字（没名字的给 ``geom<id>``）。"""
+        return [mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, i) or f"geom{i}"
+                for i in range(self.model.ngeom)]
+
+    def hide_geom(self, name: str, hide: bool = True) -> bool:
+        """把一个 geom **藏起来 / 放回去**（纯显示用，不动物理）。
+
+        做法：挪到 y 轴外 10 km 再把透明度清零 —— 比只改 alpha 稳（有的渲染后端不吃 alpha=0）。
+        原位置记在 ``self.hidden_geoms`` 里，能原样恢复。返回 ``False`` 表示场景里没有这个名字。
+
+        典型用途：场景里那些"辅助标记"（地面/车顶上的名义作业点绿圆盘 ``target_pad``、
+        小车 ``pc_cart``…）不想看时一键隐藏，不用改 XML。
+        """
+        gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        if gid < 0:
+            return False
+        if hide:
+            if name not in self.hidden_geoms:
+                self.hidden_geoms[name] = (self.model.geom_pos[gid].copy(),
+                                           self.model.geom_rgba[gid].copy())
+            self.model.geom_pos[gid] = (0.0, 1.0e4, 0.0)
+            self.model.geom_rgba[gid][3] = 0.0
+        elif name in self.hidden_geoms:
+            pos, rgba = self.hidden_geoms.pop(name)
+            self.model.geom_pos[gid] = pos
+            self.model.geom_rgba[gid] = rgba
+        return True
+
+    def geom_visible(self, name: str) -> bool:
+        """这个 geom 现在是不是"看得见"（被 :meth:`hide_geom` 藏起来过的就是 False）。"""
+        gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        if gid < 0:
+            return False
+        return name not in self.hidden_geoms and abs(float(self.model.geom_pos[gid][1])) < 1.0e3
 
     def track_err_deg(self) -> float:
         """最大关节跟踪误差[°]（指令 − 实测）。"""

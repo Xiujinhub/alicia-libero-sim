@@ -855,8 +855,29 @@ class ControlPanel(QWidget):
         self.c_cart.setToolTip("机械臂装在小车上，基座离地多高（地面就铺在这个高度）")
         self.c_show_cart = QCheckBox("画小车")
         self.c_show_cart.setChecked(True)
+        self.c_cart_x = QDoubleSpinBox()
+        self.c_cart_y = QDoubleSpinBox()
+        for w, v in ((self.c_cart_x, float(pc.DEFAULT_CART_CENTER_MM[0])),
+                     (self.c_cart_y, float(pc.DEFAULT_CART_CENTER_MM[1]))):
+            w.setRange(-500.0, 500.0)
+            w.setSingleStep(10.0)
+            w.setDecimals(0)
+            w.setSuffix(" mm")
+            w.setMaximumWidth(96)
+            w.setValue(v)
+        self.c_cart_x.setToolTip("小车中心在**基座系**里的位置（x）。默认 (+150, +150) 表示机械臂"
+                                 "贴着小车的**左前缘**装；想让基座回到车正中就填 0 0")
+        self.c_cart_y.setToolTip(self.c_cart_x.toolTip())
+        self.c_target_pad = QCheckBox("作业点标记")
+        self.c_target_pad.setChecked(bool(pc.DEFAULT_SHOW_TARGET_PAD))
+        self.c_target_pad.setToolTip("场景里那个绿色圆盘（名义作业点标记，直径 10 cm）。\n"
+                                     "默认不显示：它在点云场景里像机械臂旁多出来的一块。\n"
+                                     "勾上就显示（对当前场景立刻生效，切场景也记着）")
+        self.c_target_pad.stateChanged.connect(lambda _s: self._apply_pad_visibility())
         card.add_row(QLabel("参考点"), self.c_ref, QLabel("小车高"), self.c_cart)
-        card.add_row(self.c_show_cart, None, QLabel("（关掉就只挪地面、不画车）"))
+        card.add_row(QLabel("小车中心"), self.c_cart_x, self.c_cart_y,
+                     QLabel("（基座系，+150/+150 = 靠左前缘）"))
+        card.add_row(self.c_show_cart, self.c_target_pad, QLabel("（不画车 / 显示绿圆盘）"))
 
         self.c_points = QSpinBox()
         self.c_points.setRange(0, 200000)
@@ -969,6 +990,10 @@ class ControlPanel(QWidget):
                     ref="flange" if self.c_ref.currentIndex() == 1 else "tcp",
                     cart_height=float(self.c_cart.value()),
                     show_cart=bool(self.c_show_cart.isChecked()),
+                    cart_center_mm=(float(self.c_cart_x.value()), float(self.c_cart_y.value())),
+                    # 绿圆盘总是写进 XML，显不显示交给「作业点标记」那个勾（运行时开关，
+                    # 换场景也管用；见 _apply_pad_visibility）
+                    show_target_pad=True,
                     max_points=int(self.c_points.value()),
                     point_mm=float(self.c_size.value()),
                     bands=int(self.c_bands.value()),
@@ -1005,6 +1030,10 @@ class ControlPanel(QWidget):
                          f"（总耗时 {(time.perf_counter() - t0) * 1000:.0f} ms）")
             for line in self.cloud_report:
                 self.sim.log("    " + line)
+            self.sim.log("    显示设置: 作业点标记（绿圆盘）"
+                         f"{'显示' if self.c_target_pad.isChecked() else '隐藏'}"
+                         f" · 小车中心 ({self.c_cart_x.value():.0f}, {self.c_cart_y.value():.0f}) mm"
+                         "（点云卡片上都能改）")
             self.sim.log(f"当前场景：{Path(self.cloud_scene).name}"
                          f" · 地面 z = {self.sim.floor_z:.3f} m（「离地高度」按它算）")
         self.refresh()
@@ -1033,6 +1062,23 @@ class ControlPanel(QWidget):
             self.sim.log(f"已存图：{out}（机械臂 + 点云同框）")
         else:
             self.sim.log("存图失败：还没有渲染过画面（--no-render？）")
+
+    def apply_pad_visibility(self) -> bool:
+        """「作业点标记」那个勾 → 当前场景里 ``target_pad``（绿圆盘）的显隐。
+
+        对**任何**场景都管用（基场景那个圆盘在地面上，点云场景那个在车顶平面），
+        换场景后会再调一次，把勾选状态接上。场景里没这个 geom 就返回 ``False``。
+        """
+        return self._apply_pad_visibility(log_it=False)
+
+    def _apply_pad_visibility(self, *, log_it: bool = True) -> bool:
+        want = bool(self.c_target_pad.isChecked())
+        ok = self.sim.hide_geom("target_pad", hide=not want)
+        if log_it:
+            self.sim.log(f"作业点标记（绿圆盘）：{'显示' if want else '隐藏'}"
+                         + ("" if ok else "（当前场景里没有这个 geom）"))
+        self.refresh()
+        return ok
 
     def _cloud_text(self) -> str:
         """点云卡片下半部分的状态（加载过没有 + 体检报告）。"""
@@ -1409,6 +1455,7 @@ class RevA1Window(QMainWindow):
         self.resize(int(win_w), int(win_h))
         self.view = ArmView(sim, width=width, height=height, render=render)
         self.panel = ControlPanel(sim, self)
+        self.panel.apply_pad_visibility()          # 「作业点标记」默认不显示（绿圆盘）
 
         scroll = QScrollArea()
         scroll.setWidget(self.panel)
@@ -1629,6 +1676,7 @@ class RevA1Window(QMainWindow):
             self.panel.append_log(f"已换场景：{Path(scene_path).name}"
                                   f"（{new.model.nq} 轴 · {new.model.ngeom} 几何 · "
                                   f"地面 z = {new.floor_z:.3f} m）")
+        self.panel.apply_pad_visibility()      # 换场景后把「作业点标记」的显示状态接上
         self.panel.refresh()
         return True
 
@@ -2080,6 +2128,26 @@ def run_ui_test(args) -> int:
           abs(panel.c_cart.value() - 1.10) < 1e-9 and panel.c_points.value() == 60000
           and panel.c_frame.currentIndex() == 0 and panel.c_ref.currentIndex() == 0
           and panel.c_bands.value() == 6 and panel.c_cloud.count() >= 1)
+    check("点云卡片：小车中心默认 (+150, +150) mm（基座靠车头左前缘）",
+          abs(panel.c_cart_x.value() - 150.0) < 1e-9 and abs(panel.c_cart_y.value() - 150.0) < 1e-9,
+          f"({panel.c_cart_x.value():.0f}, {panel.c_cart_y.value():.0f}) mm")
+
+    # 「作业点标记」= 那个绿色圆盘：默认不显示，勾上就回来（任何场景都管用）
+    gid_pad = mujoco.mj_name2id(win.sim.model, mujoco.mjtObj.mjOBJ_GEOM, "target_pad")
+    check("作业点标记：默认不勾 → 绿圆盘被藏起来",
+          (not panel.c_target_pad.isChecked()) and not win.sim.geom_visible("target_pad"),
+          f"geom_visible = {win.sim.geom_visible('target_pad')}")
+    z_pad0 = float(win.sim.hidden_geoms["target_pad"][0][2]) \
+        if "target_pad" in win.sim.hidden_geoms else float("nan")     # 藏之前的原位（地面上）
+    panel.c_target_pad.setChecked(True)
+    win.pump(0.2)
+    z_pad1 = float(win.sim.model.geom_pos[gid_pad][2]) if gid_pad >= 0 else float("nan")
+    check("作业点标记：勾上 → 绿圆盘回到原位（地面上）",
+          win.sim.geom_visible("target_pad") and abs(z_pad1 - z_pad0) < 1e-9,
+          f"z {z_pad0:.4f} → {z_pad1:.4f} m")
+    panel.c_target_pad.setChecked(False)
+    win.pump(0.2)
+
     panel.c_points.setValue(3000)
     panel.c_bands.setValue(3)
     panel.on_cloud_load()
@@ -2090,6 +2158,13 @@ def run_ui_test(args) -> int:
     check("点云：加载后场景里真的有点云几何",
           panel.cloud_scene is not None and n_pc >= 3,
           f"点云几何 {n_pc} 个 · {Path(panel.cloud_scene).name if panel.cloud_scene else ''}")
+    check("点云：小车按「小车中心」摆放、且绿圆盘依然不显示",
+          abs(float(win.sim.model.geom_pos[mujoco.mj_name2id(win.sim.model,
+                                                              mujoco.mjtObj.mjOBJ_GEOM,
+                                                              "pc_cart")][0]) - 0.15) < 1e-6
+          and not win.sim.geom_visible("target_pad"),
+          f"pc_cart x = {float(win.sim.model.geom_pos[mujoco.mj_name2id(win.sim.model, mujoco.mjtObj.mjOBJ_GEOM, 'pc_cart')][0]):.3f} m"
+          f"（= 基座在小车上靠 −x 150 mm）")
     check("点云：地面挪到小车脚下", abs(win.sim.floor_z + 1.1) < 1e-6,
           f"floor_z = {win.sim.floor_z:.3f} m")
     txt = panel.cloud_label.text()
