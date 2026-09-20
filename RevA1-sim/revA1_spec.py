@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 
@@ -67,9 +69,50 @@ GAINS: dict[str, dict] = {
 # 相当于机器人用地脚螺栓固定在地板上。convert 脚本会自动量这个值。
 FLOOR_Z = -0.1712
 
-# home / ready 姿态（弧度）：工具轴**竖直朝下**、无自碰撞、重力力矩小（J2 70 Nm / J3 56 Nm）。
-# 由 sim_ik.py 对目标点 (0.40, 0, 0.179) 求逆解得到（位置误差 0.06mm、姿态误差 0.00°），
-# 再用 check_model.py 复核过静置漂移 < 0.3°、雅可比条件数 8.8。
+# 拍摄姿态（真机 pose）：点云就是在这个姿态下拍的，现在也把它当作**初始姿态**。
+# 格式 = 与真机 pose 一致：x y z [mm] + rx ry rz [deg]（**外旋 XYZ** 欧拉角）。
+CAPTURE_POSE = (110.862, -5.474, 396.436, 196.64, 34.89, 111.77)
+
+# home / ready 姿态（弧度）= **真机实测关节角**，就是上面这个拍摄姿态：
+# 工具轴前倾 38.2°（离竖直）、工具尖离地 0.568 m、0 自碰撞、静置漂移 < 0.1°、限位余量 ≥ 42.8°。
+# 关节角取自真机状态接口读数（见 runs/probe.log：模型 FK 复核工具尖差 0.50 mm、工具轴差 0.00°）；
+# 独立验算：IK 多分支搜索里同一分支的解与它只差 0.04°（见 convert_urdf_to_mjcf.py --home-from-pose）。
 # ⚠️ 改完记得重跑 convert_urdf_to_mjcf.py 和 check_model.py。
-TARGET_POSE = (0.40, 0.0, 0.179)     # 世界系名义作业点 = home 下 tool_site 的位置（场景里的绿点标记）
-HOME_QPOS = (0.3152, -1.6288, -2.3803, -0.7033, 1.5708, -2.3152)
+TARGET_POSE = (0.110860, -0.005473, 0.395935)  # = home 下 tool_site 的世界系位置（模型 FK，离地 0.567 m）
+HOME_QPOS = (1.72836, -2.39037, 2.11474, 1.19617, 1.72995, -1.75492)
+
+# 世界系**名义作业点**：地面上的绿点标记 + 笛卡尔 demo 的路径中心（工具轴竖直朝下时的常用作业区，
+# 与 home 无关 —— 换初始姿态不该把 demo 的路径一起搬走）。
+WORK_POSE = (0.40, 0.0, 0.179)
+
+# 工具轴**竖直朝下**的中性姿态（弧度）：多初值 IK 的备用初值。
+# 以前它就是 home；home 换成真机实测的前倾姿态后，"让工具轴朝下"这类目标（demo / 自检里全是）
+# 从它出发一次就能解出来，所以留作种子用。数值 = 历史上那组 home：
+# 对 (0.40, 0, 0.179) 求逆解得到的（位置误差 0.06 mm、姿态误差 0.00°），静置漂移 < 0.3°。
+NEUTRAL_QPOS = (0.3152, -1.6288, -2.3803, -0.7033, 1.5708, -2.3152)
+
+
+# ------------------------------------------------------------------ 位姿约定
+# 真机 pose / 拍摄姿态统一是 [x, y, z, rx, ry, rz]：位置 mm、角度 deg，旋转部分为
+# **外旋 XYZ 欧拉角**（R = Rz(rz) @ Ry(ry) @ Rx(rx)）。全仓只在这里实现一次。
+def euler_xyz_matrix(rx_rad: float, ry_rad: float, rz_rad: float) -> np.ndarray:
+    """外旋 XYZ 欧拉角（弧度）→ 旋转矩阵。"""
+    cx, sx = np.cos(rx_rad), np.sin(rx_rad)
+    cy, sy = np.cos(ry_rad), np.sin(ry_rad)
+    cz, sz = np.cos(rz_rad), np.sin(rz_rad)
+    return (np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]])
+            @ np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
+            @ np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]]))
+
+
+def pose_matrix(pose) -> tuple[np.ndarray, np.ndarray]:
+    """``[x,y,z(mm), rx,ry,rz(deg)]`` → ``(R 3×3, p 3[m])``。"""
+    v = [float(x) for x in np.asarray(pose, dtype=float).ravel()]
+    if len(v) != 6:
+        raise ValueError(f"位姿要 6 个数（x y z mm + rx ry rz deg）：{pose!r}")
+    return euler_xyz_matrix(*np.radians(v[3:6])), np.asarray(v[:3], dtype=float) / 1000.0
+
+
+def pose_tool_axis(pose) -> np.ndarray:
+    """位姿的工具轴方向（旋转矩阵第三列 = 末端 +z 在世界系的方向）。"""
+    return pose_matrix(pose)[0][:, 2]

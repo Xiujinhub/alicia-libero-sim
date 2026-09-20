@@ -28,27 +28,27 @@
     </body>
     <body name="Link1" pos="0 0 0.0615">
       <inertial pos="1.0637e-05 -0.005295 0.072879" quat="0.99993 0.011444 0.000547113 -0.00282637" mass="13.203" diaginertia="0.036031 0.0353042 0.0252577"/>
-      <joint name="joint1" pos="0 0 0" axis="0 0 1" range="-3.1415 3.1415"/>
+      <joint name="joint1" range="-3.1415 3.1415"/>
       <geom name="Link1_geom" type="mesh" rgba="0.77647 0.5 0.73725 1" mesh="Link1"/>
       <body name="Link2" pos="0 -0.078 0.0675" quat="0.707105 0.707108 0 0">
         <inertial pos="-0.22081 -6.9449e-08 0.070574" quat="0.500014 0.500011 0.499986 0.499989" mass="46.802" diaginertia="1.4978 1.476 0.096336"/>
-        <joint name="joint2" pos="0 0 0" axis="0 0 1" range="-3.1415 3.1415"/>
+        <joint name="joint2" range="-3.1415 3.1415"/>
         <geom name="Link2_geom" type="mesh" rgba="0.77647 0.75686 0.5 1" mesh="Link2"/>
         <body name="Link3" pos="-0.442 0 -0.0003">
           <inertial pos="-0.1918 -8.518e-08 -0.055853" quat="0.511431 0.488303 0.488285 0.511445" mass="20.24" diaginertia="0.42906 0.42695 0.0204705"/>
-          <joint name="joint3" pos="0 0 0" axis="0 0 1" range="-2.8623 2.8623"/>
+          <joint name="joint3" range="-2.8623 2.8623"/>
           <geom name="Link3_geom" type="mesh" rgba="0.5 1 1 1" mesh="Link3"/>
           <body name="Link4" pos="-0.386 0 -0.0044">
             <inertial pos="1.8594e-07 0.0056527 0.048012" quat="0.706701 0.707512 5.79265e-05 -8.41597e-05" mass="4.6142" diaginertia="0.0068327 0.0066952 0.0037508"/>
-            <joint name="joint4" pos="0 0 0" axis="0 0 1" range="-3.1415 3.1415"/>
+            <joint name="joint4" range="-3.1415 3.1415"/>
             <geom name="Link4_geom" type="mesh" rgba="0.77647 0.5 0.73725 1" mesh="Link4"/>
             <body name="Link5" pos="0 -0.0543 0.0507" quat="0.707105 0.707108 0 0">
               <inertial pos="2.1811e-06 -0.0034366 0.048188" quat="0.70507 0.709137 -0.000152272 0.000125437" mass="4.7679" diaginertia="0.0074585 0.00733072 0.00381908"/>
-              <joint name="joint5" pos="0 0 0" axis="0 0 1" range="-3.1415 3.1415"/>
+              <joint name="joint5" range="-3.1415 3.1415"/>
               <geom name="Link5_geom" type="mesh" rgba="0.77647 0.75686 0.5 1" mesh="Link5"/>
               <body name="ee_Link" pos="0 0.0543 0.0507" quat="0.707105 -0.707108 0 0">
                 <inertial pos="-2.6515e-06 -9.8103e-05 0.021947" quat="0.510385 0.489598 -0.502945 0.496837" mass="1.1773" diaginertia="0.000873069 0.000554031 0.00055272"/>
-                <joint name="joint6" pos="0 0 0" axis="0 0 -1" range="-3.1415 3.1415"/>
+                <joint name="joint6" range="-3.1415 3.1415" axis="0 0 -1"/>
                 <geom name="ee_Link_geom" type="mesh" rgba="0.77647 0.5 0.5 1" mesh="ee_Link"/>
                 <!-- J6 法兰中心（机械接口原点）：插工具/相机都用它 -->
                 <site name="ee_site" pos="0 0 0" size="0.012" rgba="1 0.55 0.1 1" group="3"/>

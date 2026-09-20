@@ -62,6 +62,7 @@ import mujoco  # noqa: E402  (必须在设置 MUJOCO_GL 之后)
 
 import revA1_spec as spec  # noqa: E402
 import sim_ik as ik  # noqa: E402
+from arm_core import ik_seeds, solve_ik_best  # noqa: E402  （多初值 IK）
 
 # tkinter / Pillow 都是本机已有的依赖；缺失时至少让 --selftest 还能跑（不给窗口）
 try:
@@ -532,8 +533,10 @@ class ArmSim:
         seed = np.asarray(self.q_pos() if seed is None else seed, dtype=float).ravel()
         qpos0, qvel0 = self.data.qpos.copy(), self.data.qvel.copy()
         try:
-            q, ep, ea = ik.solve_ik_pose(self.model, self.data, "tool_site",
-                                         pos, axis, q_seed=seed.copy())
+            # 多初值（含"工具轴竖直朝下"的中性姿态）：home 现在是真机实测的前倾姿态，
+            # 单初值解"工具尖朝下"这类目标容易掉进局部极小。
+            q, ep, ea, _ = solve_ik_best(self.model, self.data, pos, axis,
+                                         seeds=ik_seeds(seed))
             if ep > 3e-3 and axis is not None:
                 q2, ep2, ea2 = ik.refine_ik_pose(self.model, self.data, "tool_site",
                                                  pos, axis, q_seed=q)

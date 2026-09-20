@@ -54,6 +54,7 @@ LINE_STEP_M = 0.01          # 笛卡尔直线：每 1 cm 解一个路点
 LINE_MIN_POINTS = 9         # 路点下限（目标很近时也要有中间点，否则看不出直线）
 LINE_MAX_POINTS = 400       # 路点上限（防手快输个 10 m 把界面卡死）
 LINE_MAX_ERR_M = 3e-3       # 单个路点 IK 残差超过它就算这一步"没解出来"
+LINE_MAX_BRANCH_JUMP_DEG = 45.0   # 单步"换解支"超过它就当直线走不过去（换支会让轨迹甩出去）
 
 # 机体尺度（用于"目标是否在工作空间附近"的粗筛，不是硬约束）
 REACH_MIN_M = 0.05
@@ -269,12 +270,15 @@ def ik_seeds(seed) -> list[np.ndarray]:
 
     1. 当前姿态（最自然，正常情况一次就中）；
     2. home 姿态（当前姿态卡住时的兜底）；
-    3. 当前姿态 / home 再各加两处肩肘大幅扰动（跨到另一个解支上，等价于"肘上 / 肘下"换一支）。
+    3. :data:`spec.NEUTRAL_QPOS`（工具轴**竖直朝下**的中性姿态——home 现在也是前倾的，
+       "让工具轴朝下"这类常用目标从它出发一次就中）；
+    4. 以上再各加两处肩肘大幅扰动（跨到另一个解支上，等价于"肘上 / 肘下"换一支）。
     """
     seed = np.asarray(seed, dtype=float).ravel().copy()
     home = np.array(spec.HOME_QPOS, dtype=float)
-    out = [seed, home]
-    for base in (home, seed):
+    neutral = np.array(spec.NEUTRAL_QPOS, dtype=float)
+    out = [seed, home, neutral]
+    for base in (home, seed, neutral):
         for perturb in ((0.0, 0.6, -1.2, 0.0, 0.0, 0.0),
                         (0.0, -0.6, 1.2, 0.0, 0.0, 0.0)):
             out.append(base + np.asarray(perturb, dtype=float))
@@ -295,26 +299,51 @@ def solve_ik_pose(model, data, site: str, pos, axis=None, seed=None,
 
 
 def solve_ik_best(model, data, pos, axis=None, seeds=None, site: str = "tool_site",
-                  *, iters: int = 300) -> tuple[np.ndarray, float, float, int]:
-    """多初值阻尼最小二乘 IK：谁解得好用谁。
+                  *, iters: int = 300, tol_p: float = 1e-3, tol_a: float = 0.02,
+                  ) -> tuple[np.ndarray, float, float, int]:
+    """多初值阻尼最小二乘 IK。
 
-    评分 = 位置误差 + 0.05 × 姿态误差（位置优先）；两者都够好就提前收工。
+    选择规则（很重要，直接决定机械臂"怎么动"）：
+
+    1. 精度够好的解（位置 ≤ ``tol_p``、姿态 ≤ ``tol_a``）里，**挑离初值最近的那个**
+       —— 关节动得最少、最像真机；
+    2. 没有够好的，才退而挑打分最好的（``位置误差 + 0.05 × 姿态误差``）。
+
+    为什么不能"只挑精度最高的"：同一目标常有多个解支，精度差 0.02 mm 时挑到另一支上，
+    关节要翻 100°+，关节空间一动就把工具甩出去（实测笛卡尔直线能甩偏 0.64 m）。
+
     返回 ``(q, 位置误差[m], 姿态误差[rad], 实际尝试的初值组数)``。
     """
     if seeds is None:
         seeds = ik_seeds(ik.arm_qpos(model, data))
+    seeds = [np.asarray(s, dtype=float).ravel() for s in seeds]
+    q_ref = seeds[0]
+    # 求解过程会反复改 qpos，算完恢复现场（调用方可能紧接着用当前状态跑运动/画图）
+    qpos0, qvel0 = data.qpos.copy(), data.qvel.copy()
     best: tuple[float, np.ndarray, float, float] | None = None
+    near: tuple[float, np.ndarray, float, float] | None = None      # 精度够好里离初值最近的
     tries = 0
-    for seed in seeds:
-        tries += 1
-        q, ep, ea = solve_ik_pose(model, data, site, pos, axis, seed=seed, iters=iters)
-        score = float(ep) + 0.05 * float(ea)
-        if best is None or score < best[0]:
-            best = (score, q, ep, ea)
-        if ep < 1e-4 and (axis is None or ea < 1e-4):
-            break
+    try:
+        for seed in seeds:
+            tries += 1
+            q, ep, ea = solve_ik_pose(model, data, site, pos, axis, seed=seed, iters=iters)
+            q = np.asarray(q, dtype=float)
+            score = float(ep) + 0.05 * float(ea)
+            if best is None or score < best[0]:
+                best = (score, q, ep, ea)
+            if ep <= tol_p and (axis is None or ea <= tol_a):
+                dist = float(np.abs(q - q_ref).max())
+                if near is None or dist < near[0]:
+                    near = (dist, q, ep, ea)
+            if ep < 1e-4 and (axis is None or ea < 1e-4) and seed is seeds[0]:
+                break                       # 第一个初值就解好了 = 离初值最近，直接收工
+    finally:
+        data.qpos[:] = qpos0
+        data.qvel[:] = qvel0
+        mujoco.mj_forward(model, data)
     assert best is not None
-    return best[1], best[2], best[3], tries
+    pick = near if near is not None else best
+    return pick[1], pick[2], pick[3], tries
 
 
 @dataclass
@@ -386,6 +415,7 @@ class ArmSim:
         self.set_gravity(gravity)
         self.lo = np.array([spec.LIMITS[j][0] for j in spec.JOINTS])
         self.hi = np.array([spec.LIMITS[j][1] for j in spec.JOINTS])
+        self.floor_z = self._read_floor_z()
         self.mode = "joint"
         self.cmd = np.array(spec.HOME_QPOS, dtype=float)
         self.motion: Motion | None = None
@@ -403,6 +433,14 @@ class ArmSim:
                      f"dt = {self.dt * 1000:.0f} ms，home 姿态已就位）")
 
     # ---------------------------------------------------------------- 读
+    def _read_floor_z(self) -> float:
+        """地面高度：读场景里名字叫 ``floor`` 的 geom（点云场景会把它挪到小车脚下）。"""
+        try:
+            gid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+        except Exception:  # noqa: BLE001
+            gid = -1
+        return float(self.model.geom_pos[gid][2]) if gid >= 0 else float(spec.FLOOR_Z)
+
     def q_pos(self) -> np.ndarray:
         """6 个关节的**实测**角（弧度，顺序 joint1..joint6）。"""
         return ik.arm_qpos(self.model, self.data)
@@ -424,8 +462,12 @@ class ArmSim:
         return ik.tool_axis(self.model, self.data, "tool_site")
 
     def tip_height(self) -> float:
-        """工具尖离地高度[m]（地面在 spec.FLOOR_Z）。"""
-        return float(self.tip()[2] - spec.FLOOR_Z)
+        """工具尖离地高度[m]（地面 = 场景里那个叫 ``floor`` 的 geom；读不到才用 ``spec.FLOOR_Z``）。
+
+        换成"带点云 / 带小车"的场景时，地面会被挪到小车脚下（例如 z = -1.1），
+        这样界面上显示的"离地"才还是真的离地。
+        """
+        return float(self.tip()[2] - self.floor_z)
 
     def track_err_deg(self) -> float:
         """最大关节跟踪误差[°]（指令 − 实测）。"""
@@ -605,19 +647,35 @@ class ArmSim:
             pts: list[np.ndarray] = []
             seed = self.q_pos()
             ep_end, ea_end, failed_at = 0.0, 0.0, -1
+            truncated = False
             for i in range(m):
                 last = i == m - 1
                 t = i / float(m - 1)
                 p = p0 + (target - p0) * t
                 a = None if axis_goal is None else interp_axis(a0, axis_goal, t)
                 q, ep, ea, _ = self._ik_raw(p, a, seed, multi=last)
-                if float(ep) > LINE_MAX_ERR_M and failed_at < 0:
-                    failed_at = i
+                q = np.asarray(q, dtype=float)
+                # 关键：**每个路点都要跟上一个路点"同一支"**。单初值 IK 也可能游走到别的解支
+                # （实测末点会从 J2≈-173° 跳到 -61°、J3 从 +129° 翻到 -129°），
+                # 那样关节空间回放会把工具尖甩出门（实测 0.64 m）。
+                jump = float(np.abs(np.degrees(q - seed)).max())
+                if float(ep) > LINE_MAX_ERR_M or jump > LINE_MAX_BRANCH_JUMP_DEG:
+                    q2, ep2, ea2, _ = self._ik_raw(p, a, seed, multi=True)
+                    jump2 = float(np.abs(np.degrees(np.asarray(q2, dtype=float) - seed)).max())
+                    if float(ep2) <= LINE_MAX_ERR_M and jump2 <= LINE_MAX_BRANCH_JUMP_DEG:
+                        q, ep, ea, jump = np.asarray(q2, dtype=float), ep2, ea2, jump2
+                    else:
+                        truncated = True
+                        failed_at = i
+                        q = qs[-1].copy() if qs else np.asarray(seed, dtype=float).copy()
+                        qs.append(q)
+                        pts.append(p)
+                        break
                 if last:
                     ep_end, ea_end = float(ep), float(ea)
-                q = np.asarray(q, dtype=float)
-                if float(ep) > LINE_MAX_ERR_M and qs:
-                    q = qs[-1].copy()             # 这一点过不去：先停住，别让轨迹跳变
+                if float(ep) > LINE_MAX_ERR_M:            # 兜底：过不去就停住，别跳变
+                    failed_at = i if failed_at < 0 else failed_at
+                    q = qs[-1].copy() if qs else q
                 qs.append(q)
                 pts.append(p)
                 seed = q
@@ -626,10 +684,13 @@ class ArmSim:
             self.data.qvel[:] = qvel0
             mujoco.mj_forward(self.model, self.data)
         waypoints, points = np.vstack(qs), np.vstack(pts)
-        ok_pos = ep_end <= IK_TOL_POS_M
-        ok_axis = axis_goal is None or ea_end <= IK_TOL_AXIS_RAD
+        ok_pos = ep_end <= IK_TOL_POS_M and not truncated
+        ok_axis = (axis_goal is None or ea_end <= IK_TOL_AXIS_RAD) and not truncated
         reason = ""
-        if not ok_pos:
+        if truncated:
+            reason = (f"直线走到第 {failed_at + 1}/{m} 个路点就走不过去了"
+                      f"（这一支到不了：顶到限位或要换姿态）")
+        elif not ok_pos:
             reason = f"目标点位置差 {ep_end * 1000:.1f} mm"
         elif not ok_axis:
             reason = f"工具轴差 {np.degrees(ea_end):.1f}°"
@@ -677,7 +738,8 @@ class ArmSim:
                      f"（沿线有碰限位/不可达的地方，轨迹会先停在那里）")
         if not plan.ok:
             self.log(f"直线运动取消：{plan.reason}"
-                     f"（画面里目标点会标成红色；换个点或放宽工具轴试试）")
+                     f"（画面里目标点会标成红色。本支走不过去时：先用手/关节按钮把姿态转过去，"
+                     f"或把目标改到这条直线走得到的位置）")
             return plan
         self.motion = Motion(self.cmd, plan.q_end, sec, self.dt, kind="cartesian",
                              label=label, waypoints=plan.waypoints)

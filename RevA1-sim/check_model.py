@@ -28,6 +28,7 @@ import mujoco  # noqa: E402
 
 import revA1_spec as spec  # noqa: E402
 import sim_ik as ik  # noqa: E402
+from arm_core import ik_seeds, solve_ik_pose  # noqa: E402  （多初值 IK，和界面用的是同一套）
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -116,7 +117,11 @@ def check_home(model: mujoco.MjModel, data: mujoco.MjData, floor_z: float) -> No
     log(f"  ee_site   = {fmt(ik.site_pos(model, data, 'ee_site'), 4)}")
     log(f"  tool_site = {fmt(ik.site_pos(model, data, 'tool_site'), 4)}  "
         f"离地 {ik.site_pos(model, data, 'tool_site')[2] - floor_z:.3f} m")
-    log(f"  工具轴    = {fmt(ik.tool_axis(model, data, 'tool_site'))} (期望接近 [0 0 -1])")
+    log(f"  工具轴    = {fmt(ik.tool_axis(model, data, 'tool_site'))}")
+    expect_axis = spec.pose_tool_axis(spec.CAPTURE_POSE)
+    got_axis = ik.tool_axis(model, data, "tool_site")
+    dev = float(np.degrees(np.arccos(np.clip(np.dot(expect_axis, got_axis), -1, 1))))
+    log(f"  期望工具轴= {fmt(expect_axis)}（spec.CAPTURE_POSE）偏差 {dev:.3f}°")
     log(f"  重力力矩  = {fmt(data.qfrc_bias[:6], 1)} Nm")
     log(f"  自碰撞对数= {data.ncon}")
 
@@ -225,6 +230,30 @@ def check_workspace(model: mujoco.MjModel, data: mujoco.MjData, floor_z: float,
         f"常用作业区建议取 r ∈ [0.30, 0.65]、离地 0.15~0.60 m")
 
 
+def ik_clear(model: mujoco.MjModel, data: mujoco.MjData, target, axis, seeds,
+             *, tol_p: float = 1e-3, tol_a: float = 0.02):
+    """多初值 IK，但**优先挑"精度够 + 不碰东西"的解**；真找不到就退回精度最好的那个。
+
+    这一步要回答的是"能不能把工具尖送到目标、而且不杵到东西"，所以不能因为某个解支正好
+    穿进地面就把模型判成不合格。返回 ``(q, 位置误差, 姿态误差, 尝试初值数, 目标姿态接触对数)``。
+    """
+    best: tuple | None = None
+    clear: tuple | None = None
+    tries = 0
+    for sd in seeds:
+        tries += 1
+        q, ep, ea = solve_ik_pose(model, data, 'tool_site', target, axis, seed=sd)
+        mujoco.mj_forward(model, data)               # solve 后 qpos 就在解上，直接数接触
+        record = (float(ep) + 0.05 * float(ea), q, float(ep), float(ea), int(data.ncon))
+        if best is None or record[0] < best[0]:
+            best = record
+        if ep < tol_p and ea < tol_a and data.ncon == 0 and (clear is None or record[0] < clear[0]):
+            clear = record
+    chosen = clear if clear is not None else best
+    assert chosen is not None
+    return chosen[1], chosen[2], chosen[3], tries, chosen[4]
+
+
 # ============================================================================ 5
 def check_reach(model: mujoco.MjModel, data: mujoco.MjData, floor_z: float) -> None:
     """IK + 控制器联调：让工具尖按给定点/朝向走，量真实到位误差。
@@ -238,13 +267,16 @@ def check_reach(model: mujoco.MjModel, data: mujoco.MjData, floor_z: float) -> N
         ("斜向下 45°", (0.45, 0.0, floor_z + 0.35), (-0.7071, 0, -0.7071)),
         ("水平前伸", (0.55, 0.0, floor_z + 0.45), (1, 0, 0)),
     ]
-    log("\n--- IK + 控制器到位精度（每个目标都从 home 出发）---")
+    log("\n--- IK + 控制器到位精度（每个目标都从 home 出发，IK 用多初值且优先无碰撞解）---")
     ok = 0
     for label, target, axis in targets:
         if not ik.reset_home(model, data):
             mujoco.mj_forward(model, data)
         seed = ik.arm_qpos(model, data)
-        q, _, _ = ik.solve_ik_pose(model, data, 'tool_site', target, axis, q_seed=seed)
+        q, e_ik_p, e_ik_a, tries, ncon_ik = ik_clear(model, data, target, axis, ik_seeds(seed))
+        if not ik.reset_home(model, data):           # IK 求解会改 qpos，跑之前先把模型复位
+            ik.set_arm_qpos(model, data, seed)
+            mujoco.mj_forward(model, data)
         ik.drive_to(model, data, q, seconds=2.5, settle=1.0, q_start=seed)
         p = ik.site_pos(model, data, 'tool_site')
         z = ik.tool_axis(model, data, 'tool_site')
@@ -254,7 +286,8 @@ def check_reach(model: mujoco.MjModel, data: mujoco.MjData, floor_z: float) -> N
         good = e_p < 0.01 and e_a < 2.0 and data.ncon == 0
         ok += bool(good)
         log(f"  {label:22s} 位置误差 {e_p * 1000:6.2f} mm  姿态误差 {e_a:5.2f}°  "
-            f"接触 {data.ncon} 对  {'OK' if good else 'FAIL'}")
+            f"接触 {data.ncon} 对  IK {e_ik_p * 1000:5.2f}mm/{e_ik_a:4.2f}°"
+            f"（{tries} 初值，解姿态接触 {ncon_ik} 对）  {'OK' if good else 'FAIL'}")
     if ok < len(targets):
         warn(f"到位精度只有 {ok}/{len(targets)} 个目标达标，可能要调 kp/kv 或目标点不可达")
 

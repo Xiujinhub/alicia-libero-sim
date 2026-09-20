@@ -29,11 +29,22 @@ import mujoco  # noqa: E402
 
 import revA1_spec as spec  # noqa: E402
 import sim_ik as ik  # noqa: E402
+from arm_core import ik_seeds, solve_ik_best  # noqa: E402  （多初值 IK：工具轴朝下这类目标用得上）
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:  # noqa: BLE001
     pass
+
+
+def solve_ik_multi(model, data, target, axis, seed):
+    """多初值 IK（初值集含"工具轴竖直朝下"的中性姿态），返回 ``(q, 位置误差, 姿态误差)``。
+
+    单初值从 home（真机实测的**前倾**姿态）出发解"工具轴朝下"的目标容易掉进局部极小；
+    这里让 :func:`arm_core.ik_seeds` 把当前姿态 / home / 中性姿态 / 肩肘扰动都试一遍。
+    """
+    q, ep, ea, _ = solve_ik_best(model, data, target, axis, seeds=ik_seeds(seed))
+    return q, ep, ea
 
 # 关节空间路点：用"工具尖要到哪里（世界系）+ 工具轴朝下"来定义，运行时解 IK。
 # 这样每个路点的含义都是可验证的（IK 误差 < 0.1mm，实测见 check_model.log）。
@@ -48,7 +59,7 @@ WP_TARGETS = [
 ]
 
 
-def cartesian_path(center_xy=(spec.TARGET_POSE[0], spec.TARGET_POSE[1]),
+def cartesian_path(center_xy=(spec.WORK_POSE[0], spec.WORK_POSE[1]),
                    height=0.35, side=0.16, radius=0.09):
     """在水平面上生成"正方形 + 圆"的笛卡尔路点（工具轴始终朝下）。"""
     cx, cy = center_xy
@@ -100,7 +111,7 @@ def run_waypoint_demo(model, data, args, cb) -> None:
           f"{'接触':>6}{'末态误差(°)':>13}")
     q_seed = np.array(spec.HOME_QPOS)
     for label, target, axis in WP_TARGETS:
-        q, _, _ = ik.solve_ik_pose(model, data, "tool_site", target, axis, q_seed=q_seed)
+        q, ep, ea = solve_ik_multi(model, data, target, axis, q_seed)
         ik.drive_to(model, data, q, seconds=args.seconds, settle=0.5, callback=cb)
         p = ik.site_pos(model, data, "tool_site")
         z = ik.tool_axis(model, data, "tool_site")
@@ -123,11 +134,17 @@ def run_cartesian_demo(model, data, args, cb) -> None:
     errs = []
     print(f"{'路点':>6}{'目标':>26}{'实际':>26}{'误差(mm)':>10}{'接触':>6}")
     for i, p in enumerate(pts):
-        q, e_p, _ = ik.solve_ik_pose(model, data, "tool_site", p, (0, 0, -1),
-                                     q_seed=q_seed)
+        q, e_p, _ = solve_ik_multi(model, data, p, (0, 0, -1), q_seed)
         if e_p > 3e-3:                       # 单次解不动就再精修一轮
             q, e_p, _ = ik.refine_ik_pose(model, data, "tool_site", p, (0, 0, -1),
                                           q_seed=q)
+        if i == 0:
+            # 起点单独当"接近"处理：从前倾 home 到工具轴朝下的作业姿态位移最大，
+            # 给它足够时间，别把这一段的大跟踪误差混进路径精度统计里。
+            ik.drive_to(model, data, q, seconds=max(args.segment * 4, 1.0), settle=0.3,
+                        q_start=q_seed, callback=cb)
+            q_seed = q
+            continue
         ik.drive_to(model, data, q, seconds=args.segment, settle=0.05, callback=cb)
         got = ik.site_pos(model, data, "tool_site")
         err = float(np.linalg.norm(got - np.array(p)))
@@ -164,8 +181,7 @@ def _view_demo(model, data, args) -> None:
             print("窗口模式: 笛卡尔演示（关窗口即退出）")
             q_seed = np.array(spec.HOME_QPOS)
             for p in cartesian_path():
-                q, e_p, _ = ik.solve_ik_pose(model, data, "tool_site", p, (0, 0, -1),
-                                             q_seed=q_seed)
+                q, e_p, _ = solve_ik_multi(model, data, p, (0, 0, -1), q_seed)
                 for j, v in zip(spec.JOINTS, q):
                     data.ctrl[ik.dof_adr(model, j)] = v
                 if not spin(int(args.segment / model.opt.timestep)):
@@ -175,8 +191,7 @@ def _view_demo(model, data, args) -> None:
             print("窗口模式: 路点演示（关窗口即退出）")
             q_seed = np.array(spec.HOME_QPOS)
             for label, target, axis in WP_TARGETS:
-                q, e_p, _ = ik.solve_ik_pose(model, data, "tool_site", target, axis,
-                                             q_seed=q_seed)
+                q, e_p, _ = solve_ik_multi(model, data, target, axis, q_seed)
                 print(f"-> {label}  target={np.round(target, 3)}  IK误差={e_p * 1000:.2f}mm")
                 for j, v in zip(spec.JOINTS, q):
                     data.ctrl[ik.dof_adr(model, j)] = v

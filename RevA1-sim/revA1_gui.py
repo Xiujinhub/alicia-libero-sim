@@ -4,20 +4,23 @@
 界面布局
 --------
 左边是 MuJoCo 实时画面（离屏渲染成 QImage 贴上去，不另开窗口），右边是可滚动的控制面板，
-底下一行状态栏；面板分 6 张卡片：
+底下一行状态栏；面板分 7 张卡片：
 
 1. **关节微调**：每个关节一行 ``− 目标角 + 实测角``——**点一下动一点**（按住还能连点）。
    旧版是 6 根滑条，拖起来又不准又不直观，这里直接换成 ± 按钮 + 步长选择。
 2. **真机跟随**：接真机的姿态——真机在广播/开着状态接口，这里一按就把**真机姿态**搬到
    模型上实时跟着动（HTTP 状态接口 / UDP 广播两路，见 ``robot_link.py``）；
    卡片上同时显示延迟、包率、真机与仿真的**TCP 位置/工具轴误差**。
-3. **末端目标 / IK**：填工具尖目标（世界系 x/y/z）+ 工具轴方向，``求解 IK`` 只算不动、
+3. **点云（相机 → 机械臂）**：深度相机拍的点云，按**手眼标定 + 拍摄姿态**换算到机械臂基座系，
+   生成"带点云 + 小车"的世界场景再整体加载（见 ``point_cloud.py``）——机械臂与点云同框、
+   相对位置真实（深度 z 越小越靠近相机），地面按小车高度下移。
+4. **末端目标 / IK**：填工具尖目标（世界系 x/y/z）+ 工具轴方向，``求解 IK`` 只算不动、
    ``求解并沿直线运动`` 算完就走。结果里写清楚位置误差 / 姿态误差 / 耗时 / 解出来的 6 个关节角，
    目标点在画面里画成**绿球 + 黄轴**（不可达时变红）。
-4. **点位（示教 / 点到点）**：``记录当前位姿`` 存点，``走到选中点`` 沿直线过去（双击列表也行）。
+5. **点位（示教 / 点到点）**：``记录当前位姿`` 存点，``走到选中点`` 沿直线过去（双击列表也行）。
    这是最直观的"点到点"：先手动摆到位置存下来，以后一键复现。
-5. **运行 / 伺服**：运动时长、进度条、kp 缩放（体会伺服软硬）、暂停、重力、**急停**、复位、存图。
-6. **日志**：每一步动作 + **实测**到位精度（不是只看指令）。
+6. **运行 / 伺服**：运动时长、进度条、kp 缩放（体会伺服软硬）、暂停、重力、**急停**、复位、存图。
+7. **日志**：每一步动作 + **实测**到位精度（不是只看指令）。
 
 点到点为什么改成"直线"
 ----------------------
@@ -73,6 +76,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,  # noqa: E402
                                QVBoxLayout, QWidget)
 
 import arm_core as core  # noqa: E402
+import point_cloud as pc  # noqa: E402
 import revA1_spec as spec  # noqa: E402
 import robot_link as link  # noqa: E402
 
@@ -270,6 +274,7 @@ class ArmView(QWidget):
         super().__init__()
         self.sim = sim
         self.cam = core.Camera()
+        self.render_enabled = bool(render)        # 换场景时按它决定要不要重建渲染器
         self.setMinimumSize(360, 260)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -507,12 +512,17 @@ class ControlPanel(QWidget):
         self.link: link.JointLink | None = None    # 真机 ↔ 仿真的姿态链路（没启动时 None）
         self.follow_out: link.FollowOut | None = None
         self.follow_error = ""                # 启动失败的原因（留在卡片上）
+        self.cloud_scene: Path | None = None  # 当前场景里是否接了点云（None = 干净场景）
+        self.cloud_report: list[str] = []     # 点云的体检报告（卡片上显示）
+        self.cloud_points = None              # 基座系点云（存图时算视角用）
+        self.cloud_error = ""
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
         lay.setSpacing(10)
-        for builder in (self._build_joints, self._build_follow, self._build_cartesian,
-                        self._build_points, self._build_run, self._build_log):
+        for builder in (self._build_joints, self._build_follow, self._build_cloud,
+                        self._build_cartesian, self._build_points, self._build_run,
+                        self._build_log):
             lay.addWidget(builder())
         lay.addStretch(1)
         self.select_joint(0)
@@ -804,7 +814,239 @@ class ControlPanel(QWidget):
         """卡片下半部分那几行状态：转发给模块级 :func:`follow_status_text`（自检也能用）。"""
         return follow_status_text(self.sim, self.link, self.follow_out, self.follow_error)
 
-    # ------------------------------------------------------------ 3. 末端目标 / IK
+    # ------------------------------------------------------------ 3. 点云（相机 → 机械臂）
+    def _build_cloud(self) -> Card:
+        card = Card("点云（相机 → 机械臂）",
+                    "深度相机拍的点云（本机数据是 **o2e**：已经换算到**末端系**），"
+                    "按**拍摄姿态**搬到机械臂基座系，再生成一个「机械臂 + 点云 + 小车」的世界场景整体加载。"
+                    "相机 z 越小 = 离相机越近；地面按小车高度下移，所以「离地高度」还是真的。")
+        self.c_cloud = QComboBox()
+        for p in pc.list_clouds():
+            self.c_cloud.addItem(p.name, str(p))
+        if self.c_cloud.count() == 0:
+            self.c_cloud.addItem("（point_cloud/ 里还没有文件）", "")
+        self.c_cloud.setToolTip("point_cloud/ 下的点云（*.json：3D 点 或 16 位深度图；也认 *.npy）")
+        card.add_row(QLabel("点云"), self.c_cloud, self._btn("刷新", self.on_cloud_refresh, name="Preset"))
+
+        self.c_pose = QLineEdit(pc.pose_text(pc.DEFAULT_POSE))
+        self.c_pose.setToolTip("拍摄姿态：x y z(mm) + rx ry rz(deg)（= 真机 pose 的 6 个数）")
+        card.add_row(QLabel("拍摄姿态"), self.c_pose,
+                     self._btn("取真机姿态", self.on_cloud_pose_from_robot, name="Preset"))
+
+        self.c_calib = QLineEdit(str(pc.DEFAULT_EXTRINSIC))
+        self.c_calib.setToolTip("手眼标定（OpenCV XML 里的 R / t：相机 → 末端，单位 mm）")
+        card.add_row(QLabel("手眼标定"), self.c_calib)
+
+        self.c_frame = QComboBox()
+        self.c_frame.addItems(["自动判定", "相机光学系", "末端系（o2e）"])
+        self.c_frame.setToolTip("点云自带哪个坐标系。自动判定 = 看有多少点反投影落回文件自带的 ROI\n"
+                                "（本机的 o2e 数据会判成末端系：光学→末端的转换已经做过，不再重复乘手眼）")
+        card.add_row(QLabel("坐标系"), self.c_frame, None, QLabel("（o2e = 末端系）"))
+
+        self.c_ref = QComboBox()
+        self.c_ref.addItems(["TCP（工具尖）", "法兰（ee_site）"])
+        self.c_ref.setToolTip("标定矩阵是相对哪个点算的（真机 pose 报的是工具尖）")
+        self.c_cart = QDoubleSpinBox()
+        self.c_cart.setRange(0.0, 2.5)
+        self.c_cart.setSingleStep(0.05)
+        self.c_cart.setDecimals(2)
+        self.c_cart.setValue(float(pc.DEFAULT_CART_HEIGHT_M))
+        self.c_cart.setSuffix(" m")
+        self.c_cart.setToolTip("机械臂装在小车上，基座离地多高（地面就铺在这个高度）")
+        self.c_show_cart = QCheckBox("画小车")
+        self.c_show_cart.setChecked(True)
+        card.add_row(QLabel("参考点"), self.c_ref, QLabel("小车高"), self.c_cart)
+        card.add_row(self.c_show_cart, None, QLabel("（关掉就只挪地面、不画车）"))
+
+        self.c_points = QSpinBox()
+        self.c_points.setRange(0, 200000)
+        self.c_points.setSingleStep(5000)
+        self.c_points.setValue(int(pc.DEFAULT_MAX_POINTS))
+        self.c_points.setToolTip("点数上限（0 = 不抽稀）；整云 8 万点也能跑，就是网格文件大一些")
+        self.c_size = QDoubleSpinBox()
+        self.c_size.setRange(1.0, 20.0)
+        self.c_size.setSingleStep(0.5)
+        self.c_size.setDecimals(1)
+        self.c_size.setValue(float(pc.DEFAULT_POINT_R_MM))
+        self.c_size.setSuffix(" mm")
+        self.c_size.setToolTip("每个点画多大（点越稀疏就开大一点，看起来才是连续的面）")
+        self.c_bands = QSpinBox()
+        self.c_bands.setRange(0, 8)
+        self.c_bands.setValue(int(pc.DEFAULT_BANDS))
+        self.c_bands.setToolTip("按深度分几带颜色（近红 → 远紫）；1 = 单色，0 = 也当单色")
+        card.add_row(QLabel("点数上限"), self.c_points, QLabel("点大小"), self.c_size)
+        card.add_row(QLabel("深度分色"), self.c_bands, None, QLabel("（近红 → 远紫）"))
+
+        self.c_dx = QDoubleSpinBox()
+        self.c_dy = QDoubleSpinBox()
+        self.c_dz = QDoubleSpinBox()
+        for w in (self.c_dx, self.c_dy, self.c_dz):
+            w.setRange(-500.0, 500.0)
+            w.setSingleStep(10.0)
+            w.setDecimals(0)
+            w.setSuffix(" mm")
+            w.setMaximumWidth(96)
+            w.setToolTip("手动微调：把整片点云沿基座 xyz 平移（标定有残差时用）")
+        self.c_yaw = QDoubleSpinBox()
+        self.c_yaw.setRange(-180.0, 180.0)
+        self.c_yaw.setSingleStep(1.0)
+        self.c_yaw.setDecimals(1)
+        self.c_yaw.setSuffix(" °")
+        self.c_yaw.setMaximumWidth(96)
+        self.c_yaw.setToolTip("手动微调：绕基座 z 轴转一点（对不准时用）")
+        card.add_row(QLabel("微调 Δx"), self.c_dx, QLabel("Δy"), self.c_dy)
+        card.add_row(QLabel("Δz"), self.c_dz, QLabel("绕 z"), self.c_yaw)
+
+        card.add_row(self._btn("加载点云", self.on_cloud_load, name="Primary"),
+                     self._btn("清除点云", self.on_cloud_clear, name="Danger"),
+                     None,
+                     self._btn("存当前画面", self.on_cloud_snapshot, name="Preset"))
+
+        self.cloud_label = QLabel()
+        self.cloud_label.setObjectName("Mono")
+        self.cloud_label.setWordWrap(True)
+        self.cloud_label.setMinimumHeight(150)
+        self.cloud_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        card.add(self.cloud_label)
+        return card
+
+    # ---- 点云：按钮 / 状态
+    def cloud_file(self) -> str:
+        """下拉框里选的点云文件（完整路径）。"""
+        return str(self.c_cloud.currentData() or "")
+
+    def set_cloud_file(self, path) -> None:
+        """把下拉框切到某个文件（不在列表里就临时加进去）。"""
+        want = Path(path)
+        for i in range(self.c_cloud.count()):
+            if Path(str(self.c_cloud.itemData(i) or "")) == want:
+                self.c_cloud.setCurrentIndex(i)
+                return
+        self.c_cloud.addItem(want.name, str(want))
+        self.c_cloud.setCurrentIndex(self.c_cloud.count() - 1)
+
+    def on_cloud_refresh(self) -> None:
+        """重新扫一遍 ``point_cloud/``。"""
+        cur = self.cloud_file()
+        self.c_cloud.clear()
+        for p in pc.list_clouds():
+            self.c_cloud.addItem(p.name, str(p))
+        if self.c_cloud.count() == 0:
+            self.c_cloud.addItem("（point_cloud/ 里还没有文件）", "")
+        if cur:
+            self.set_cloud_file(cur)
+        self.sim.log(f"点云列表已刷新：{self.c_cloud.count()} 个文件")
+        self.refresh()
+
+    def on_cloud_pose_from_robot(self) -> None:
+        """「取真机姿态」：读一次真机 pose（mm + 度）填进姿态框。"""
+        pose = None
+        try:
+            lk = self.link
+            if lk is not None and lk.latest() is not None and lk.latest().pose is not None:
+                pose = lk.latest().pose                      # 正在跟随：直接用最近一帧
+            else:
+                st = link.HttpStateSource(self.f_url.text().strip(), timeout=1.5).poll_once()
+                pose = st.pose
+        except Exception as exc:  # noqa: BLE001
+            self.sim.log(f"取真机姿态失败：{type(exc).__name__}: {exc}")
+            return
+        if pose is None:
+            self.sim.log("真机这一帧里没有 pose（只有关节角），请手动填拍摄姿态")
+            return
+        vals = [float(v) for v in np.r_[np.asarray(pose[:3], float) * 1000.0,
+                                        np.degrees(np.asarray(pose[3:6], float))]]
+        self.c_pose.setText(pc.pose_text(vals))
+        self.sim.log("拍摄姿态已填成真机当前 pose：["
+                     + ", ".join(f"{v:.2f}" for v in vals) + "]（mm, deg）")
+        self.refresh()
+
+    def cloud_kwargs(self) -> dict:
+        """把卡片上的控件读成 :func:`point_cloud.build_cloud_scene` 的参数。"""
+        return dict(pose=self.c_pose.text().strip(),
+                    extrinsic=self.c_calib.text().strip(),
+                    frame=("auto", "cam", "end")[self.c_frame.currentIndex()],
+                    ref="flange" if self.c_ref.currentIndex() == 1 else "tcp",
+                    cart_height=float(self.c_cart.value()),
+                    show_cart=bool(self.c_show_cart.isChecked()),
+                    max_points=int(self.c_points.value()),
+                    point_mm=float(self.c_size.value()),
+                    bands=int(self.c_bands.value()),
+                    offset_mm=(float(self.c_dx.value()), float(self.c_dy.value()),
+                               float(self.c_dz.value())),
+                    yaw_deg=float(self.c_yaw.value()))
+
+    def on_cloud_load(self) -> None:
+        """「加载点云」：换算 → 生成场景 → 重建模型（机械臂 + 点云 + 小车同框）。"""
+        path = self.cloud_file()
+        if not path:
+            self.sim.log("没有选点云文件（point_cloud/ 里放 *.json 或 *.npy，再点「刷新」）")
+            return
+        self.sim.log(f"正在把点云接进场景：{Path(path).name}（写网格 + 重建场景，约 1 秒）……")
+        QApplication.processEvents()                          # 让上面这行日志先显示出来
+        t0 = time.perf_counter()
+        try:
+            res = pc.build_cloud_scene(cloud_path=path, **self.cloud_kwargs())
+        except Exception as exc:  # noqa: BLE001
+            self.cloud_error = f"{type(exc).__name__}: {exc}"
+            self.cloud_report = []
+            self.sim.log(f"点云加载失败：{self.cloud_error}")
+            self.refresh()
+            return
+        self.cloud_error = ""
+        self.cloud_report = list(res["report"])
+        self.cloud_points = np.asarray(res["points_base"], dtype=float)
+        self.cloud_scene = Path(res["scene"].scene)
+        if not self.win.load_scene(self.cloud_scene, log=False):
+            self.cloud_error = "场景重建失败（看日志）"
+            self.cloud_scene = None
+        else:
+            self.sim.log(f"点云已接进场景：{res['scene'].summary()}"
+                         f"（总耗时 {(time.perf_counter() - t0) * 1000:.0f} ms）")
+            for line in self.cloud_report:
+                self.sim.log("    " + line)
+            self.sim.log(f"当前场景：{Path(self.cloud_scene).name}"
+                         f" · 地面 z = {self.sim.floor_z:.3f} m（「离地高度」按它算）")
+        self.refresh()
+
+    def on_cloud_clear(self) -> None:
+        """「清除点云」：回到干净场景（不带点云 / 小车）。"""
+        if self.cloud_scene is None:
+            self.sim.log("现在就是干净场景（没加载过点云）")
+            return
+        ok = self.win.load_scene(spec.SCENE_XML, log=False)
+        self.cloud_scene = None
+        self.cloud_points = None
+        self.cloud_report = []
+        self.cloud_error = "" if ok else "回不到基场景（看日志）"
+        self.sim.log(f"已清除点云：回到 {Path(spec.SCENE_XML).name}"
+                     f" · 地面 z = {self.sim.floor_z:.3f} m")
+        self.refresh()
+
+    def on_cloud_snapshot(self) -> None:
+        """「存当前画面」：把"机械臂 + 点云"同框这一帧存成 PNG。"""
+        if self.cloud_scene is None:
+            self.sim.log("先「加载点云」，再存画面")
+            return
+        out = RUNS / "pc_view.png"
+        if self.win.save_frame(out):
+            self.sim.log(f"已存图：{out}（机械臂 + 点云同框）")
+        else:
+            self.sim.log("存图失败：还没有渲染过画面（--no-render？）")
+
+    def _cloud_text(self) -> str:
+        """点云卡片下半部分的状态（加载过没有 + 体检报告）。"""
+        if self.cloud_scene is None:
+            note = f"（上次失败：{self.cloud_error}）" if self.cloud_error else ""
+            files = pc.list_clouds()
+            return (f"状态：未加载点云{note}\n"
+                    f"可选点云：{len(files)} 个（{files[0].name if files else '—'} 等）\n"
+                    f"点「加载点云」→ 世界换成「机械臂 + 点云 + 小车」；「清除点云」回到原场景。\n"
+                    f"位置由**手眼标定 + 拍摄姿态**决定；「离地高度」按小车高度铺的地面算"
+                    f"（默认 {pc.DEFAULT_CART_HEIGHT_M:.2f} m）。")
+        return "\n".join([f"状态：已接进场景 {Path(self.cloud_scene).name}"] + self.cloud_report[:9])
+
+    # ------------------------------------------------------------ 4. 末端目标 / IK
     def _build_cartesian(self) -> Card:
         card = Card("末端目标 / IK（笛卡尔）",
                     "目标位置是世界系（米），默认就是 home 时工具尖的位置。「求解 IK」只算不动，"
@@ -957,7 +1199,7 @@ class ControlPanel(QWidget):
         self.ik_label.setProperty("fail", not res.ok)
         restyle(self.ik_label)
 
-    # ------------------------------------------------------------ 4. 点位（示教 / 点到点）
+    # ------------------------------------------------------------ 5. 点位（示教 / 点到点）
     def _build_points(self) -> Card:
         card = Card("点位（示教 / 点到点）",
                     "「记录当前位姿」把当前工具尖 + 工具轴存成一条点位；「走到选中点」让工具尖沿"
@@ -1011,7 +1253,7 @@ class ControlPanel(QWidget):
         self.point_list.clear()
         self.sim.log("点位已清空")
 
-    # ------------------------------------------------------------ 5. 运行 / 伺服
+    # ------------------------------------------------------------ 6. 运行 / 伺服
     def _build_run(self) -> Card:
         card = Card("运行 / 伺服",
                     "运动时长作用在「点到点 / 直线运动」上（smoothstep，首尾速度 0）；"
@@ -1103,7 +1345,7 @@ class ControlPanel(QWidget):
         else:
             self.sim.log("存图失败：还没有渲染过画面")
 
-    # ------------------------------------------------------------ 6. 日志
+    # ------------------------------------------------------------ 7. 日志
     def _build_log(self) -> Card:
         card = Card("日志", "动作和**实测**到位精度都记在这里（同一份也打印到终端）。")
         self.log_text = QPlainTextEdit()
@@ -1131,6 +1373,7 @@ class ControlPanel(QWidget):
             row["act"].setText(f"({st['q_deg'][i]:+.1f}°)")
         self.bar.setValue(int(round(st["progress"] * 1000)))
         self.follow_label.setText(self._follow_text())
+        self.cloud_label.setText(self._cloud_text())
 
     def nudge_selected(self, sign: float) -> None:
         """键盘 ``-`` / ``=``：给选中关节 ± 一个步长。"""
@@ -1356,6 +1599,39 @@ class RevA1Window(QMainWindow):
         self.view.close()          # 必须显式释放 GL 上下文
         super().close()
 
+    # ------------------------------------------------------------ 换场景
+    def load_scene(self, scene_path, *, log: bool = True) -> bool:
+        """换一个场景（例如把点云接进世界）：重建 ``ArmSim`` + 渲染器。
+
+        伺服软硬 / 重力开关 / 运动时长都沿用当前的；真机跟随会先停掉
+        （模型换了，接收线程不该再往旧模型上写）。
+        """
+        old = self.sim
+        try:
+            new = core.ArmSim(scene_path, kp_scale=old.kp_scale, gravity=old.gravity_on,
+                              move_seconds=old.move_seconds, log_scene=False)
+        except Exception as exc:  # noqa: BLE001
+            self.panel.append_log(f"换场景失败（{Path(scene_path).name}）："
+                                  f"{type(exc).__name__}: {exc}")
+            return False
+        self.panel.shutdown()
+        self.sim = new
+        self.view.sim = new
+        self.panel.sim = new
+        self.panel.link = None
+        self.panel.follow_out = None
+        self.acc = 0.0
+        self.t_last = time.perf_counter()
+        if self.view.render_enabled:
+            self.view.close()               # 先放掉旧 GL 上下文，再按新模型重建
+            self.view.init_renderer()
+        if log:
+            self.panel.append_log(f"已换场景：{Path(scene_path).name}"
+                                  f"（{new.model.nq} 轴 · {new.model.ngeom} 几何 · "
+                                  f"地面 z = {new.floor_z:.3f} m）")
+        self.panel.refresh()
+        return True
+
 
 # =============================================================== 入口 / 自检
 def make_app() -> QApplication:
@@ -1446,10 +1722,12 @@ def run_selftest(args) -> int:
     check("不可达目标：不会偷偷开始运动", sim.motion is None)
 
     # 5) 笛卡尔直线：规划直线度 / 执行到位精度
-    tgt = np.array([0.52, 0.18, 0.34])
+    #    目标挑"从当前姿态这一支沿直线走得到"的点（新 home 是前倾姿态，
+    #    把工具轴摆成竖直朝下往往要换解支 → 那种直线会被明确拒绝，见 5b）
+    tgt = np.array([0.25, 0.10, 0.30])
     plan = sim.plan_line(tgt, (0, 0, -1))
     check("直线规划：路点严格落在直线上（直线度 = 0）",
-          plan.straightness() < 1e-9 and plan.n >= core.LINE_MIN_POINTS,
+          plan.straightness() < 1e-9 and plan.n >= core.LINE_MIN_POINTS and plan.ok,
           f"{plan.n} 个路点，直线度 {plan.straightness() * 1000:.6f} mm，"
           f"规划 {plan.ms:.0f} ms")
     check("直线规划：终点 IK 残差够小", plan.pos_err_mm < 0.5 and plan.ok,
@@ -1475,6 +1753,15 @@ def run_selftest(args) -> int:
           _fmt_deg(rep.get("axis_err_deg", float("nan"))))
     check("直线执行：关节跟踪误差", rep.get("joint_err_deg", 9e9) < 1.0,
           _fmt_deg(rep.get("joint_err_deg", float("nan"))))
+
+    # 5b) 这一支沿直线走不到的目标：必须**明确拒绝**，而不是换解支把工具甩出去
+    bad = np.array([0.52, 0.18, 0.34])
+    plan_bad = sim.plan_line(bad, (0, 0, -1))
+    check("直线规划：本支到不了的目标 → 判为不 OK 且给出原因（不许偷偷换支）",
+          (not plan_bad.ok) and bool(plan_bad.reason) and plan_bad.failed_at >= 0,
+          f"{plan_bad.n} 点，{plan_bad.reason}")
+    sim.start_cartesian(bad, (0, 0, -1), args.move_time)
+    check("直线规划：不 OK 的直线不会开始运动", sim.motion is None)
 
     # 6) 关节空间 P2P（归零）+ 急停
     sim.zero(1.2)
@@ -1596,6 +1883,25 @@ def run_selftest(args) -> int:
     lk.stop()
     check("真机跟随：停止后接收线程退出", not lk.running and not lk.sources)
 
+    # 10) 点云 → 场景（点数压小一点，别拖慢自检）
+    try:
+        res_pc = pc.build_cloud_scene(max_points=2000, bands=3, point_mm=5.0,
+                                      scene_out=pc.ASSETS / "revA1_pc_scene_selftest.xml")
+        sim_pc = core.ArmSim(res_pc["scene"].scene, log_scene=False)
+        names = [mujoco.mj_id2name(sim_pc.model, mujoco.mjtObj.mjOBJ_GEOM, i)
+                 for i in range(sim_pc.model.ngeom)]
+        n_pc = sum(1 for n in names if n and n.startswith("pc_pts"))
+        check("点云：ArmSim 能加载「机械臂 + 点云 + 小车」场景",
+              sim_pc.model.nq == 6 and n_pc >= 3 and "pc_cart" in names,
+              f"ngeom={sim_pc.model.ngeom}（点云几何 {n_pc} 个）")
+        check("点云：地面按小车高度下移（ArmSim 读到 floor_z）",
+              abs(sim_pc.floor_z + 1.1) < 1e-6, f"floor_z = {sim_pc.floor_z:.4f} m")
+        check("点云：离地高度 = 工具尖 z − 场景地面 z",
+              abs(sim_pc.tip_height() - (sim_pc.tip()[2] - sim_pc.floor_z)) < 1e-9,
+              f"{sim_pc.tip_height():.3f} m")
+    except pc.PointCloudError as exc:
+        check("点云：全链路（点云 → 场景 → ArmSim）", False, str(exc))
+
     print("-" * 78)
     if fails:
         print(f"结论：{len(fails)} 项失败 -> {fails}")
@@ -1662,8 +1968,9 @@ def run_ui_test(args) -> int:
           panel.selected == 1 and abs(float(sim.cmd_deg()[1] - q0[1]) + 0.5) < 1e-6,
           f"J2 {q0[1]:+.2f}° → {sim.cmd_deg()[1]:+.2f}°")
 
-    # IK 求解
-    for spin, v in zip(panel.pos_spins, (0.52, 0.18, 0.34)):
+    # IK 求解（目标挑"从当前姿态这一支沿直线走得到"的点；
+    # 新 home 是前倾姿态，把工具轴摆竖直朝下往往要换解支，那种直线会被拒绝，见下面那条）
+    for spin, v in zip(panel.pos_spins, (0.25, 0.10, 0.30)):
         spin.setValue(v)
     panel.on_solve()
     check("「求解 IK」结果显示可解", "可解" in panel.ik_label.text(),
@@ -1674,16 +1981,27 @@ def run_ui_test(args) -> int:
     # 求解并沿直线运动
     panel.on_move_to_target()
     win.pump(args.move_time + 2.5)
-    err = float(np.linalg.norm(sim.tip() - np.array([0.52, 0.18, 0.34])))
+    err = float(np.linalg.norm(sim.tip() - np.array([0.25, 0.10, 0.30])))
     check("「求解并沿直线运动」后工具尖到位", err < 0.015, f"误差 {err * 1000:.2f} mm")
     check("日志里记了实测到位精度", "到位（cartesian）" in panel.log_text.toPlainText())
+
+    # 本支沿直线走不到的目标：界面要明确拒绝 + 说明原因，而且**不许动**
+    tip0 = sim.tip().copy()
+    for spin, v in zip(panel.pos_spins, (0.52, 0.18, 0.34)):
+        spin.setValue(v)
+    panel.on_move_to_target()
+    win.pump(1.0)
+    moved = float(np.linalg.norm(sim.tip() - tip0))
+    check("「求解并沿直线运动」：本支到不了的目标 → 拒绝并说明原因、工具尖不动",
+          ("直线运动取消" in panel.log_text.toPlainText()) and moved < 0.02,
+          f"工具尖只挪了 {moved * 1000:.1f} mm")
 
     # 不可达目标：界面必须说清楚
     panel.pos_spins[0].setValue(1.30)
     panel.on_solve()
     check("不可达点：结果显示不可用 + 原因", "不可用" in panel.ik_label.text(),
           panel.ik_label.text().splitlines()[0])
-    panel.pos_spins[0].setValue(0.52)
+    panel.pos_spins[0].setValue(0.25)
 
     # 点位（示教 / 点到点）
     panel.record_point()
@@ -1757,6 +2075,32 @@ def run_ui_test(args) -> int:
     check("真机跟随：停止后链路释放、姿态就地保持",
           panel.link is None and win.sim.mode == "hold", win.sim.mode)
 
+    # 点云卡片：默认值 + 加载/清除各一遍
+    check("点云卡片：默认值（自动判坐标系 / 小车 1.10 m / 6 万点 / TCP / 6 带 / 有点云文件）",
+          abs(panel.c_cart.value() - 1.10) < 1e-9 and panel.c_points.value() == 60000
+          and panel.c_frame.currentIndex() == 0 and panel.c_ref.currentIndex() == 0
+          and panel.c_bands.value() == 6 and panel.c_cloud.count() >= 1)
+    panel.c_points.setValue(3000)
+    panel.c_bands.setValue(3)
+    panel.on_cloud_load()
+    win.pump(0.5)
+    names = [mujoco.mj_id2name(win.sim.model, mujoco.mjtObj.mjOBJ_GEOM, i)
+             for i in range(win.sim.model.ngeom)]
+    n_pc = sum(1 for n in names if n and n.startswith("pc_pts"))
+    check("点云：加载后场景里真的有点云几何",
+          panel.cloud_scene is not None and n_pc >= 3,
+          f"点云几何 {n_pc} 个 · {Path(panel.cloud_scene).name if panel.cloud_scene else ''}")
+    check("点云：地面挪到小车脚下", abs(win.sim.floor_z + 1.1) < 1e-6,
+          f"floor_z = {win.sim.floor_z:.3f} m")
+    txt = panel.cloud_label.text()
+    check("点云：卡片上有体检报告（相机位置 / 基座系 / 离地）",
+          ("相机位置" in txt) and ("基座系" in txt), txt.splitlines()[0] if txt else "")
+    panel.on_cloud_clear()
+    win.pump(0.3)
+    check("点云：清除后回到干净场景",
+          panel.cloud_scene is None and abs(win.sim.floor_z + 0.171217) < 2e-3,
+          f"floor_z = {win.sim.floor_z:.4f} m")
+
     win.close()
     print("-" * 78)
     if fails:
@@ -1779,8 +2123,8 @@ def run_gui(args) -> int:
     print("鼠标     : 左键拖动=转视角  右键拖动=平移  滚轮=推拉  双击=复位视角")
     print("键盘     : 空格=暂停  H=回 home  R=复位  G=重力  F=真机跟随  1..6=选关节  "
           "−/=±一个步长  Ctrl+S=存图  ESC=退出")
-    print("面板     : ① 关节 −/+ 微调  ② 真机跟随（UDP 广播 / HTTP 状态）  ③ 末端目标 / IK"
-          "  ④ 点位（示教点到点）  ⑤ 运行 / 伺服  ⑥ 日志")
+    print("面板     : ① 关节 −/+ 微调  ② 真机跟随（UDP 广播 / HTTP 状态）  ③ 点云（相机 → 机械臂）"
+          "  ④ 末端目标 / IK  ⑤ 点位（示教点到点）  ⑥ 运行 / 伺服  ⑦ 日志")
     if args.follow_source:
         win.panel.f_source.setCurrentIndex(link.SOURCES.index(args.follow_source))
     if args.follow_url:
@@ -1789,6 +2133,9 @@ def run_gui(args) -> int:
         win.panel.f_port.setValue(int(args.follow_port))
     if args.follow:
         win.panel.on_follow_start()
+    if getattr(args, "point_cloud", ""):
+        win.panel.set_cloud_file(args.point_cloud)
+        win.panel.on_cloud_load()
     return QApplication.instance().exec() if not args.exit_after else _exec(win)
 
 
@@ -1827,6 +2174,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="覆盖跟随的数据源（auto/http/udp）")
     ap.add_argument("--follow-url", default="", help="覆盖真机 HTTP 状态接口")
     ap.add_argument("--follow-port", type=int, default=0, help="覆盖真机 UDP 广播端口")
+    ap.add_argument("--point-cloud", default="",
+                    help="启动时直接把这个点云接进场景（等价于点卡片里的「加载点云」）")
     ap.add_argument("--snapshot-dir", default=str(here / "runs"), help="存图目录")
     args = ap.parse_args(argv)
 
