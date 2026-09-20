@@ -28,7 +28,7 @@ e:\deepenv\mujoco\alicia_libero\
     ├── test_leader_arm.py        # 示教臂链路单测（夹爪映射方向/相对绝对/死人开关/限速，无需硬件）
     ├── test_camera_visibility.py # 相机可见性（分割渲染数机械臂像素，防"只看到地板"）
     ├── test_visual_alignment.py  # 物体与桌面/相机的对齐检查
-    <!-- 规划相关测试已随规划移除，备份见 ..\_archive_motion_plan_20260918\tests\ -->
+    <!-- 规划相关测试已随规划移除，备份见 ..\..\_alicia_motion_plan_archive\20260918\ -->
     └── render_preview.py         # 把各机位画面存成 PNG 便于肉眼检查
 ```
 
@@ -328,6 +328,12 @@ LeRobot 数据集（`use_videos=True` → **每个相机键一个 mp4**）；主
 再跑一次 `build_all_scenes.py`。
 
 ## 6. 实测结果
+
+> ⚠ 下表与下文提到的 `E:\deepenv\_tools\diag_*.py` 是**开发期的一次性诊断脚本**，
+> 已随临时文件清理一起删除（它们不在本仓库里、也不随仓库分发），**表里的数字都是当时的实测结果**，
+> 脚本名仅作留档；`skills.py` / `libero_tasks.py` 的注释里也有同样的脚本名引用，同理。
+> 想复现这些验证：界面的日常回归用 `tests/test_gui_smoke.py`、示教臂链路用 `tests/test_leader_arm.py`、
+> 任务通过率用 `tests/bench_tasks.py`、各机位出图用 `tests/render_preview.py`。
 
 | 验证项 | 结果 |
 | --- | --- |

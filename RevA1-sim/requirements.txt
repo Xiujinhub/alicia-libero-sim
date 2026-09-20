@@ -1,0 +1,18 @@
+# RevA1-sim 依赖（本机验证：Python 3.10.21 + mujoco 3.13.0 + numpy 2.2.6 + PySide6 6.7.3，
+# conda 环境 lerobot）
+#
+#   pip install -r requirements.txt
+#
+# 这些脚本只用 MuJoCo 自己的 Python 接口 + numpy，不依赖 ROS / gym / torch。
+mujoco>=3.3          # 核心：MjModel / MjData / viewer / Renderer
+numpy>=1.24          # 矩阵运算（IK、雅可比、采样）
+PySide6==6.7.3       # 交互控制台界面（revA1_gui.py / interactive_control.py）
+                     # ⚠️ 本机实测 6.11 的 Qt6Core.dll 加载失败（WinError 127），6.7.3 正常
+imageio>=2.30        # viewer.py --headless 出 PNG、demo --video 写视频、--selftest 存图
+imageio-ffmpeg>=0.4  # 写 mp4 需要（只出 PNG 序列的话可以不装）
+
+# 下面两个只有**旧版 tkinter 界面**（interactive_control_tk.py）才需要，
+# 新界面（revA1_gui.py）不用它们：
+pillow>=9            # 旧版：离屏帧 -> tkinter Canvas 贴图
+# tkinter 是 Python 标准库，但 Linux 常常要单独装系统包：
+#   sudo apt install python3-tk     或     conda install tk

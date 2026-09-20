@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- revA1_scene.xml —— 由 convert_urdf_to_mjcf.py 自动生成，可以随意手改。
+     机器人本体在 revA1_arm.xml（include 进来），这里只放"世界"相关的东西。
+
+坐标系约定
+----------
+· 世界原点 = 机械臂安装面中心（URDF 原点），z 向上；
+· base_link 底面在 z = -0.171217，地面就铺在这个高度（= 机器人坐在车间地板上）；
+· 六轴全 0 时手臂沿 -x 方向平伸；正常工作区大约 x ∈ [0.3, 0.9]、|y| < 0.6、z > 0；
+· qpos / ctrl 顺序：joint1..joint6（弧度）。
+-->
+<mujoco model="revA1_scene">
+  <include file="revA1_arm.xml"/>
+
+  <statistic center="0 0 0.5" extent="1.6"/>
+
+  <visual>
+    <headlight diffuse="0.55 0.55 0.55" ambient="0.35 0.35 0.35" specular="0.1 0.1 0.1"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="135" elevation="-18" offwidth="1280" offheight="960"/>
+  </visual>
+
+  <asset>
+    <texture name="revA1_sky" type="skybox" builtin="gradient"
+             rgb1="0.28 0.40 0.56" rgb2="0.04 0.06 0.09" width="256" height="256"/>
+    <texture name="revA1_floor_tex" type="2d" builtin="checker"
+             rgb1="0.26 0.27 0.29" rgb2="0.20 0.21 0.23" width="256" height="256"/>
+    <material name="revA1_floor_mat" texture="revA1_floor_tex" texrepeat="16 16"
+              reflectance="0.03"/>
+    <material name="revA1_target_mat" rgba="0.15 0.80 0.35 0.55"/>
+  </asset>
+
+  <worldbody>
+    <light name="key_light" pos="1.2 -1.2 2.4" dir="-0.4 0.4 -1" directional="true"
+           diffuse="0.6 0.6 0.6" specular="0.25 0.25 0.25" castshadow="true"/>
+    <light name="fill_light" pos="-1.4 1.4 1.6" dir="0.45 -0.45 -1" directional="true"
+           diffuse="0.3 0.3 0.35"/>
+
+    <!-- 地面：正好在机器人的安装底面高度 -->
+    <geom name="floor" type="plane" pos="0 0 -0.171217" size="4 4 0.1"
+          material="revA1_floor_mat" condim="4" friction="1.0 0.005 0.0001"/>
+
+    <!-- 名义作业点标记（纯视觉，不参与碰撞）= home 姿态下 tool_site 的地面投影 -->
+    <geom name="target_pad" type="cylinder" size="0.05 0.002" pos="0.4 0 -0.169217"
+          material="revA1_target_mat" contype="0" conaffinity="0"/>
+
+    <!-- 三个固定相机，方便离线渲染/录视频 -->
+    <camera name="overview_cam" pos="1.6 -1.6 1.1" xyaxes="0.7071 0.7071 0 -0.21 0.21 0.958"
+            fovy="45"/>
+    <camera name="top_cam" pos="0 0 2.2" xyaxes="1 0 0 0 1 0" fovy="50"/>
+    <camera name="side_cam" pos="2.2 0 0.7" xyaxes="0 1 0 0 0 1" fovy="50"/>
+  </worldbody>
+
+  <keyframe>
+    <!-- home：实测无自碰撞、工具轴竖直朝下、tool_site 离地面 0.350 m，
+         可以直接作为训练/演示的初始位姿。改姿态后请重跑 check_model.py 复核。 -->
+    <key name="home" qpos="0.3152 -1.6288 -2.3803 -0.7033 1.5708 -2.3152" ctrl="0.3152 -1.6288 -2.3803 -0.7033 1.5708 -2.3152"/>
+  </keyframe>
+</mujoco>
