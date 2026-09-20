@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | [`alicia_libero/`](alicia_libero/README.md) | **LIBERO 桌面操作仿真台**（PySide6 界面） | 9 个桌面任务；鼠标拖拽 IK、键盘虚拟示教臂、关节滑块、**示教臂（手摇跟随：真机 leader → 仿真 follower，见 `leader_arm.py`）**；每帧实时判分 |
 | [`alicia_teleop/`](alicia_teleop/README.md) | **虚拟示教臂 / 遥操作** | `alicia_virtual_teleop.py`（真机 leader ↔ MuJoCo follower 同步 + 相机 + CSV 录制）、`make_follower_xml.py`（给原始 MJCF 补 actuator） |
-| [`RevA1-sim/`](RevA1-sim/README.md) | **TB6-R5-RevA1 六轴工业臂仿真 + 交互控制台**（PySide6 界面，自带 URDF/mesh，可独立拷走） | 关节 `−`/`+` 微调、**笛卡尔直线点到点**、多初值 IK（可解/不可解 + 误差 + 目标点红绿标记）、示教点位；`viewer.py` / `demo_trajectory.py` 可视化与轨迹演示 |
+| [`RevA1-sim/`](RevA1-sim/README.md) | **TB6-R5-RevA1 六轴工业臂仿真 + 交互控制台**（PySide6 界面，自带 URDF/mesh，可独立拷走） | 关节 `−`/`+` 微调、**真机跟随（真机 UDP 6001 广播 / HTTP 状态 → 模型实时同步动，见 `robot_link.py`）**、**笛卡尔直线点到点**、多初值 IK（可解/不可解 + 误差 + 目标点红绿标记）、示教点位；`viewer.py` / `demo_trajectory.py` 可视化与轨迹演示 |
 
 ## 1. 快速开始
 

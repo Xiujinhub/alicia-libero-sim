@@ -11,6 +11,7 @@ cd RevA1-sim
 python convert_urdf_to_mjcf.py  # ① 生成 assets/revA1_arm.xml + revA1_scene.xml + meshes/
 python check_model.py           # ② 自检：结构/质量/奇异位形/稳定性/工作空间/IK 精度
 python revA1_gui.py             # ③ 交互控制台（PySide6）：关节 −/+ 微调 / 笛卡尔直线点到点 / IK（推荐）
+python revA1_gui.py --follow    # ③′ 同上，并直接开「真机跟随」：真机 UDP 广播 / HTTP 状态 → 仿真实时跟
 python viewer.py                # ④ 开 MuJoCo 原生窗口玩（拖滑条 / 空格暂停 / 1-4 预设姿态）
 python demo_trajectory.py       # ⑤ 自动跑一段点到点轨迹
 python demo_trajectory.py --cartesian --video runs/cart.mp4   # ⑥ 笛卡尔画方+圆并录视频
@@ -24,8 +25,9 @@ python demo_trajectory.py --cartesian --video runs/cart.mp4   # ⑥ 笛卡尔画
 | `convert_urdf_to_mjcf.py` | URDF → MJCF 转换的命令行入口（在 `assets/` 下生成场景三件套） |
 | `model_import.py` | 转换用的工具库：`package://` 路径修复、mesh 拷贝、MJCF 文本后处理、场景模板 |
 | `check_model.py` | 模型自检脚本，结果打印并写入 `check_model.log` |
-| `arm_core.py` | **控制核心**（不依赖界面框架）：`Camera` 轨道相机、`Motion` 运动插值、`ArmSim` 仿真/伺服/IK、多初值 IK、笛卡尔直线规划 |
-| `revA1_gui.py` | **交互控制台（PySide6，主推）**：关节 −/+ 微调、末端目标/IK、示教点位（点到点）、伺服参数、日志；自带 `--selftest` / `--ui-test` |
+| `arm_core.py` | **控制核心**（不依赖界面框架）：`Camera` 轨道相机、`Motion` 运动插值、`ArmSim` 仿真/伺服/IK/`follow()`（真机跟随）、多初值 IK、笛卡尔直线规划 |
+| `robot_link.py` | **真机 ↔ 仿真 姿态链路**：状态源（HTTP 轮询 / UDP 广播接收）× 报文解析 × 映射/平滑/限速/看门狗；界面里的「真机跟随」卡片就用它，另有 `--probe / --listen / --emit-demo / --selftest` |
+| `revA1_gui.py` | **交互控制台（PySide6，主推）**：关节 `−`/`+` 微调、**真机跟随（真机姿态实时映到模型）**、末端目标/IK、示教点位（点到点）、伺服参数、日志；自带 `--selftest` / `--ui-test` |
 | `interactive_control.py` | 交互控制台入口（转发到 `revA1_gui.py`，让老的命令行继续可用） |
 | `interactive_control_tk.py` | 旧版 tkinter 界面（保留作对照/回退，逻辑同源，命令行不变） |
 | `sim_ik.py` | 末端位姿数值 IK（阻尼最小二乘）+ `drive_to` 平滑运动 / `reset_home`，也可单独当命令行 IK 用 |
@@ -51,6 +53,8 @@ pip install -r requirements.txt          # mujoco / numpy / PySide6 / imageio / 
 * `revA1_gui.py` 只需要 **PySide6**（不依赖 tkinter / Pillow）；旧界面
   `interactive_control_tk.py` 才需要 tkinter + Pillow（Linux 上 tkinter 通常要单独装系统包，
   例如 `sudo apt install python3-tk`）。
+* `robot_link.py`（真机跟随）只用 **标准库 + numpy**，不 import mujoco / Qt：既能被界面调用，
+  也能单独当命令行工具跑（`--probe / --listen / --emit-demo / --selftest`）。
 * 没有显示器时用 `--headless`（离屏渲染成 PNG / mp4），不要开窗口；
   界面自检也能在无头机器上跑：`QT_QPA_PLATFORM=offscreen python revA1_gui.py --ui-test`。
 
@@ -64,17 +68,19 @@ pip install -r requirements.txt          # mujoco / numpy / PySide6 / imageio / 
 
 ```bash
 python revA1_gui.py                            # 开窗口（= python interactive_control.py）
+python revA1_gui.py --follow                   # 开窗口并直接开「真机跟随」（UDP 6001 + HTTP 8080）
 python revA1_gui.py --width 960 --height 600 --fps 30   # 渲染分辨率 / 帧率上限
 python revA1_gui.py --selftest                 # 无窗口：控制逻辑 + 渲染通路全跑一遍并断言
 python revA1_gui.py --ui-test                  # 真建窗口 → 脚本化点一遍控件 → 存图 → 退出
 python revA1_gui.py --exit-after 10            # 开窗口跑 10 秒自动退出（自动化 / 截图）
 ```
 
-**五张卡片**
+**六张卡片**
 
 | 卡片 | 做什么 | 怎么用 |
 |---|---|---|
 | 关节微调 | 每个关节一行：`−` `目标角（大号字）` `+` `(实测角)` | **点一下动一点**；步长可选 0.5°/1°/5°/15°；按住 0.4 s 后自动连点；还有「同步实测 / 全部归零 / 回 home」 |
+| **真机跟随** | 真机在广播/开机时，把它的 **6 个关节角实时搬到模型上**（数据源：UDP 广播 / HTTP 状态 / 自动）；卡片上实时显示**延迟、包率、真机 ↔ 仿真的 TCP 位置与工具轴误差** | 填/确认地址端口 → 「启动跟随」；「读一次」只读一帧看通不通；「停止跟随」就地保持姿态（不会掉下来）。详见下文「真机跟随」一节 |
 | 末端目标 / IK | 工具尖目标 `x y z`（±5 mm / 1 cm / 5 cm 步进）+ 工具轴方向（保持当前朝向 / 竖直朝下 / 自定义 / 不约束） | 「求解 IK」只算不动 → 结果区显示**位置误差、姿态误差、耗时、解出的 6 个关节角**；「求解并沿直线运动」再让工具尖沿直线过去；预设按钮 home / 前伸 / 侧向 / 低位 |
 | 点位（示教 / 点到点） | 列表 + 「记录当前位姿 / 走到选中点 / 删除 / 清空」 | 先用手动（关节 ± 或 IK）摆到位 → 记录 → 以后双击列表项就能**沿直线复现**（这就是最直观的点到点） |
 | 运行 / 伺服 | 运动时长、进度条、kp 缩放、暂停物理、重力、急停、复位、存图、视角按钮 | 急停 = 就地保持（指令钉在实测角上）；视角 4 个预设（斜视/俯视/侧视/近看末端） |
@@ -96,7 +102,7 @@ python revA1_gui.py --exit-after 10            # 开窗口跑 10 秒自动退出
    * 到不了就**明确拒绝执行**（不会偷偷动、也不会卡在奇怪的姿态上）。
 
 **鼠标/键盘**：左键拖动转视角、右键拖动平移、滚轮推拉、双击复位视角；
-`空格` 暂停、`H` 回 home、`R` 复位、`G` 重力、`1..6` 选关节、`−`/`=` 给选中关节 ± 一个步长、
+`空格` 暂停、`H` 回 home、`R` 复位、`G` 重力、`F` 真机跟随（切启动/停止）、`1..6` 选关节、`−`/`=` 给选中关节 ± 一个步长、
 `Ctrl+S` 存图、`ESC` 退出。（输入框里打字时快捷键不抢键，负号、数字都能正常输入。）
 
 **动作到点后会自己报告精度**（不是只看指令，是量实际状态）：
@@ -113,10 +119,10 @@ python revA1_gui.py --exit-after 10            # 开窗口跑 10 秒自动退出
    等比缩放居中（`Qt.KeepAspectRatio`，不变形），`close()` 时显式 `renderer.close()`。
 2. **PySide6 6.11 的 `Qt6Core.dll` 加载失败**（WinError 127）→ 用 `PySide6==6.7.3`。
 3. **快捷键不能抢输入框**：`1..6`、`−`、`=` 这些在 `QDoubleSpinBox` 里就是正常输入（比如打 `-0.05`），
-   所以按键处理先看焦点是不是数值框/日志框，是就原样交给控件；另外一次动作（H/R/G/ESC）挡掉自动重复。
+   所以按键处理先看焦点是不是数值框/日志框，是就原样交给控件；另外一次动作（H/R/G/F/ESC）挡掉自动重复。
 4. **QSS 的 `[prop="true"]` 选择器改完要 `unpolish/polish` 一次**才生效（例如关节高亮、IK 失败变红）。
 
-### 自检结果（`--selftest`，29 项全过）
+### 自检结果（`--selftest`，35 项全过）
 
 ```
 home 姿态 0.16 mm / 无自碰撞        单关节 5 下「+」J4 实测 +4.92°（其余关节 <0.27°），限位自动夹住
@@ -125,11 +131,14 @@ IK 预设 4 个点最差 0.09 mm / 0.000°  不可达点 (1.30,0,0.30) → 明�
 关节空间 P2P 到位 0.896°（含重力下垂） 急停：指令定格、停下后 0.5 s 漂移 0.01 mm
 离屏渲染 320x480 正常               目标标记目标球 + 路径胶囊 ngeom 9 → 11
 相机 拖动/平移/推拉/预设视角 + 工具轴插值（含反向 180°）
+真机跟随（假真机 HTTP + 正运动学 pose → JointLink → ArmSim）：关节最大差 0.325°、TCP 差 4.04 mm、
+        数据率 21.3 Hz、模式 follow、停止后线程退出
 ```
 
-`--ui-test` 会真开窗口把**每个卡片**都点一遍（30 项，全过；加 `--no-render` 是 26 项，跳过渲染相关）：
+`--ui-test` 会真开窗口把**每个卡片**都点一遍（34 项，全过；加 `--no-render` 是 30 项，跳过渲染相关）：
 关节 ± 按钮、键盘选关节/微调、功能键不误触发、「求解 IK」结果文案、「求解并沿直线运动」到位、
 不可达点提示、记录/走到/删除点位、急停、复位、kp 滑块、窗口缩放不重建渲染器、截图；
+**真机跟随卡片的控件齐全 + 启停一遍（用没人发的 UDP 端口，不碰真机）**；
 产物在 `runs/gui_ui_test.png`（窗口截图）、`runs/gui_ui_test_view.png`（3D 画面）
 和 `runs/gui_selftest.png`（自检渲染帧）。
 
@@ -213,6 +222,84 @@ ee_site   = [0.400, 0.000, 0.222]
    或者在 `drive_to()` 外面加前馈/积分补偿。
 5. **不是用来做精确动力学辨识的**：URDF 只给了质量/惯量，没有关节刚度、齿隙、摩擦模型。
 
+## 真机跟随（真机 → 仿真，实时互通）
+
+真机（TB6-R5-RevA1）一直在往外发状态，本目录用 `robot_link.py` 收下来，**把 6 个关节角逐帧下发给模型**，
+于是仿真里的手臂跟着真机同步动。两条数据路都支持，界面里选「自动」就都用：
+
+| 路 | 真机怎么发 | 本机实测 | 说明 |
+|---|---|---|---|
+| **UDP 广播** | 往 `255.255.255.255:6001` 广播 JSON | 源 `192.168.66.169:44558`，约 **96 Hz**，一包 ~1.1 kB | 最实时；另有约 1 Hz 的**心跳包**（没有关节角，已单独计数、不算错误） |
+| **HTTP 状态** | `http://192.168.66.169/` 是 nginx 上的 H5，状态接口在 **8080** | `GET http://192.168.66.169:8080/api/state`，往返 ~34 ms | 方便命令行 / 远程查；字段与广播一致 |
+
+两条路的报文里都带着 `joints`（6 个关节角，**弧度**）、`pose`（工具尖 x/y/z[m] + 外旋 XYZ 欧拉角[rad]）、
+`vel`、`torque`、`enabled`、`running`、`speed`、`ts`：
+
+```json
+{"data": {"joints": [1.7285, -2.3903, 2.1147, 1.1962, 1.7299, -1.7549],
+          "pose":   [0.1109, -0.0055, 0.3964, 3.4320, 0.6090, 1.9507],
+          "vel": [...], "torque": [...], "enabled": [...], "running": true, "speed": "v25"},
+ "type": "state", "ver": 1}
+```
+
+**关节约定已现场核对**（这是能直接镜像的前提）：把真机 `joints` 灌进模型 qpos，模型 FK 出的
+`tool_site` 与真机 `pose[:3]` 差 **0.5 mm**、工具轴差 **0.00°** —— 也就是**同号同零位，不用改符号/偏置**。
+（`python robot_link.py --probe` 随时可以复现这两行。）
+
+### 怎么用
+
+```bash
+# 界面：开窗口 → 「真机跟随」卡片 → 「启动跟随」（或直接下面这条，等效）
+python revA1_gui.py --follow
+python revA1_gui.py --follow --follow-source udp --follow-port 6001        # 只用 UDP 广播
+python revA1_gui.py --follow --follow-source http \
+                    --follow-url http://192.168.66.169:8080/api/state     # 只用 HTTP 状态
+
+# 命令行联调（不用开界面）
+python robot_link.py --probe                    # 读一次真机状态 + 复核它与模型的约定
+python robot_link.py --listen --port 6001       # 只听 UDP 广播，逐包打印
+python robot_link.py --listen --source http     # 或听 HTTP 状态接口
+python robot_link.py --selftest                 # 全链路自检（含"真机可达"，读不到只 SKIP 不算失败）
+python robot_link.py --emit-demo --target 127.0.0.1:6001   # 模拟真机发报文（离线联调）
+```
+
+卡片上的参数（命令行里没有的就改卡片默认值，或改 `robot_link.py` 顶部常量）：
+
+| 参数 | 默认 | 作用 |
+|---|---|---|
+| 数据源 | 自动 | `自动` = HTTP 与 UDP 同时开，每帧用最新那一路；也可只用其中之一 |
+| HTTP / UDP 端口 | `…:8080/api/state` / `6001` | 真机地址；换机型 / 换网段改这里 |
+| 报文 / 单位 | 自动 / 自动 | UDP 报文格式（真机是 JSON）；单位自动判：绝对值 > 7 当**度**，否则当**弧度** |
+| 映射 | 绝对（完全镜像） | `相对` = 启动瞬间记下"真机基准 / 仿真基准"，之后只镜像增量（两边本来就不同姿时用） |
+| 平滑 | 0.08 s | 一阶低通时间常数；0 = 最跟手，真机信号抖就调大 |
+| 限速 | 180 °/s | 每秒最多跟多少度，防真机跳变/毛刺把仿真甩出去；0 = 不限 |
+| 看门狗 | 1.0 s | 超过这么久没有新包 → 判掉线：**保持不动**并把「掉线！」写在卡片上（也可改成回 home） |
+
+### 跟得准不准（本机实测）
+
+真机保持不动 8 s，`source=auto`（HTTP 30 Hz + UDP 96 Hz 同时收）：
+
+```
+数据：21.4 + 96.4 Hz · 延迟 1 ms · 包 928 / 错 0
+真机：q [99.03, -136.96, 121.17, 68.54, 99.12, -100.55]°
+仿真：q [99.03, -137.25, 121.50, 68.48, 99.12, -100.55]° · 关节跟踪 0.339°
+误差：TCP 2.84 mm · 工具轴 0.01°（真机 pose vs 模型 tool_site）
+```
+
+* 关节角是**直接镜像**的（不走 IK），所以真机 ↔ 仿真的差只来自位置伺服（无积分项，稳态误差 ≈ 重力力矩/kp）
+  和跟踪带宽，量级是**零点几度 / 几毫米**；
+* 想更紧：把「运行 / 伺服」里的 **kp 缩放**调大（界面滑条），或把「平滑」调到 0、「限速」放宽；
+* 真机跳变不会带飞仿真：报文先过**关节范围合理性检查**（绝对值 ≤ 7 rad），再受**限速**与**看门狗**约束。
+
+### 排错
+
+| 现象 | 先看 |
+|---|---|
+| 卡片一直「还没收到数据」 | ① `ping 192.168.66.169`；② 电脑是否和真机同网段（本机 `192.168.66.88/24`）；③ 真机是否在广播（`python robot_link.py --listen --port 6001`）；④ 端口被占了就换端口或改用 HTTP |
+| 「错」一直在涨 | 看卡片/日志里的**原始包预览**，对着报文改「报文 / 单位」；真机的心跳包不算错 |
+| 仿真手势和真机反着来 | 机型换了符号/零位：用 `JointLink(signs=..., offsets=...)` 改（本机同号，不用改） |
+| 掉线后手臂不动了 | 这是**故意**的（看门狗：保持不动比乱动安全）；恢复广播后会自动继续跟 |
+
 ## 常用命令
 
 ```bash
@@ -230,6 +317,13 @@ python revA1_gui.py                    # 等价于 python interactive_control.py
 python revA1_gui.py --selftest
 python revA1_gui.py --ui-test --width 960 --height 600
 
+# 真机跟随：开窗口并直接开跟随 / 只用某一路 / 命令行联调
+python revA1_gui.py --follow
+python revA1_gui.py --follow --follow-source udp --follow-port 6001
+python robot_link.py --probe
+python robot_link.py --listen --port 6001
+python robot_link.py --selftest
+
 # 无显示器：离屏出图 / 录视频
 python viewer.py --headless --seconds 3 --out runs/h.png --camera overview_cam
 python demo_trajectory.py --cartesian --video runs/cart.mp4 --camera overview_cam
@@ -240,6 +334,9 @@ python demo_trajectory.py --cartesian --video runs/cart.mp4 --camera overview_ca
 | 想改 | 去哪 |
 |---|---|
 | 换 URDF / 换机器人 | `revA1_spec.py` 的 `URDF` / `PACKAGE_ROOT`（默认用本目录 `TB6-R5-RevA1/`），然后重跑 `convert_urdf_to_mjcf.py` |
+| 真机地址 / 端口 | `robot_link.py` 顶部 `DEFAULT_HOST` / `DEFAULT_HTTP_URL` / `DEFAULT_UDP_PORT`（界面「真机跟随」卡片里也能直接改） |
+| 跟随手感（跟多紧 / 多平滑 / 限速 / 断线策略） | 卡片上的 平滑 / 限速 / 看门狗；或 `JointLink(smooth=…, max_speed_deg=…, timeout=…, timeout_policy=…)` |
+| 真机符号 / 零位（机型不同才要动） | `JointLink(signs=…, offsets=…)`；先用 `python robot_link.py --probe` 看模型复核那两行 |
 | 工具长度（TCP） | `revA1_spec.py` 的 `TOOL_TIP_LOCAL_Z`（换成自己夹爪的尺寸） |
 | 伺服软硬 | `revA1_spec.py` 的 `GAINS`（kp/kv/forcerange） |
 | 地面高度 | 默认自动量 `base_link` 网格最低点；要覆盖用 `--floor-z` |
@@ -258,4 +355,7 @@ python demo_trajectory.py --cartesian --video runs/cart.mp4 --camera overview_ca
   `ee_site` 当抓取参考点（`lerobot_codeit/sim/mujoco_env.py` 就是按这个思路写的）。
 * 加夹爪 + 工件，做 pick & place（参考 `lerobot_codeit/sim/assets/kinova/kinova_scene.xml`）。
 * 加相机渲染做视觉策略输入（场景里已经有 3 个相机，`mujoco.Renderer` 直接出图）。
+* 真机跟随还能往前一步：现在只**读**真机（安全第一），要双向就接真机的写接口
+  （`POST /api/command`，`cmd=move_joint` / `move_c` 等，界面 H5 里用的就是它）——
+  那属于"远程遥控真机"，请先在真机侧做好限速与急停。
 

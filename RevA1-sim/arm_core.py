@@ -367,6 +367,7 @@ class ArmSim:
     ``p2p``         关节空间点到点：``Motion`` 每一步覆盖 ``cmd``（smoothstep 插值）
     ``cartesian``   笛卡尔直线：``Motion`` 带着一串 IK 路点覆盖 ``cmd``（工具尖走直线）
     ``hold``        急停：``cmd`` 定格在急停瞬间的**实测**姿态（原地撑住）
+    ``follow``      真机跟随：每帧把 ``cmd`` 钉到真机来的关节角上（见 ``robot_link.py``）
     ==============  ==========================================================
     """
 
@@ -482,6 +483,24 @@ class ArmSim:
         """直接设定 6 个目标（不插值，主要给复位/测试用）。"""
         self.cmd = np.clip(np.asarray(q, dtype=float).ravel(), self.lo, self.hi)
         self.mode = "joint"
+
+    def follow(self, q_target) -> np.ndarray:
+        """**真机跟随**：把 6 个目标角直接钉到给定角度（弧度，不插值，逐帧刷新）。
+
+        和 :meth:`set_cmd` 的区别只有两点，但都是必须的：
+
+        1. 顺手取消正在跑的自动运动（``p2p`` / ``cartesian`` 也在写 ``cmd``，
+           两个来源抢目标会互相打架）；
+        2. 模式标成 ``follow``（状态栏、日志能一眼看出"现在是人/真机在带"）。
+
+        限位仍然生效：真机偶尔给出超限角（比如 ±400°）时按模型关节范围截断。
+        """
+        if self.motion is not None:
+            self.motion = None
+            self.pending = None
+        self.mode = "follow"
+        self.cmd = np.clip(np.asarray(q_target, dtype=float).ravel(), self.lo, self.hi)
+        return self.cmd
 
     def hold(self) -> None:
         """急停：取消运动，把目标钉在**当前实测**姿态上（伺服原地撑住）。"""

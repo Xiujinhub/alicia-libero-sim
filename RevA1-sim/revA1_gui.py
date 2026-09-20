@@ -4,17 +4,20 @@
 界面布局
 --------
 左边是 MuJoCo 实时画面（离屏渲染成 QImage 贴上去，不另开窗口），右边是可滚动的控制面板，
-底下一行状态栏；面板分 5 张卡片：
+底下一行状态栏；面板分 6 张卡片：
 
 1. **关节微调**：每个关节一行 ``− 目标角 + 实测角``——**点一下动一点**（按住还能连点）。
    旧版是 6 根滑条，拖起来又不准又不直观，这里直接换成 ± 按钮 + 步长选择。
-2. **末端目标 / IK**：填工具尖目标（世界系 x/y/z）+ 工具轴方向，``求解 IK`` 只算不动、
+2. **真机跟随**：接真机的姿态——真机在广播/开着状态接口，这里一按就把**真机姿态**搬到
+   模型上实时跟着动（HTTP 状态接口 / UDP 广播两路，见 ``robot_link.py``）；
+   卡片上同时显示延迟、包率、真机与仿真的**TCP 位置/工具轴误差**。
+3. **末端目标 / IK**：填工具尖目标（世界系 x/y/z）+ 工具轴方向，``求解 IK`` 只算不动、
    ``求解并沿直线运动`` 算完就走。结果里写清楚位置误差 / 姿态误差 / 耗时 / 解出来的 6 个关节角，
    目标点在画面里画成**绿球 + 黄轴**（不可达时变红）。
-3. **点位（示教 / 点到点）**：``记录当前位姿`` 存点，``走到选中点`` 沿直线过去（双击列表也行）。
+4. **点位（示教 / 点到点）**：``记录当前位姿`` 存点，``走到选中点`` 沿直线过去（双击列表也行）。
    这是最直观的"点到点"：先手动摆到位置存下来，以后一键复现。
-4. **运行 / 伺服**：运动时长、进度条、kp 缩放（体会伺服软硬）、暂停、重力、**急停**、复位、存图。
-5. **日志**：每一步动作 + **实测**到位精度（不是只看指令）。
+5. **运行 / 伺服**：运动时长、进度条、kp 缩放（体会伺服软硬）、暂停、重力、**急停**、复位、存图。
+6. **日志**：每一步动作 + **实测**到位精度（不是只看指令）。
 
 点到点为什么改成"直线"
 ----------------------
@@ -46,6 +49,7 @@ Ctrl+S=存图，ESC=退出。
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import time
 from pathlib import Path
@@ -63,12 +67,14 @@ from PySide6.QtGui import (QColor, QFont, QFontDatabase, QImage,  # noqa: E402
 from PySide6.QtTest import QTest  # noqa: E402  (UI 自检里模拟真实按键)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,  # noqa: E402
                                QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout,
-                               QLabel, QListWidget, QListWidgetItem, QMainWindow,
-                               QPlainTextEdit, QProgressBar, QPushButton, QScrollArea,
-                               QSizePolicy, QSlider, QSplitter, QVBoxLayout, QWidget)
+                               QLabel, QLineEdit, QListWidget, QListWidgetItem,
+                               QMainWindow, QPlainTextEdit, QProgressBar, QPushButton,
+                               QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter,
+                               QVBoxLayout, QWidget)
 
 import arm_core as core  # noqa: E402
 import revA1_spec as spec  # noqa: E402
+import robot_link as link  # noqa: E402
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -127,9 +133,9 @@ QPushButton#Step { min-width: 30px; max-width: 30px; padding: 2px 0; font-size: 
                    font-weight: 700; }
 QPushButton#Tiny { min-width: 24px; max-width: 24px; padding: 1px 0; }
 QPushButton#Preset { padding: 4px 8px; font-size: 12px; }
-QDoubleSpinBox, QComboBox, QLineEdit { background: #101720; border: 1px solid #2c3743;
+QDoubleSpinBox, QSpinBox, QComboBox, QLineEdit { background: #101720; border: 1px solid #2c3743;
                                        border-radius: 5px; padding: 3px 6px; }
-QDoubleSpinBox:focus, QComboBox:focus { border-color: #2ba48c; }
+QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus, QLineEdit:focus { border-color: #2ba48c; }
 QComboBox::drop-down { border: 0; width: 16px; }
 QComboBox QAbstractItemView { background: #161d26; border: 1px solid #2c3743;
                               selection-background-color: #1f7f6e; }
@@ -439,6 +445,54 @@ class ArmView(QWidget):
 
 
 # =============================================================== 控制面板
+# =============================================================== 真机跟随的体检文本
+def follow_status_text(sim: core.ArmSim, lk, out=None, err: str = "") -> str:
+    """「真机跟随」卡片下半部分那几行（状态 / 延迟 / 包率 / 真机 ↔ 仿真误差）。
+
+    做成模块级函数是为了**自检能直接调**（不用建窗口），界面里的
+    ``ControlPanel._follow_text`` 只是转发到这里。
+    """
+    st_sim = sim.status()
+    if lk is None:
+        note = f"（上次启动失败：{err}）" if err else ""
+        return (f"状态：未启动{note}\n"
+                f"当前模式：{MODE_NAMES.get(st_sim['mode'], st_sim['mode'])} · "
+                f"仿真工具尖 {vec_str(st_sim['tip'])}\n"
+                f"默认：UDP :{link.DEFAULT_UDP_PORT} 广播 + HTTP {link.DEFAULT_HTTP_URL}\n"
+                f"提示：点「启动跟随」开始，键盘 F 也能切；停止时会就地保持姿态。")
+    n_pkt, n_err = lk.packets()
+    head = "跟随中" if lk.running else "已停止"
+    if out is not None and out.stale:
+        head += " · 掉线！"
+    line1 = f"状态：{head} · {lk.describe_sources()}"
+    age = lk.age()
+    line2 = (f"数据：{lk.rate_text()} · 延迟 "
+             f"{'—' if age == float('inf') else f'{age * 1000:.0f} ms'} · "
+             f"包 {n_pkt} / 错 {n_err}")
+    if out is not None and out.note:
+        line2 += f" · {out.note}"
+    st = out.state if out is not None else lk.latest()
+    if st is None:
+        return "\n".join([line1, line2, "还没收到数据……检查真机是否在广播 / 地址端口对不对"])
+    lines = [line1, line2,
+             f"真机：q {np.round(st.deg, 2).tolist()}（原单位 {st.unit}）",
+             f"仿真：q {np.round(st_sim['q_deg'], 2).tolist()} · "
+             f"关节跟踪 {st_sim['track_deg']:.3f}°"]
+    tcp = st.tcp()
+    if tcp is not None:
+        d_mm = float(np.linalg.norm(sim.tip() - tcp)) * 1000.0
+        axis = st.axis()
+        if axis is None:
+            lines.append(f"误差：TCP {d_mm:.2f} mm（真机 pose vs 模型 tool_site）")
+        else:
+            ang = math.degrees(math.acos(float(np.clip(sim.tip_axis() @ axis, -1.0, 1.0))))
+            lines.append(f"误差：TCP {d_mm:.2f} mm · 工具轴 {ang:.2f}°"
+                         f"（真机 pose vs 模型 tool_site）")
+        lines.append(f"真机 TCP {np.round(tcp, 4).tolist()} · "
+                     f"仿真工具尖 {vec_str(sim.tip(), 4)}")
+    return "\n".join(lines)
+
+
 class ControlPanel(QWidget):
     """右侧控制面板：5 张卡片；所有控件回调都只做两件事——调 ``ArmSim`` 的方法、刷新显示。"""
 
@@ -450,12 +504,15 @@ class ControlPanel(QWidget):
         self.joint_rows: list[dict] = []      # 关节表格的控件引用（刷新用）
         self.points: list[dict] = []          # 示教点位（工具尖 + 工具轴 + 关节角）
         self._last_log: dict[str, float] = {}
+        self.link: link.JointLink | None = None    # 真机 ↔ 仿真的姿态链路（没启动时 None）
+        self.follow_out: link.FollowOut | None = None
+        self.follow_error = ""                # 启动失败的原因（留在卡片上）
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
         lay.setSpacing(10)
-        for builder in (self._build_joints, self._build_cartesian, self._build_points,
-                        self._build_run, self._build_log):
+        for builder in (self._build_joints, self._build_follow, self._build_cartesian,
+                        self._build_points, self._build_run, self._build_log):
             lay.addWidget(builder())
         lay.addStretch(1)
         self.select_joint(0)
@@ -541,6 +598,8 @@ class ControlPanel(QWidget):
     def nudge(self, i: int, sign: float) -> None:
         """−/+ 按钮：改第 i 个关节的目标角（并按需记一条日志）。"""
         self.select_joint(i)
+        if self.link is not None and self.link.running and self._throttled("follow-nudge", 3.0):
+            self.sim.log("真机跟随中：手动微调下一秒就会被真机姿态覆盖（要手动先点「停止跟随」）")
         self.sim.nudge_joint(i, sign * self.step_deg())
         if self._throttled(f"j{i}"):
             self.sim.log(f"单关节：J{i + 1} 目标 → {self.sim.cmd_deg()[i]:+.1f}°")
@@ -565,7 +624,187 @@ class ControlPanel(QWidget):
     def on_home(self) -> None:
         self.sim.home(self.move_time())
 
-    # ------------------------------------------------------------ 2. 末端目标 / IK
+    # ------------------------------------------------------------ 2. 真机跟随（真机 → 仿真）
+    def _build_follow(self) -> Card:
+        card = Card("真机跟随（UDP 广播 / HTTP 状态）",
+                    "真机把姿态发出来（本机实测：往 **UDP 6001** 广播，约 96 Hz；也开着 HTTP 状态接口），"
+                    "点「启动跟随」就把它的 6 个关节角实时搬到模型上。下面几行是现场体检："
+                    "延迟、包率，以及**真机 TCP ↔ 仿真工具尖**的误差。")
+        self.f_source = QComboBox()
+        self.f_source.addItems(link.SOURCE_LABELS)
+        self.f_source.setCurrentIndex(link.SOURCES.index("auto"))
+        self.f_source.setToolTip("自动 = HTTP 与 UDP 同时开，哪路新用哪路（推荐）")
+        self.f_fmt = QComboBox()
+        self.f_fmt.addItems(link.FORMAT_LABELS)
+        self.f_fmt.setToolTip("UDP 报文的格式；真机是 JSON，认不出来就换这里试")
+        card.add_row(QLabel("数据源"), self.f_source, QLabel("报文"), self.f_fmt)
+
+        self.f_url = QLineEdit(link.DEFAULT_HTTP_URL)
+        self.f_url.setToolTip("真机 HTTP 状态接口（本机实测 http://192.168.66.169:8080/api/state）")
+        self.f_url.setMinimumWidth(150)
+        card.add_row(QLabel("HTTP"), self.f_url)
+
+        self.f_port = QSpinBox()
+        self.f_port.setRange(1, 65535)
+        self.f_port.setValue(int(link.DEFAULT_UDP_PORT))
+        self.f_port.setToolTip("真机 UDP 广播端口（本机实测往 6001 发）")
+        self.f_unit = QComboBox()
+        self.f_unit.addItems(link.UNIT_LABELS)
+        self.f_unit.setToolTip("报文里的角度单位；自动 = |角| > 7 当度，否则当弧度")
+        card.add_row(QLabel("UDP 端口"), self.f_port, QLabel("单位"), self.f_unit)
+
+        self.f_mode = QComboBox()
+        self.f_mode.addItems(link.MODE_LABELS)
+        self.f_mode.setToolTip("绝对 = 完全镜像真机姿态；相对 = 只镜像增量（两边本来就不同姿时用）")
+        card.add_row(QLabel("映射"), self.f_mode)
+
+        self.f_smooth = QDoubleSpinBox()
+        self.f_smooth.setRange(0.0, 0.5)
+        self.f_smooth.setSingleStep(0.02)
+        self.f_smooth.setDecimals(2)
+        self.f_smooth.setValue(0.08)
+        self.f_smooth.setSuffix(" s")
+        self.f_smooth.setToolTip("0 = 最跟手；越大越平滑但滞后（真机信号抖的时候调大）")
+        self.f_speed = QDoubleSpinBox()
+        self.f_speed.setRange(0.0, 720.0)
+        self.f_speed.setSingleStep(30.0)
+        self.f_speed.setDecimals(0)
+        self.f_speed.setValue(180.0)
+        self.f_speed.setSuffix(" °/s")
+        self.f_speed.setToolTip("每秒最多跟多少度（防真机跳变/毛刺把仿真甩出去）；0 = 不限")
+        self.f_timeout = QDoubleSpinBox()
+        self.f_timeout.setRange(0.2, 10.0)
+        self.f_timeout.setSingleStep(0.1)
+        self.f_timeout.setDecimals(2)
+        self.f_timeout.setValue(1.0)
+        self.f_timeout.setSuffix(" s")
+        self.f_timeout.setToolTip("多久没有新包就算掉线（看门狗：掉线就保持不动）")
+        card.add_row(QLabel("平滑"), self.f_smooth, QLabel("限速"), self.f_speed)
+        card.add_row(QLabel("看门狗"), self.f_timeout, None)
+        for w in (self.f_port, self.f_unit, self.f_smooth, self.f_speed, self.f_timeout):
+            w.setMaximumWidth(96)
+
+        card.add_row(self._btn("启动跟随", self.on_follow_start, name="Primary"),
+                     self._btn("停止跟随", self.on_follow_stop, name="Danger"),
+                     None,
+                     self._btn("读一次", self.on_follow_probe, name="Preset"))
+
+        self.follow_label = QLabel()
+        self.follow_label.setObjectName("Mono")
+        self.follow_label.setWordWrap(True)
+        self.follow_label.setMinimumHeight(132)
+        self.follow_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        card.add(self.follow_label)
+        return card
+
+    # ---- 真机跟随：按钮 / 每帧 / 显示
+    def follow_source(self) -> str:
+        """当前选的数据源（``auto`` / ``http`` / ``udp``）。"""
+        return link.SOURCES[self.f_source.currentIndex()]
+
+    def follow_config(self) -> dict:
+        """把卡片上的控件读成 :class:`robot_link.JointLink` 的构造参数。"""
+        return dict(source=self.follow_source(),
+                    http_url=self.f_url.text().strip(),
+                    port=int(self.f_port.value()),
+                    fmt=link.FORMATS[self.f_fmt.currentIndex()],
+                    unit=link.UNITS[self.f_unit.currentIndex()],
+                    mode=link.MODES[self.f_mode.currentIndex()],
+                    smooth=float(self.f_smooth.value()),
+                    max_speed_deg=float(self.f_speed.value()),
+                    timeout=float(self.f_timeout.value()))
+
+    def on_follow_start(self) -> None:
+        """「启动跟随」：起接收线程，之后主循环每帧把真机姿态下发到仿真。"""
+        if self.link is not None and self.link.running:
+            self.sim.log("真机跟随已经在跑了（要改参数先点「停止跟随」）")
+            return
+        cfg = self.follow_config()
+        self.follow_error = ""
+        if cfg["source"] in ("http", "auto") and not cfg["http_url"]:
+            self.follow_error = "HTTP 地址是空的（或者把数据源改成「UDP 广播」）"
+            self.link = None
+        else:
+            try:
+                new_link = link.JointLink(**cfg)
+                new_link.start()
+                self.link = new_link
+            except (link.RobotLinkError, OSError) as exc:
+                self.link = None
+                self.follow_error = f"{type(exc).__name__}: {exc}"
+        if self.link is None:
+            self.sim.log(f"真机跟随启动失败：{self.follow_error}")
+        else:
+            speed = "不限" if cfg["max_speed_deg"] <= 0 else f"{cfg['max_speed_deg']:.0f}°/s"
+            self.sim.log(f"真机跟随已启动：{self.link.describe_sources()}"
+                         f"（{link.MODE_LABELS[self.f_mode.currentIndex()]}，"
+                         f"平滑 {cfg['smooth']:.2f} s，限速 {speed}，"
+                         f"看门狗 {cfg['timeout']:.2f} s）")
+        self.refresh()
+
+    def on_follow_stop(self) -> None:
+        """「停止跟随」：收线程关掉，并**就地保持**当前姿态（不会掉下来）。"""
+        if self.link is None:
+            self.sim.log("真机跟随还没启动（没什么可停的）")
+            self.refresh()
+            return
+        name = self.link.describe_sources()
+        self.link.stop()
+        self.link = None
+        self.follow_out = None
+        self.sim.hold()
+        self.sim.log(f"真机跟随已停止（{name}）：就地保持当前姿态"
+                     f"（要回 home 按 H，或点「回 home」）")
+        self.refresh()
+
+    def on_follow_probe(self) -> None:
+        """「读一次」：不持续跟，先读一帧看看通不通（HTTP 专有；UDP 只能一直听）。"""
+        if self.follow_source() == "udp":
+            self.sim.log("UDP 只能持续听：点「启动跟随」后看卡片上的包率 / 延迟")
+            return
+        try:
+            st = link.HttpStateSource(self.f_url.text().strip(), timeout=1.5).poll_once()
+        except Exception as exc:  # noqa: BLE001
+            self.follow_error = f"{type(exc).__name__}: {exc}"
+            self.sim.log(f"「读一次」失败：{self.follow_error}")
+            self.refresh()
+            return
+        self.follow_error = ""
+        extra = "" if st.tcp() is None else f"，TCP {np.round(st.tcp(), 4).tolist()}"
+        self.sim.log(f"真机在线：q(deg) {np.round(st.deg, 2).tolist()}{extra}")
+        self.refresh()
+
+    def toggle_follow(self) -> None:
+        """键盘 ``F``：在「启动跟随 / 停止跟随」之间切。"""
+        if self.link is not None and self.link.running:
+            self.on_follow_stop()
+        else:
+            self.on_follow_start()
+
+    def follow_tick(self) -> None:
+        """主循环**每帧**调用（在推进物理之前）：把最近一帧真机姿态下发到仿真。"""
+        lk = self.link
+        if lk is None:
+            return
+        for line in lk.drain_notes():          # 链路自己的事件也写进日志
+            self.sim.log(line)
+        out = lk.update(self.sim.cmd)          # 映射 / 平滑 / 限速 / 看门狗
+        self.follow_out = out
+        if out.ok:
+            self.sim.follow(out.q_rad)
+
+    def shutdown(self) -> None:
+        """退出前收尾：把接收线程停掉（别留 socket / 线程）。"""
+        if self.link is not None:
+            self.link.stop()
+            self.link = None
+            self.follow_out = None
+
+    def _follow_text(self) -> str:
+        """卡片下半部分那几行状态：转发给模块级 :func:`follow_status_text`（自检也能用）。"""
+        return follow_status_text(self.sim, self.link, self.follow_out, self.follow_error)
+
+    # ------------------------------------------------------------ 3. 末端目标 / IK
     def _build_cartesian(self) -> Card:
         card = Card("末端目标 / IK（笛卡尔）",
                     "目标位置是世界系（米），默认就是 home 时工具尖的位置。「求解 IK」只算不动，"
@@ -718,7 +957,7 @@ class ControlPanel(QWidget):
         self.ik_label.setProperty("fail", not res.ok)
         restyle(self.ik_label)
 
-    # ------------------------------------------------------------ 3. 点位（示教 / 点到点）
+    # ------------------------------------------------------------ 4. 点位（示教 / 点到点）
     def _build_points(self) -> Card:
         card = Card("点位（示教 / 点到点）",
                     "「记录当前位姿」把当前工具尖 + 工具轴存成一条点位；「走到选中点」让工具尖沿"
@@ -772,7 +1011,7 @@ class ControlPanel(QWidget):
         self.point_list.clear()
         self.sim.log("点位已清空")
 
-    # ------------------------------------------------------------ 4. 运行 / 伺服
+    # ------------------------------------------------------------ 5. 运行 / 伺服
     def _build_run(self) -> Card:
         card = Card("运行 / 伺服",
                     "运动时长作用在「点到点 / 直线运动」上（smoothstep，首尾速度 0）；"
@@ -864,7 +1103,7 @@ class ControlPanel(QWidget):
         else:
             self.sim.log("存图失败：还没有渲染过画面")
 
-    # ------------------------------------------------------------ 5. 日志
+    # ------------------------------------------------------------ 6. 日志
     def _build_log(self) -> Card:
         card = Card("日志", "动作和**实测**到位精度都记在这里（同一份也打印到终端）。")
         self.log_text = QPlainTextEdit()
@@ -885,12 +1124,13 @@ class ControlPanel(QWidget):
 
     # ------------------------------------------------------------ 刷新（主循环调用）
     def refresh(self) -> None:
-        """按 ~5 Hz 由主循环调用：目标角 / 实测角 / 进度条 跟仿真状态对齐。"""
+        """按 ~5 Hz 由主循环调用：目标角 / 实测角 / 进度条 / 真机跟随体检 跟状态对齐。"""
         st = self.sim.status()
         for i, row in enumerate(self.joint_rows):
             row["val"].setText(f"{st['cmd_deg'][i]:+.1f}°")
             row["act"].setText(f"({st['q_deg'][i]:+.1f}°)")
         self.bar.setValue(int(round(st["progress"] * 1000)))
+        self.follow_label.setText(self._follow_text())
 
     def nudge_selected(self, sign: float) -> None:
         """键盘 ``-`` / ``=``：给选中关节 ± 一个步长。"""
@@ -899,7 +1139,7 @@ class ControlPanel(QWidget):
 
 # =============================================================== 主窗口
 MODE_NAMES = {"joint": "单关节", "p2p": "关节点到点", "cartesian": "笛卡尔直线",
-              "hold": "急停保持"}
+              "hold": "急停保持", "follow": "真机跟随"}
 
 
 class RevA1Window(QMainWindow):
@@ -960,12 +1200,14 @@ class RevA1Window(QMainWindow):
         self.st_tip = QLabel()
         self.st_axis = QLabel()
         self.st_track = QLabel()
+        self.st_follow = QLabel()
         self.st_perf = QLabel()
         self.st_hint = QLabel("左键旋转 · 右键平移 · 滚轮缩放 · 空格暂停 · H 回 home · "
-                              "1..6 选关节 · −/= 微调")
+                              "F 真机跟随 · 1..6 选关节 · −/= 微调")
         self.st_hint.setObjectName("Hint")
         bar.addWidget(self.st_hint, 1)
-        for w in (self.st_mode, self.st_tip, self.st_axis, self.st_track, self.st_perf):
+        for w in (self.st_mode, self.st_tip, self.st_axis, self.st_track, self.st_follow,
+                  self.st_perf):
             w.setObjectName("Sub")
             bar.addPermanentWidget(w)
 
@@ -978,14 +1220,24 @@ class RevA1Window(QMainWindow):
         self.st_tip.setText(f"工具尖 {vec_str(st['tip'])} · 离地 {st['height']:.3f} m")
         self.st_axis.setText(f"工具轴 {vec_str(st['axis'], 2)}")
         self.st_track.setText(f"跟踪误差 {st['track_deg']:.3f}° · 接触 {st['contacts']} 对")
+        lk = self.panel.link
+        if lk is None:
+            self.st_follow.setText("真机跟随 关")
+        else:
+            age = lk.age()
+            delay = "—" if age == float("inf") else f"{age * 1000:.0f} ms"
+            n_pkt, n_err = lk.packets()
+            self.st_follow.setText(f"真机 {lk.rate_text()} · 延迟 {delay} · "
+                                   f"包 {n_pkt} / 错 {n_err}")
         self.st_perf.setText(f"{self.r_fps:.1f} fps（渲染 {self.view.render_ms:.0f} ms）")
 
     # ------------------------------------------------------------ 主循环
     def _advance(self) -> None:
-        """推进一帧：物理（按真实时间补步）→ 日志 → 渲染 → 面板/状态栏。"""
+        """推进一帧：真机跟随下发目标 → 物理（按真实时间补步）→ 日志 → 渲染 → 面板/状态栏。"""
         t0 = time.perf_counter()
         dt_wall = min(t0 - self.t_last, 0.25)      # 卡顿时最多补 0.25 s，别一次算几百步
         self.t_last = t0
+        self.panel.follow_tick()                   # 真机跟随：先更新目标，再推进物理
         if not self.paused:
             self.acc += dt_wall
             n = 0
@@ -1036,7 +1288,7 @@ class RevA1Window(QMainWindow):
             super().keyPressEvent(ev)
             return
         key, txt = ev.key(), (ev.text() or "")
-        if ev.isAutoRepeat() and (txt.lower() in ("h", "r", "g") or key == Qt.Key_Escape):
+        if ev.isAutoRepeat() and (txt.lower() in ("h", "r", "g", "f") or key == Qt.Key_Escape):
             return
         if Qt.Key_1 <= key <= Qt.Key_6:
             self.panel.select_joint(key - Qt.Key_1)
@@ -1061,6 +1313,9 @@ class RevA1Window(QMainWindow):
             return
         if txt.lower() == "g":
             self.toggle_gravity()
+            return
+        if txt.lower() == "f":
+            self.panel.toggle_follow()
             return
         if key == Qt.Key_S and (ev.modifiers() & Qt.ControlModifier):
             self.panel.on_snapshot()
@@ -1097,6 +1352,7 @@ class RevA1Window(QMainWindow):
             return
         self.closed = True
         self.timer.stop()
+        self.panel.shutdown()      # 真机跟随的接收线程 / socket
         self.view.close()          # 必须显式释放 GL 上下文
         super().close()
 
@@ -1292,6 +1548,54 @@ def run_selftest(args) -> int:
           bool(np.allclose(core.interp_axis((0, 0, -1), (1, 0, 0), 0.0), (0, 0, -1)))
           and bool(np.allclose(core.interp_axis((0, 0, -1), (1, 0, 0), 1.0), (1, 0, 0))))
 
+    # 9) 真机跟随全链路：假真机（HTTP，带 MuJoCo 正运动学算的 pose）→ JointLink → ArmSim
+    q_real = np.array([0.35, -1.30, -2.10, -0.60, 1.45, -2.10])
+    q_wave = np.radians([3.0, -3.0, 2.0, -2.0, 2.0, -2.0])
+
+    def q_fn(t):
+        """真机在慢慢动（±3°、0.3 Hz）：要跟得住**运动**，不只是停在某一点。"""
+        return q_real + q_wave * math.sin(2.0 * math.pi * 0.3 * t)
+
+    fk_model = mujoco.MjModel.from_xml_path(str(spec.SCENE_XML))
+    fk_data = mujoco.MjData(fk_model)
+    fk_site = mujoco.mj_name2id(fk_model, mujoco.mjtObj.mjOBJ_SITE, "tool_site")
+
+    def pose_fn(qq):
+        """用模型正运动学造一帧真机 pose（位置 + 外旋 XYZ 欧拉角），误差链也能一起测。"""
+        fk_data.qpos[:6] = qq
+        mujoco.mj_forward(fk_model, fk_data)
+        R = fk_data.site_xmat[fk_site].reshape(3, 3)
+        ry = math.asin(-float(np.clip(R[2, 0], -1.0, 1.0)))
+        rx = math.atan2(float(R[2, 1]), float(R[2, 2]))
+        rz = math.atan2(float(R[1, 0]), float(R[0, 0]))
+        return list(fk_data.site_xpos[fk_site]) + [rx, ry, rz]
+
+    server = link.FakeStateServer(q_fn=q_fn, pose_fn=pose_fn).start()
+    follow_sim = core.ArmSim(args.scene, move_seconds=args.move_time, log_scene=False)
+    lk = link.JointLink(source="http", http_url=server.url, smooth=0.0, timeout=2.0)
+    lk.start()
+    t_end = time.perf_counter() + 2.5
+    while time.perf_counter() < t_end:
+        out = lk.update(follow_sim.cmd)
+        if out.ok:
+            follow_sim.follow(out.q_rad)
+        follow_sim.step()
+    server.stop()
+    now = time.time()
+    err_deg = float(np.degrees(np.abs(follow_sim.q_pos() - q_fn(now))).max())
+    check("真机跟随：仿真关节实时跟上真机（运动中 < 3°）", err_deg < 3.0,
+          f"最大差 {err_deg:.3f}°（真机此刻 {np.round(np.degrees(q_fn(now)), 1).tolist()}°）")
+    check("真机跟随：仿真进入 follow 模式", follow_sim.mode == "follow", follow_sim.mode)
+    tcp_err = float(np.linalg.norm(follow_sim.tip() - np.asarray(pose_fn(q_fn(now))[:3]))) * 1000.0
+    check("真机跟随：工具尖 ↔ 真机 TCP < 8 mm", tcp_err < 8.0, f"{tcp_err:.2f} mm")
+    check("真机跟随：数据率 > 10 Hz", lk.rate_hz() > 10.0, lk.rate_text())
+    txt = follow_status_text(follow_sim, lk, out, "")
+    check("真机跟随：卡片体检文本成形（延迟 / 包率 / 误差）",
+          ("Hz" in txt) and ("延迟" in txt) and ("TCP" in txt) and ("工具轴" in txt),
+          txt.splitlines()[1] if len(txt.splitlines()) > 1 else txt)
+    lk.stop()
+    check("真机跟随：停止后接收线程退出", not lk.running and not lk.sources)
+
     print("-" * 78)
     if fails:
         print(f"结论：{len(fails)} 项失败 -> {fails}")
@@ -1433,6 +1737,26 @@ def run_ui_test(args) -> int:
     check("日志面板有内容", len(panel.log_text.toPlainText()) > 60,
           f"{len(panel.log_text.toPlainText())} 字符")
 
+    # 真机跟随卡片：控件齐全 + 启停不崩（用 UDP 收一个没人发的端口，不碰真机）
+    check("真机跟随卡片：控件齐全（数据源 / 地址 / 端口）",
+          panel.f_source.count() == len(link.SOURCE_LABELS)
+          and panel.f_port.value() == int(link.DEFAULT_UDP_PORT)
+          and panel.f_url.text() == link.DEFAULT_HTTP_URL)
+    panel.f_source.setCurrentIndex(link.SOURCES.index("udp"))
+    panel.f_port.setValue(link.free_udp_port())
+    panel.on_follow_start()
+    win.pump(0.4)
+    check("真机跟随：启动后接收线程在跑",
+          panel.link is not None and panel.link.running,
+          panel.link.describe_sources() if panel.link is not None else "")
+    txt = panel.follow_label.text()
+    check("真机跟随：没数据时卡片给提示（不崩）",
+          ("还没收到数据" in txt) or ("看门狗" in txt), txt.splitlines()[0] if txt else "")
+    panel.on_follow_stop()
+    win.pump(0.2)
+    check("真机跟随：停止后链路释放、姿态就地保持",
+          panel.link is None and win.sim.mode == "hold", win.sim.mode)
+
     win.close()
     print("-" * 78)
     if fails:
@@ -1453,10 +1777,18 @@ def run_gui(args) -> int:
     print(f"关节顺序 : {spec.JOINTS}")
     print(f"home qpos: {np.round(spec.HOME_QPOS, 4)}")
     print("鼠标     : 左键拖动=转视角  右键拖动=平移  滚轮=推拉  双击=复位视角")
-    print("键盘     : 空格=暂停  H=回 home  R=复位  G=重力  1..6=选关节  −/=±一个步长  "
-          "Ctrl+S=存图  ESC=退出")
-    print("面板     : ① 关节 −/+ 微调  ② 末端目标 / IK  ③ 点位（示教点到点）"
-          "  ④ 运行 / 伺服  ⑤ 日志")
+    print("键盘     : 空格=暂停  H=回 home  R=复位  G=重力  F=真机跟随  1..6=选关节  "
+          "−/=±一个步长  Ctrl+S=存图  ESC=退出")
+    print("面板     : ① 关节 −/+ 微调  ② 真机跟随（UDP 广播 / HTTP 状态）  ③ 末端目标 / IK"
+          "  ④ 点位（示教点到点）  ⑤ 运行 / 伺服  ⑥ 日志")
+    if args.follow_source:
+        win.panel.f_source.setCurrentIndex(link.SOURCES.index(args.follow_source))
+    if args.follow_url:
+        win.panel.f_url.setText(args.follow_url)
+    if args.follow_port:
+        win.panel.f_port.setValue(int(args.follow_port))
+    if args.follow:
+        win.panel.on_follow_start()
     return QApplication.instance().exec() if not args.exit_after else _exec(win)
 
 
@@ -1489,6 +1821,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--ui-test", action="store_true", help="建窗口 → 脚本化点一遍控件 → 存图 → 退出")
     ap.add_argument("--exit-after", type=float, default=0.0,
                     help="开窗口跑这么多秒后自动退出（自动化 / 截图用）")
+    ap.add_argument("--follow", action="store_true",
+                    help="启动时自动开「真机跟随」（用卡片里的默认值：UDP 6001 + HTTP 8080）")
+    ap.add_argument("--follow-source", default="", choices=("",) + link.SOURCES,
+                    help="覆盖跟随的数据源（auto/http/udp）")
+    ap.add_argument("--follow-url", default="", help="覆盖真机 HTTP 状态接口")
+    ap.add_argument("--follow-port", type=int, default=0, help="覆盖真机 UDP 广播端口")
     ap.add_argument("--snapshot-dir", default=str(here / "runs"), help="存图目录")
     args = ap.parse_args(argv)
 
