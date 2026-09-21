@@ -562,10 +562,9 @@ SCENE_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
   <asset>
     <texture name="{name}_sky" type="skybox" builtin="gradient"
              rgb1="0.28 0.40 0.56" rgb2="0.04 0.06 0.09" width="256" height="256"/>
-    <texture name="{name}_floor_tex" type="2d" builtin="checker"
-             rgb1="0.26 0.27 0.29" rgb2="0.20 0.21 0.23" width="256" height="256"/>
-    <material name="{name}_floor_mat" texture="{name}_floor_tex" texrepeat="16 16"
-              reflectance="0.03"/>
+    <texture name="{name}_floor_tex" type="2d" file="revA1_floor_grid.png"/>
+    <material name="{name}_floor_mat" texture="{name}_floor_tex"
+              reflectance="0.05"/>
     <material name="{name}_target_mat" rgba="0.15 0.80 0.35 0.55"/>
   </asset>
 

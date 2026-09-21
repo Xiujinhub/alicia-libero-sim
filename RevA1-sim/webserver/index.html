@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RevA1-sim 画面</title>
+<style>
+  :root { --bg:#0b0f14; --fg:#e7edf4; --dim:#8296a8; --accent:#2ba48c; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+               font-family:"Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif; }
+  #wrap { position:fixed; inset:0; display:flex; flex-direction:column; }
+  #bar { display:flex; align-items:center; gap:14px; padding:8px 14px;
+         background:#12161c; border-bottom:1px solid #262f3a; font-size:13px; }
+  #bar .title { font-weight:600; color:#6fd3bd; }
+  #bar .dim { color:var(--dim); }
+  #stage { flex:1; position:relative; overflow:hidden; background:#000; cursor:grab; }
+  #stage.dragging { cursor:grabbing; }
+  #stage img { width:100%; height:100%; object-fit:contain; user-select:none;
+               -webkit-user-drag:none; pointer-events:none; }
+  #hint { position:absolute; left:12px; bottom:12px; color:var(--dim); font-size:12px;
+          pointer-events:none; }
+  #status { font-variant-numeric:tabular-nums; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="bar">
+    <span class="title">RevA1-sim 画面</span>
+    <span class="dim" id="scene"></span>
+    <span style="flex:1"></span>
+    <span class="dim" id="status">连接中…</span>
+  </div>
+  <div id="stage">
+    <img id="stream" src="/stream" alt="MuJoCo 画面">
+    <div id="hint">左键拖动旋转 · 滚轮缩放 · 双击复位视角</div>
+  </div>
+</div>
+<script>
+(function () {
+  const stage = document.getElementById('stage');
+  const statusEl = document.getElementById('status');
+  const sceneEl = document.getElementById('scene');
+
+  // —— 视角：拖动旋转 / 滚轮缩放 / 双击复位 ——
+  let dragging = false, lastX = 0, lastY = 0;
+  stage.addEventListener('mousedown', (e) => {
+    dragging = true; lastX = e.clientX; lastY = e.clientY;
+    stage.classList.add('dragging');
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    fetch(`/cam/orbit?dx=${dx}&dy=${dy}`).catch(() => {});
+  });
+  window.addEventListener('mouseup', () => {
+    dragging = false; stage.classList.remove('dragging');
+  });
+  stage.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    fetch(`/cam/zoom?n=${e.deltaY / 120}`).catch(() => {});
+  }, { passive:false });
+  stage.addEventListener('dblclick', () => {
+    fetch('/cam/reset').catch(() => {});
+  });
+
+  // —— 状态轮询 ——
+  setInterval(async () => {
+    try {
+      const s = await (await fetch('/status')).json();
+      statusEl.textContent = `${s.fps.toFixed(0)} fps · 渲染 ${s.render_ms.toFixed(0)} ms`
+        + ` · ${s.follow ? '真机跟随' : '离线'}` + (s.task ? ' · 任务中' : '');
+      if (sceneEl.textContent !== s.scene) sceneEl.textContent = s.scene;
+    } catch (e) { statusEl.textContent = '离线'; }
+  }, 1000);
+})();
+</script>
+</body>
+</html>
