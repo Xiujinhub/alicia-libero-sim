@@ -64,15 +64,15 @@ from gl_backend import configure_gl
 configure_gl()
 import mujoco  # noqa: E402  (必须在设置 MUJOCO_GL 之后)
 
-from PySide6.QtCore import Qt, QTimer  # noqa: E402
+from PySide6.QtCore import Qt, QTimer, Signal  # noqa: E402
 from PySide6.QtGui import (QColor, QFont, QFontDatabase, QImage,  # noqa: E402
                            QPainter, QPixmap)
 from PySide6.QtTest import QTest  # noqa: E402  (UI 自检里模拟真实按键)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,  # noqa: E402
-                               QDoubleSpinBox, QFrame, QGridLayout, QHBoxLayout,
+                               QFrame, QGridLayout, QHBoxLayout,
                                QLabel, QLineEdit, QListWidget, QListWidgetItem,
                                QMainWindow, QPlainTextEdit, QProgressBar, QPushButton,
-                               QScrollArea, QSizePolicy, QSlider, QSpinBox, QSplitter,
+                               QScrollArea, QSizePolicy, QSlider, QSplitter,
                                QVBoxLayout, QWidget)
 
 import arm_core as core  # noqa: E402
@@ -137,9 +137,14 @@ QPushButton#Step { min-width: 30px; max-width: 30px; padding: 2px 0; font-size: 
                    font-weight: 700; }
 QPushButton#Tiny { min-width: 24px; max-width: 24px; padding: 1px 0; }
 QPushButton#Preset { padding: 4px 8px; font-size: 12px; }
-QDoubleSpinBox, QSpinBox, QComboBox, QLineEdit { background: #101720; border: 1px solid #2c3743;
-                                       border-radius: 5px; padding: 3px 6px; }
-QDoubleSpinBox:focus, QSpinBox:focus, QComboBox:focus, QLineEdit:focus { border-color: #2ba48c; }
+QComboBox, QLineEdit { background: #101720; border: 1px solid #2c3743;
+                       border-radius: 5px; padding: 3px 6px; }
+QComboBox:focus, QLineEdit:focus { border-color: #2ba48c; }
+QLabel#NumBox { background: #101720; border: 1px solid #2c3743; border-radius: 5px;
+                padding: 3px 6px; color: #eaf3fb;
+                font-family: "Consolas", "Cascadia Mono", monospace; }
+QPushButton#NumBtn { min-width: 22px; max-width: 22px; padding: 1px 0; font-size: 13px;
+                     font-weight: 700; border-radius: 5px; }
 QComboBox::drop-down { border: 0; width: 16px; }
 QComboBox QAbstractItemView { background: #161d26; border: 1px solid #2c3743;
                               selection-background-color: #1f7f6e; }
@@ -256,6 +261,98 @@ class Card(QFrame):
                 row.addLayout(w)
         self.body.addLayout(row)
         return row
+
+
+class NumBox(QWidget):
+    """数字输入框：``[-] 数值 [+]``（替代 QSpinBox / QDoubleSpinBox）。
+
+    * 上/下箭头改成 ``+`` / ``−`` 按钮（RepeatButton：按住连发）；
+    * 数值是只读 QLabel，天然不响应鼠标滚轮 → 不会再被滚轮误改；
+    * 保留了 spinbox 常用的 setter 链，替换时其它调用不用改。
+    """
+
+    valueChanged = Signal(float)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._lo = -1e9
+        self._hi = 1e9
+        self._step = 1.0
+        self._decimals = 0
+        self._suffix = ""
+        self._value = 0.0
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self._minus = RepeatButton("−", self._dec)
+        self._plus = RepeatButton("+", self._inc)
+        for b in (self._minus, self._plus):
+            b.setObjectName("NumBtn")
+            b.setFixedWidth(22)
+            b.setFocusPolicy(Qt.NoFocus)
+            b.setCursor(Qt.PointingHandCursor)
+        self._label = QLabel()
+        self._label.setObjectName("NumBox")
+        self._label.setAlignment(Qt.AlignCenter)
+        self._label.setFocusPolicy(Qt.NoFocus)
+        lay.addWidget(self._minus)
+        lay.addWidget(self._label, 1)
+        lay.addWidget(self._plus)
+        self._refresh()
+
+    # ---------------------------------------------------------- 兼容 spinbox 的 setter 链
+    def setRange(self, lo: float, hi: float) -> "NumBox":
+        self._lo, self._hi = float(lo), float(hi)
+        self._clamp()
+        return self
+
+    def setSingleStep(self, step: float) -> "NumBox":
+        self._step = float(step)
+        return self
+
+    def setDecimals(self, d: int) -> "NumBox":
+        self._decimals = int(d)
+        self._refresh()
+        return self
+
+    def setSuffix(self, s: str) -> "NumBox":
+        self._suffix = str(s)
+        self._refresh()
+        return self
+
+    def setValue(self, v: float) -> "NumBox":
+        self._value = float(v)
+        if self._decimals == 0:
+            self._value = float(round(self._value))
+        self._clamp()
+        self._refresh()
+        return self
+
+    def value(self) -> float:
+        return self._value
+
+    # ---------------------------------------------------------- 内部
+    def _inc(self) -> None:
+        self._step_by(+1.0)
+
+    def _dec(self) -> None:
+        self._step_by(-1.0)
+
+    def _step_by(self, sign: float) -> None:
+        self._value = float(round(self._value + sign * self._step, self._decimals))
+        self._clamp()
+        self._refresh()
+        self.valueChanged.emit(self._value)
+
+    def _clamp(self) -> None:
+        self._value = float(np.clip(self._value, self._lo, self._hi))
+
+    def _refresh(self) -> None:
+        if self._decimals == 0:
+            txt = f"{int(self._value)}{self._suffix}"
+        else:
+            txt = f"{self._value:.{self._decimals}f}{self._suffix}"
+        self._label.setText(txt)
 
 
 # =============================================================== 画面区
@@ -612,7 +709,7 @@ class ControlPanel(QWidget):
         row.addStretch(1)
         card.add_row(row)
 
-        self.tool_width = QDoubleSpinBox()
+        self.tool_width = NumBox()
         self.tool_width.setRange(1.0, 12.0)
         self.tool_width.setSingleStep(0.5)
         self.tool_width.setDecimals(1)
@@ -699,9 +796,12 @@ class ControlPanel(QWidget):
         self.f_source.addItems(link.SOURCE_LABELS)
         self.f_source.setCurrentIndex(link.SOURCES.index("auto"))
         self.f_source.setToolTip("自动 = HTTP 与 UDP 同时开，哪路新用哪路（推荐）")
+        self.f_source.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.f_source.setMaximumWidth(180)
         self.f_fmt = QComboBox()
         self.f_fmt.addItems(link.FORMAT_LABELS)
         self.f_fmt.setToolTip("UDP 报文的格式；真机是 JSON，认不出来就换这里试")
+        self.f_fmt.setMaximumWidth(96)
         card.add_row(QLabel("数据源"), self.f_source, QLabel("报文"), self.f_fmt)
 
         self.f_url = QLineEdit(link.DEFAULT_HTTP_URL)
@@ -709,7 +809,7 @@ class ControlPanel(QWidget):
         self.f_url.setMinimumWidth(150)
         card.add_row(QLabel("HTTP"), self.f_url)
 
-        self.f_port = QSpinBox()
+        self.f_port = NumBox()
         self.f_port.setRange(1, 65535)
         self.f_port.setValue(int(link.DEFAULT_UDP_PORT))
         self.f_port.setToolTip("真机 UDP 广播端口（本机实测往 6001 发）")
@@ -723,21 +823,21 @@ class ControlPanel(QWidget):
         self.f_mode.setToolTip("绝对 = 完全镜像真机姿态；相对 = 只镜像增量（两边本来就不同姿时用）")
         card.add_row(QLabel("映射"), self.f_mode)
 
-        self.f_smooth = QDoubleSpinBox()
+        self.f_smooth = NumBox()
         self.f_smooth.setRange(0.0, 0.5)
         self.f_smooth.setSingleStep(0.02)
         self.f_smooth.setDecimals(2)
         self.f_smooth.setValue(0.08)
         self.f_smooth.setSuffix(" s")
         self.f_smooth.setToolTip("0 = 最跟手；越大越平滑但滞后（真机信号抖的时候调大）")
-        self.f_speed = QDoubleSpinBox()
+        self.f_speed = NumBox()
         self.f_speed.setRange(0.0, 720.0)
         self.f_speed.setSingleStep(30.0)
         self.f_speed.setDecimals(0)
         self.f_speed.setValue(180.0)
         self.f_speed.setSuffix(" °/s")
         self.f_speed.setToolTip("每秒最多跟多少度（防真机跳变/毛刺把仿真甩出去）；0 = 不限")
-        self.f_timeout = QDoubleSpinBox()
+        self.f_timeout = NumBox()
         self.f_timeout.setRange(0.2, 10.0)
         self.f_timeout.setSingleStep(0.1)
         self.f_timeout.setDecimals(2)
@@ -768,7 +868,7 @@ class ControlPanel(QWidget):
                     "真机开始/结束作业时往 **UDP 6501** 广播 ``{\"motion\": \"start\"}`` / "
                     "``{\"motion\": \"over\"}``。收到 start 就把勾上的工具尖连成轨迹（随机械臂长出来），"
                     "收到 over 就立刻清空。")
-        self.t_task_port = QSpinBox()
+        self.t_task_port = NumBox()
         self.t_task_port.setRange(1, 65535)
         self.t_task_port.setValue(int(link.DEFAULT_TASK_PORT))
         self.t_task_port.setMaximumWidth(96)
@@ -992,12 +1092,13 @@ class ControlPanel(QWidget):
         if self.c_cloud.count() == 0:
             self.c_cloud.addItem("（point_cloud/ 里还没有文件）", "")
         self.c_cloud.setToolTip("point_cloud/ 下的点云（*.json：3D 点 或 16 位深度图；也认 *.npy）")
+        self.c_cloud.setMaximumWidth(200)
         card.add_row(QLabel("点云"), self.c_cloud, self._btn("刷新", self.on_cloud_refresh, name="Preset"))
 
         self.c_pose = QLineEdit(pc.pose_text(pc.DEFAULT_POSE))
         self.c_pose.setToolTip("拍摄姿态：x y z(mm) + rx ry rz(deg)（= 真机 pose 的 6 个数）")
-        card.add_row(QLabel("拍摄姿态"), self.c_pose,
-                     self._btn("取真机姿态", self.on_cloud_pose_from_robot, name="Preset"))
+        card.add_row(QLabel("拍摄姿态"), self.c_pose)
+        card.add_row(self._btn("取真机姿态", self.on_cloud_pose_from_robot, name="Preset"), None)
 
         self.c_calib = QLineEdit(str(pc.DEFAULT_EXTRINSIC))
         self.c_calib.setToolTip("手眼标定（OpenCV XML 里的 R / t：相机 → 末端，单位 mm）")
@@ -1012,7 +1113,7 @@ class ControlPanel(QWidget):
         self.c_ref = QComboBox()
         self.c_ref.addItems(["TCP（工具尖）", "法兰（ee_site）"])
         self.c_ref.setToolTip("标定矩阵是相对哪个点算的（真机 pose 报的是工具尖）")
-        self.c_cart = QDoubleSpinBox()
+        self.c_cart = NumBox()
         self.c_cart.setRange(0.0, 2.5)
         self.c_cart.setSingleStep(0.05)
         self.c_cart.setDecimals(2)
@@ -1021,8 +1122,8 @@ class ControlPanel(QWidget):
         self.c_cart.setToolTip("机械臂装在小车上，基座离地多高（地面就铺在这个高度）")
         self.c_show_cart = QCheckBox("画小车")
         self.c_show_cart.setChecked(True)
-        self.c_cart_x = QDoubleSpinBox()
-        self.c_cart_y = QDoubleSpinBox()
+        self.c_cart_x = NumBox()
+        self.c_cart_y = NumBox()
         for w, v in ((self.c_cart_x, float(pc.DEFAULT_CART_CENTER_MM[0])),
                      (self.c_cart_y, float(pc.DEFAULT_CART_CENTER_MM[1]))):
             w.setRange(-500.0, 500.0)
@@ -1041,32 +1142,31 @@ class ControlPanel(QWidget):
                                      "勾上就显示（对当前场景立刻生效，切场景也记着）")
         self.c_target_pad.stateChanged.connect(lambda _s: self._apply_pad_visibility())
         card.add_row(QLabel("参考点"), self.c_ref, QLabel("小车高"), self.c_cart)
-        card.add_row(QLabel("小车中心"), self.c_cart_x, self.c_cart_y,
-                     QLabel("（基座系，+150/+150 = 靠左前缘）"))
-        card.add_row(self.c_show_cart, self.c_target_pad, QLabel("（不画车 / 显示绿圆盘）"))
+        card.add_row(QLabel("小车中心"), self.c_cart_x, self.c_cart_y, None)
+        card.add_row(self.c_show_cart, self.c_target_pad, None)
 
-        self.c_points = QSpinBox()
+        self.c_points = NumBox()
         self.c_points.setRange(0, 200000)
         self.c_points.setSingleStep(5000)
         self.c_points.setValue(int(pc.DEFAULT_MAX_POINTS))
         self.c_points.setToolTip("点数上限（0 = 不抽稀）；整云 8 万点也能跑，就是网格文件大一些")
-        self.c_size = QDoubleSpinBox()
+        self.c_size = NumBox()
         self.c_size.setRange(1.0, 20.0)
         self.c_size.setSingleStep(0.5)
         self.c_size.setDecimals(1)
         self.c_size.setValue(float(pc.DEFAULT_POINT_R_MM))
         self.c_size.setSuffix(" mm")
         self.c_size.setToolTip("每个点画多大（点越稀疏就开大一点，看起来才是连续的面）")
-        self.c_bands = QSpinBox()
+        self.c_bands = NumBox()
         self.c_bands.setRange(0, 8)
         self.c_bands.setValue(int(pc.DEFAULT_BANDS))
         self.c_bands.setToolTip("按深度分几带颜色（近红 → 远紫）；1 = 单色，0 = 也当单色")
         card.add_row(QLabel("点数上限"), self.c_points, QLabel("点大小"), self.c_size)
         card.add_row(QLabel("深度分色"), self.c_bands, None, QLabel("（近红 → 远紫）"))
 
-        self.c_dx = QDoubleSpinBox()
-        self.c_dy = QDoubleSpinBox()
-        self.c_dz = QDoubleSpinBox()
+        self.c_dx = NumBox()
+        self.c_dy = NumBox()
+        self.c_dz = NumBox()
         for w in (self.c_dx, self.c_dy, self.c_dz):
             w.setRange(-500.0, 500.0)
             w.setSingleStep(10.0)
@@ -1074,7 +1174,7 @@ class ControlPanel(QWidget):
             w.setSuffix(" mm")
             w.setMaximumWidth(96)
             w.setToolTip("手动微调：把整片点云沿基座 xyz 平移（标定有残差时用）")
-        self.c_yaw = QDoubleSpinBox()
+        self.c_yaw = NumBox()
         self.c_yaw.setRange(-180.0, 180.0)
         self.c_yaw.setSingleStep(1.0)
         self.c_yaw.setDecimals(1)
@@ -1263,7 +1363,7 @@ class ControlPanel(QWidget):
         card = Card("末端目标 / IK（笛卡尔）",
                     "目标位置是世界系（米），默认就是 home 时工具尖的位置。「求解 IK」只算不动，"
                     "并把目标点标在画面里；「求解并沿直线运动」先解、再让工具尖沿直线走过去。")
-        self.pos_spins: list[QDoubleSpinBox] = []
+        self.pos_spins: list[NumBox] = []
         for r, (nm, val) in enumerate(zip("XYZ", spec.TARGET_POSE)):
             tag = QLabel(nm)
             tag.setObjectName("Tag")
@@ -1284,7 +1384,7 @@ class ControlPanel(QWidget):
         self.axis_box = QComboBox()
         self.axis_box.addItems([name for name, _ in AXIS_CHOICES])
         self.axis_box.currentIndexChanged.connect(self.on_axis_choice)
-        self.axis_spins: list[QDoubleSpinBox] = []
+        self.axis_spins: list[NumBox] = []
         for nm, val in zip("XYZ", (0.0, 0.0, -1.0)):
             spin = self._pos_spin(val, f"工具轴方向分量 {nm}（选「自定义」时生效）")
             spin.setDecimals(2)
@@ -1321,8 +1421,8 @@ class ControlPanel(QWidget):
         self.on_axis_choice()
         return card
 
-    def _pos_spin(self, value: float, tip: str) -> QDoubleSpinBox:
-        spin = QDoubleSpinBox()
+    def _pos_spin(self, value: float, tip: str) -> NumBox:
+        spin = NumBox()
         spin.setRange(-1.5, 1.5)
         spin.setDecimals(3)
         spin.setSingleStep(0.01)
@@ -1470,7 +1570,7 @@ class ControlPanel(QWidget):
         card = Card("运行 / 伺服",
                     "运动时长作用在「点到点 / 直线运动」上（smoothstep，首尾速度 0）；"
                     "急停 = 就地保持当前姿态（指令钉在实测角上，不会掉下来）。")
-        self.dur_spin = QDoubleSpinBox()
+        self.dur_spin = NumBox()
         self.dur_spin.setRange(0.2, 10.0)
         self.dur_spin.setSingleStep(0.1)
         self.dur_spin.setDecimals(2)
@@ -1743,7 +1843,7 @@ class RevA1Window(QMainWindow):
         1. 输入框里按键（数字、负号）**不能抢** —— 否则在位置上打 "-0.05" 会被当成快捷键；
         2. 一次性动作（回 home / 复位 / 重力）要挡掉自动重复，不然按住键会刷爆动作。
         """
-        if isinstance(QApplication.focusWidget(), (QDoubleSpinBox, QPlainTextEdit)):
+        if isinstance(QApplication.focusWidget(), (QLineEdit, QPlainTextEdit)):
             super().keyPressEvent(ev)
             return
         key, txt = ev.key(), (ev.text() or "")
