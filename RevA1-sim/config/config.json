@@ -1,6 +1,6 @@
 {
     "_comment": "RevA1-sim 全局配置：路径 + 默认配置。相对路径以 RevA1-sim/ 为基准。",
     "point_cloud_dir": "point_cloud",
-    "point_cloud_file": "point_cloud/sink_1_o2e.json",
+    "point_cloud_file": "point_cloud/sink_6_o2e.json",
     "jetson_ip": "192.168.66.169"
 }

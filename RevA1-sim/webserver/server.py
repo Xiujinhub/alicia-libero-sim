@@ -14,6 +14,7 @@
     python webserver/server.py --follow             # 再接真机跟随（真机动 → 画面跟着动）
     python webserver/server.py --task-listen        # 监听 6501 任务信号：start 记轨迹 / over 清空
     python webserver/server.py --port 8080 --width 960 --height 600 --fps 30
+    python webserver/server.py --point-cloud --follow --task-listen
 
 然后浏览器打开 ``http://127.0.0.1:8080/``。
 
@@ -391,7 +392,7 @@ def main(argv=None) -> int:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("--host", default="0.0.0.0", help="监听地址")
     ap.add_argument("--port", type=int, default=8080, help="监听端口")
-    ap.add_argument("--width", type=int, default=960, help="渲染宽度[px]")
+    ap.add_argument("--width", type=int, default=1280, help="渲染宽度[px]")
     ap.add_argument("--height", type=int, default=600, help="渲染高度[px]")
     ap.add_argument("--fps", type=float, default=30.0, help="渲染/推流帧率上限")
     ap.add_argument("--distance", type=float, default=2.5, help="相机距离[m]")
