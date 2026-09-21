@@ -1047,6 +1047,10 @@ def build_multi_cloud_scene(groups=None, *, extrinsic=DEFAULT_EXTRINSIC, intrins
         report.append(f"{label}｜拍照位姿 {pose_text(pose6)}｜{len(grp['files'])} 份点云合并 "
                       f"{pts_g.shape[0]} 点｜基座系 x[{lo[0]:.2f},{hi[0]:.2f}] "
                       f"y[{lo[1]:.2f},{hi[1]:.2f}] z[{lo[2]:.2f},{hi[2]:.2f}] m")
+        cam_base = camera_in_base(R, t, pose6, ref=ref, tool_offset_mm=float(tool_offset_mm),
+                                  offset_mm=offset_mm, yaw_deg=yaw_deg)
+        report.append(f"{label}｜相机位置 基座系 ({cam_base[0]:.3f}, {cam_base[1]:.3f}, "
+                      f"{cam_base[2]:.3f}) m")
 
     scene = build_scene(merged[0][0], merged[0][1], scene_out=scene_out, mesh_dir=mesh_dir,
                         base_scene=base_scene, cart_height=cart_height, show_cart=show_cart,

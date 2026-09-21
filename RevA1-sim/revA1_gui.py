@@ -87,6 +87,8 @@ except Exception:  # noqa: BLE001
 
 HERE = Path(__file__).resolve().parent
 RUNS = HERE / "runs"
+# 点云下拉框里代表「config.json 的多组点云（多位姿 + 多点云）」的哨兵值（不是真实文件路径）
+MULTI_CLOUD = "__config_multi_cloud__"
 
 # IK 快捷预设（与 viewer.py / demo_trajectory.py 同一批点）：工具尖目标（世界系）+ 工具轴
 POSE_PRESETS = [
@@ -1089,9 +1091,14 @@ class ControlPanel(QWidget):
         self.c_cloud = QComboBox()
         for p in pc.list_clouds():
             self.c_cloud.addItem(p.name, str(p))
+        if pc.load_cloud_groups():           # config.json 里配了多组点云 → 放第一项并默认选中
+            self.c_cloud.insertItem(0, self.multi_cloud_label(), MULTI_CLOUD)
+            self.c_cloud.setCurrentIndex(0)
         if self.c_cloud.count() == 0:
             self.c_cloud.addItem("（point_cloud/ 里还没有文件）", "")
-        self.c_cloud.setToolTip("point_cloud/ 下的点云（*.json：3D 点 或 16 位深度图；也认 *.npy）")
+        self.c_cloud.setToolTip("point_cloud/ 下的点云（*.json：3D 点 或 16 位深度图；也认 *.npy）\n"
+                                "第一项「配置的多组点云」= config.json 的 point_cloud_groups："
+                                "每组用自己的拍摄姿态换算，和网页端一样一起渲染")
         self.c_cloud.setMaximumWidth(200)
         card.add_row(QLabel("点云"), self.c_cloud, self._btn("刷新", self.on_cloud_refresh, name="Preset"))
 
@@ -1195,12 +1202,31 @@ class ControlPanel(QWidget):
         self.cloud_label.setMinimumHeight(150)
         self.cloud_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         card.add(self.cloud_label)
+        self.c_cloud.currentIndexChanged.connect(self._sync_cloud_mode)   # 多组 ↔ 单份 切换
+        self._sync_cloud_mode()                   # 默认可能是多组模式 → 先同步一次拍摄姿态框
         return card
 
     # ---- 点云：按钮 / 状态
     def cloud_file(self) -> str:
-        """下拉框里选的点云文件（完整路径）。"""
+        """下拉框里选的点云文件（完整路径；选在「多组点云」那一项时是 :data:`MULTI_CLOUD`）。"""
         return str(self.c_cloud.currentData() or "")
+
+    def cloud_is_multi(self) -> bool:
+        """下拉框是不是选在「配置的多组点云」那一项（= config 的 ``point_cloud_groups``）。"""
+        return self.cloud_file() == MULTI_CLOUD
+
+    def multi_cloud_label(self) -> str:
+        """「配置的多组点云」那一项显示的名字（N 组 / M 份）。"""
+        groups = pc.load_cloud_groups()
+        return (f"（配置的多组点云：{len(groups)} 组 / "
+                f"{sum(len(g['files']) for g in groups)} 份）")
+
+    def _sync_cloud_mode(self, *_args) -> None:
+        """切到多组模式时把「拍摄姿态」框置灰 —— 每组的位姿写在 config 里，改这个框不管用。"""
+        multi = self.cloud_is_multi()
+        self.c_pose.setEnabled(not multi)
+        self.c_pose.setToolTip("多组点云模式：每组的拍摄姿态写在 config.json 里（本框不参与）" if multi
+                               else "拍摄姿态：x y z(mm) + rx ry rz(deg)（= 真机 pose 的 6 个数）")
 
     def set_cloud_file(self, path) -> None:
         """把下拉框切到某个文件（不在列表里就临时加进去）。"""
@@ -1218,11 +1244,13 @@ class ControlPanel(QWidget):
         self.c_cloud.clear()
         for p in pc.list_clouds():
             self.c_cloud.addItem(p.name, str(p))
+        if pc.load_cloud_groups():                       # 多组那一项也补回来
+            self.c_cloud.insertItem(0, self.multi_cloud_label(), MULTI_CLOUD)
         if self.c_cloud.count() == 0:
             self.c_cloud.addItem("（point_cloud/ 里还没有文件）", "")
         if cur:
             self.set_cloud_file(cur)
-        self.sim.log(f"点云列表已刷新：{self.c_cloud.count()} 个文件")
+        self.sim.log(f"点云列表已刷新：{len(pc.list_clouds())} 个文件")
         self.refresh()
 
     def on_cloud_pose_from_robot(self) -> None:
@@ -1267,17 +1295,47 @@ class ControlPanel(QWidget):
                                float(self.c_dz.value())),
                     yaw_deg=float(self.c_yaw.value()))
 
+    def cloud_multi_kwargs(self) -> dict:
+        """多组点云用：卡片控件里 :func:`point_cloud.build_multi_cloud_scene` 认识的那些。
+
+        逐组的**拍摄姿态**写在 config.json 里（每组一个），所以「拍摄姿态」框不参与
+        （见 :meth:`_sync_cloud_mode`）。
+        """
+        kw = self.cloud_kwargs()
+        kw.pop("pose", None)
+        return kw
+
     def on_cloud_load(self) -> None:
-        """「加载点云」：换算 → 生成场景 → 重建模型（机械臂 + 点云 + 小车同框）。"""
-        path = self.cloud_file()
-        if not path:
-            self.sim.log("没有选点云文件（point_cloud/ 里放 *.json 或 *.npy，再点「刷新」）")
+        """「加载点云」：换算 → 生成场景 → 重建模型（机械臂 + 点云 + 小车同框）。
+
+        下拉框选具体文件 = 只看那一份；选「配置的多组点云」= 按 config.json 的
+        ``point_cloud_groups``，**每组用自己的拍摄姿态**换算后一起渲染（和网页端一致）。
+        """
+        multi = self.cloud_is_multi()
+        groups = pc.load_cloud_groups() if multi else []
+        if multi and not groups:
+            self.sim.log("config.json 里没有可用的多组点云（point_cloud_groups）")
             return
-        self.sim.log(f"正在把点云接进场景：{Path(path).name}（写网格 + 重建场景，约 1 秒）……")
+        if groups:
+            n_files = sum(len(g["files"]) for g in groups)
+            self.sim.log(f"正在把配置的多组点云接进场景：{len(groups)} 组 / {n_files} 份点云"
+                         "（写网格 + 重建场景）……")
+        else:
+            path = self.cloud_file()
+            if not path:
+                self.sim.log("没有选点云文件（point_cloud/ 里放 *.json 或 *.npy，再点「刷新」）")
+                return
+            self.sim.log(f"正在把点云接进场景：{Path(path).name}（写网格 + 重建场景，约 1 秒）……")
         QApplication.processEvents()                          # 让上面这行日志先显示出来
         t0 = time.perf_counter()
         try:
-            res = pc.build_cloud_scene(cloud_path=path, **self.cloud_kwargs())
+            if groups:
+                res = pc.build_multi_cloud_scene(groups, **self.cloud_multi_kwargs())
+                pts = np.vstack([np.asarray(p, dtype=float).reshape(-1, 3)
+                                 for p in res["points_base"]])
+            else:
+                res = pc.build_cloud_scene(cloud_path=path, **self.cloud_kwargs())
+                pts = np.asarray(res["points_base"], dtype=float)
         except Exception as exc:  # noqa: BLE001
             self.cloud_error = f"{type(exc).__name__}: {exc}"
             self.cloud_report = []
@@ -1286,7 +1344,7 @@ class ControlPanel(QWidget):
             return
         self.cloud_error = ""
         self.cloud_report = list(res["report"])
-        self.cloud_points = np.asarray(res["points_base"], dtype=float)
+        self.cloud_points = pts
         self.cloud_scene = Path(res["scene"].scene)
         if not self.win.load_scene(self.cloud_scene, log=False):
             self.cloud_error = "场景重建失败（看日志）"
@@ -2477,8 +2535,22 @@ def run_gui(args) -> int:
         win.panel.f_port.setValue(int(args.follow_port))
     if args.follow:
         win.panel.on_follow_start()
-    if getattr(args, "point_cloud", ""):
-        win.panel.set_cloud_file(args.point_cloud)
+    cloud = getattr(args, "point_cloud", None)
+    if cloud is None:                                  # 没给参数 → 用 config 里配好的点云
+        groups = pc.load_cloud_groups()
+        if groups:
+            cloud = MULTI_CLOUD
+            print(f"点云     : config.json 的 {len(groups)} 组 / "
+                  f"{sum(len(g['files']) for g in groups)} 份点云（每组按自己的拍摄姿态一起渲染）")
+        else:
+            try:
+                cloud = str(pc.default_cloud())
+                print(f"点云     : {cloud}（来自 config.json，可用 --point-cloud 覆盖）")
+            except pc.PointCloudError as exc:
+                cloud = ""
+                win.sim.log(f"配置里没有可用点云，先不加载：{exc}")
+    if cloud:
+        win.panel.set_cloud_file(cloud)
         win.panel.on_cloud_load()
     if getattr(args, "task_port", 0):
         win.panel.t_task_port.setValue(int(args.task_port))
@@ -2522,8 +2594,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="覆盖跟随的数据源（auto/http/udp）")
     ap.add_argument("--follow-url", default="", help="覆盖真机 HTTP 状态接口")
     ap.add_argument("--follow-port", type=int, default=0, help="覆盖真机 UDP 广播端口")
-    ap.add_argument("--point-cloud", default="",
-                    help="启动时直接把这个点云接进场景（等价于点卡片里的「加载点云」）")
+    ap.add_argument("--point-cloud", default=None,
+                    help="启动时接进场景的点云文件；**不给这个参数 = 用 config.json 里配的**"
+                         "（point_cloud_groups / point_cloud_file），传空串 \"\" = 不加载点云（干净场景）")
     ap.add_argument("--task-listen", action="store_true",
                     help="启动时自动开「任务信号」监听（默认 UDP 6501）")
     ap.add_argument("--task-port", type=int, default=0, help="覆盖任务信号 UDP 端口")
