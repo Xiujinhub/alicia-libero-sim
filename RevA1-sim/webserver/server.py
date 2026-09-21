@@ -125,17 +125,27 @@ class Viewer:
     def _resolve_scene(self, args) -> str:
         if not args.point_cloud:
             return str(spec.SCENE_XML)
+        groups = pc.load_cloud_groups()          # 配置里的多组点云（拍照位姿 → 多份点云）
         try:
-            res = pc.build_cloud_scene(args.cloud_file or None,
-                                       max_points=args.max_points,
-                                       point_mm=args.point_mm,
-                                       bands=args.bands)
+            if groups and not args.cloud_file:
+                # 配了多组 → 每组按自己的拍照位姿变换到基座系，最后合并进同一个场景
+                print(f"[web] 点云组：{len(groups)} 组"
+                      f"（{'、'.join(str(g['label']) for g in groups)}）")
+                res = pc.build_multi_cloud_scene(groups,
+                                                 max_points=args.max_points,
+                                                 point_mm=args.point_mm,
+                                                 bands=args.bands)
+            else:
+                res = pc.build_cloud_scene(args.cloud_file or None,
+                                           max_points=args.max_points,
+                                           point_mm=args.point_mm,
+                                           bands=args.bands)
         except pc.PointCloudError as exc:
             print(f"[web] 点云场景生成失败（退回基场景）：{exc}")
             return str(spec.SCENE_XML)
         scene = str(res["scene"].scene)
         print(f"[web] 点云场景：{scene}")
-        for line in res["report"][:6]:
+        for line in res["report"]:
             print(f"[web]   {line}")
         return scene
 

@@ -1,6 +1,14 @@
 {
     "_comment": "RevA1-sim 全局配置：路径 + 默认配置。相对路径以 RevA1-sim/ 为基准。",
-    "point_cloud_dir": "point_cloud",
-    "point_cloud_file": "point_cloud/sink_6_o2e.json",
-    "jetson_ip": "192.168.66.169"
+
+    "jetson_ip": "192.168.66.169",
+    "_comment_point_cloud_groups": "多组点云：每组 = 1 个拍照机械臂位姿 + 该位姿下拍的多份点云文件（多对一）。pose 是 'x y z(mm) + rx ry rz(deg)' 共 6 个数（= 真机 pose 字段）；files 是点云文件数组（相对 RevA1-sim/，可写 *.json / *.npy）。可以写任意多组；本项删掉（或空数组）= 退回上面 point_cloud_file 的单个点云模式。",
+    "point_cloud_groups": [
+        {
+            "pose": "110.862 -5.474 396.436 196.64 34.89 111.77",
+            "files": [
+                "point_cloud/sink_6_o2e.json"
+            ]
+        }
+    ]
 }

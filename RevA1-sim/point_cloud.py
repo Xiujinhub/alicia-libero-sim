@@ -706,8 +706,13 @@ def build_scene(points_base_m, depth_mm=None, *, scene_out=OUT_SCENE, mesh_dir=M
                 show_target_pad: bool = DEFAULT_SHOW_TARGET_PAD,
                 point_mm: float = DEFAULT_POINT_R_MM,
                 bands: int = DEFAULT_BANDS, max_points: int = DEFAULT_MAX_POINTS,
-                prefix: str = DEFAULT_MESH_PREFIX, color=None) -> CloudScene:
+                prefix: str = DEFAULT_MESH_PREFIX, color=None,
+                extra_groups=None) -> CloudScene:
     """把（基座系）点云写成网格，并生成一份**带点云的世界场景 XML**。
+
+    ``extra_groups``：**额外的点云组** ``[(点(m), 深度(mm) | None), ...]`` —— 要在同一帧里再画
+    几组点云时传它（每组**独立按自己的深度分带**，网格名带组号 ``{prefix}_g{组号}_{带号}``）。
+    默认 ``None`` = 只画 ``points_base_m`` 这一组，生成物和以前**完全一样**。
 
     生成物（都放 ``assets/`` 下，和基场景同目录 —— 这样 ``<include>`` 和 ``meshdir`` 才解析得对）：
 
@@ -719,21 +724,11 @@ def build_scene(points_base_m, depth_mm=None, *, scene_out=OUT_SCENE, mesh_dir=M
     ``show_target_pad``：要不要保留基场景那个"名义作业点"绿圆盘（默认**不要**）。
     """
     t0 = time.perf_counter()
-    pts = np.asarray(points_base_m, dtype=float).reshape(-1, 3)
-    dep = None if depth_mm is None else np.asarray(depth_mm, dtype=float).ravel()
-    if dep is not None and dep.size != pts.shape[0]:
-        dep = None
-    total = int(pts.shape[0])
-    pts, dep, _step = subsample(pts, max_points, dep)
-    if pts.shape[0] == 0:
-        raise PointCloudError("点云是空的（都被深度过滤掉了？）")
-
-    specs: list[tuple[np.ndarray, tuple, tuple | None]] = []
-    if dep is None:
-        specs.append((np.ones(pts.shape[0], dtype=bool), tuple(color or DEPTH_COLORS[0]), None))
-    else:
-        for i, (rng, mask) in enumerate(depth_band_masks(dep, bands)):
-            specs.append((mask, tuple(color or DEPTH_COLORS[i % len(DEPTH_COLORS)]), rng))
+    groups: list[tuple] = [(points_base_m, depth_mm)]
+    for item in (extra_groups or []):                    # 额外点云组（可选）
+        item = tuple(item)
+        groups.append((item[0], item[1] if len(item) > 1 else None))
+    multi = len(groups) > 1
 
     mesh_dir = Path(mesh_dir)
     mesh_dir.mkdir(parents=True, exist_ok=True)
@@ -745,20 +740,43 @@ def build_scene(points_base_m, depth_mm=None, *, scene_out=OUT_SCENE, mesh_dir=M
 
     meshes: list[Path] = []
     band_info: list[dict] = []
-    for i, (mask, rgba, rng) in enumerate(specs):
-        sub = pts[mask]
-        if sub.shape[0] == 0:
-            continue
-        meshes.append(write_points_obj(mesh_dir / f"{prefix}_{i}.obj", sub,
-                                       float(point_mm) / 1000.0))
-        band_info.append(dict(n=int(sub.shape[0]), rgba=rgba, mm=rng))
+    total = 0
+    used = 0
+    for g, (g_points, g_depth) in enumerate(groups):
+        pts = np.asarray(g_points, dtype=float).reshape(-1, 3)
+        dep = None if g_depth is None else np.asarray(g_depth, dtype=float).ravel()
+        if dep is not None and dep.size != pts.shape[0]:
+            dep = None
+        total += int(pts.shape[0])
+        pts, dep, _step = subsample(pts, max_points, dep)
+        if pts.shape[0] == 0:
+            raise PointCloudError("点云是空的（都被深度过滤掉了？）")
+        used += int(pts.shape[0])
+        gprefix = f"{prefix}_g{g}" if multi else prefix     # 多组时网格名带组号，免得撞名
+
+        specs: list[tuple[np.ndarray, tuple, tuple | None]] = []
+        if dep is None:
+            specs.append((np.ones(pts.shape[0], dtype=bool), tuple(color or DEPTH_COLORS[0]), None))
+        else:
+            for i, (rng, mask) in enumerate(depth_band_masks(dep, bands)):
+                specs.append((mask, tuple(color or DEPTH_COLORS[i % len(DEPTH_COLORS)]), rng))
+
+        for i, (mask, rgba, rng) in enumerate(specs):
+            sub = pts[mask]
+            if sub.shape[0] == 0:
+                continue
+            path = write_points_obj(mesh_dir / f"{gprefix}_{i}.obj", sub,
+                                    float(point_mm) / 1000.0)
+            meshes.append(path)
+            band_info.append(dict(n=int(sub.shape[0]), rgba=rgba, mm=rng, group=g,
+                                  mesh=path.stem))
 
     txt = Path(base_scene).read_text(encoding="utf-8")
     if "</asset>" not in txt or "<worldbody>" not in txt:
         raise PointCloudError(f"基场景 {Path(base_scene).name} 里找不到 </asset> / <worldbody>")
     txt = txt.replace("</asset>", "\n".join(
-        f'    <mesh name="{prefix}_{i}" file="{p.name}"/>' for i, p in enumerate(meshes))
-        + "\n  </asset>", 1)
+        f'    <mesh name="{band["mesh"]}" file="{m.name}"/>'
+        for band, m in zip(band_info, meshes)) + "\n  </asset>", 1)
 
     body: list[str] = []
     cart = np.asarray(cart_center_mm, dtype=float).ravel() if cart_center_mm is not None \
@@ -778,7 +796,7 @@ def build_scene(points_base_m, depth_mm=None, *, scene_out=OUT_SCENE, mesh_dir=M
                     f'contype="0" conaffinity="0"/>')
     for i, band in enumerate(band_info):
         r, g, b, a = band["rgba"]
-        body.append(f'    <geom name="pc_pts_{i}" type="mesh" mesh="{prefix}_{i}" '
+        body.append(f'    <geom name="pc_pts_{i}" type="mesh" mesh="{band["mesh"]}" '
                     f'rgba="{r:.3f} {g:.3f} {b:.3f} {a:.3f}" contype="0" conaffinity="0"/>')
     txt = txt.replace("<worldbody>", "<worldbody>\n" + "\n".join(body), 1)
 
@@ -799,7 +817,7 @@ def build_scene(points_base_m, depth_mm=None, *, scene_out=OUT_SCENE, mesh_dir=M
     scene_out.parent.mkdir(parents=True, exist_ok=True)
     scene_out.write_text(txt, encoding="utf-8")
     return CloudScene(scene=scene_out, meshes=meshes, points_total=total,
-                      points_used=int(pts.shape[0]), bands=band_info,
+                      points_used=used, bands=band_info,
                       cart_height=float(cart_height), cart_center=cart.copy(),
                       show_target_pad=bool(show_target_pad),
                       ms=(time.perf_counter() - t0) * 1000.0)
@@ -826,6 +844,47 @@ def default_cloud() -> Path:
         if "o2e" in p.name.lower():
             return p
     return files[0]
+
+
+def load_cloud_groups(cfg: dict | None = None) -> list[dict]:
+    """读 config 里的**多组点云**配置：一组 = 一个拍照位姿 + 该位姿下拍的多份点云（多对一）。
+
+    ``config/config.json`` 里这样写（``files`` 可给数组，也可只给一个字符串）::
+
+        "point_cloud_groups": [
+            {"pose": "110.9 -5.5 396.4 196.6 34.9 111.8",
+             "files": ["point_cloud/sink_6_o2e.json", "point_cloud/sink_1_o2e.json"]},
+            {"pose": "...另一组位姿...", "files": ["point_cloud/urinal_o2e_stride5.json"]}
+        ]
+
+    返回 ``[{"pose": 6 个数, "files": [路径, ...], "label": 名字}, ...]``；没配就是 ``[]``。
+    位姿不合法 / 文件列表为空的那一组会被**跳过**（不报错，方便边配边试）。
+    """
+    raw = (cfg if cfg is not None else _CONFIG).get("point_cloud_groups")
+    if not isinstance(raw, list):
+        return []
+    out: list[dict] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        files = item.get("files") or item.get("cloud_files") or item.get("cloud")
+        if isinstance(files, (str, Path)):
+            files = [files]
+        paths: list[Path] = []
+        for f in (files or []):
+            if f is None or not str(f).strip():
+                continue
+            p = Path(str(f))
+            paths.append(p if p.is_absolute() else (HERE / p))
+        if not paths:
+            continue
+        try:
+            pose = parse_pose6(item.get("pose", DEFAULT_POSE))
+        except PointCloudError:
+            continue
+        out.append(dict(pose=pose, files=paths,
+                        label=str(item.get("label") or f"组{i + 1}")))
+    return out
 
 
 def geometry_report(cloud: Cloud, points_base, cam_base, *, cart_height: float = DEFAULT_CART_HEIGHT_M,
@@ -922,6 +981,81 @@ def build_cloud_scene(cloud_path=None, *, cloud: Cloud | None = None, pose=DEFAU
     report.append(scene.summary())
     return dict(cloud=cloud, points_base=pts_base, cam_base=cam_base, scene=scene,
                 report=report, R=R, t=t, pose=pose6, frame=use_frame, frame_probe=probe)
+
+
+def build_multi_cloud_scene(groups=None, *, extrinsic=DEFAULT_EXTRINSIC, intrinsic=DEFAULT_INTRINSIC,
+                            frame: str = "auto", ref: str = "tcp", tool_offset_mm: float | None = None,
+                            cart_height: float = DEFAULT_CART_HEIGHT_M, show_cart: bool = True,
+                            cart_center_mm=DEFAULT_CART_CENTER_MM,
+                            show_target_pad: bool = DEFAULT_SHOW_TARGET_PAD,
+                            max_points: int = DEFAULT_MAX_POINTS, point_mm: float = DEFAULT_POINT_R_MM,
+                            bands: int = DEFAULT_BANDS, stride: int = 1,
+                            depth_min_mm: float = MIN_DEPTH_MM, depth_max_mm=None,
+                            offset_mm=(0.0, 0.0, 0.0), yaw_deg: float = 0.0, undistort: bool = True,
+                            scene_out=OUT_SCENE, mesh_dir=MESH_DIR, base_scene=BASE_SCENE,
+                            cfg: dict | None = None) -> dict:
+    """**多组点云**一步到位：每组 = 一个拍照机械臂位姿 + 该位姿下拍的 1..N 份点云（多对一）。
+
+    和 :func:`build_cloud_scene`（只画一帧点云）的区别：这里**每组按自己的拍照位姿**把点云
+    变换到基座系，最后**全部合并进同一个场景**一起渲染（网格名带组号，互不覆盖）。
+    组配置默认读 ``config/config.json`` 的 ``point_cloud_groups``（见 :func:`load_cloud_groups`）。
+
+    返回 ``dict(groups, clouds, points_base, scene, report)``。
+    """
+    if tool_offset_mm is None:                       # 默认用机型表里的工具长度
+        try:
+            import revA1_spec as _spec                            # noqa: PLC0415
+            tool_offset_mm = float(_spec.TOOL_TIP_LOCAL_Z) * 1000.0
+        except Exception:  # noqa: BLE001
+            tool_offset_mm = 42.7
+    if groups is None:
+        groups = load_cloud_groups(cfg)
+    groups = [g for g in (groups or []) if g.get("files")]
+    if not groups:
+        raise PointCloudError("没有可用的点云组（config 的 point_cloud_groups 是空的？）")
+
+    R, t = load_extrinsic(extrinsic)
+    clouds: list[Cloud] = []
+    merged: list[tuple[np.ndarray, np.ndarray]] = []
+    report: list[str] = []
+    for gi, grp in enumerate(groups):
+        label = str(grp.get("label") or f"组{gi + 1}")
+        pose6 = parse_pose6(grp.get("pose", DEFAULT_POSE))
+        pts_parts: list[np.ndarray] = []
+        dep_parts: list[np.ndarray] = []
+        for f in grp["files"]:
+            cloud = load_cloud(f, intrinsic_path=intrinsic, stride=stride,
+                               depth_min_mm=depth_min_mm, depth_max_mm=depth_max_mm,
+                               undistort=undistort)
+            if not frame or str(frame).lower() in ("auto", "detect"):
+                probe = detect_cloud_frame(cloud, R=R, t=t, intrinsic_path=intrinsic)
+                use_frame = probe["frame"]
+            else:
+                use_frame = normalize_frame(frame) or "cam"
+            cloud.frame = use_frame                     # 让 cloud.summary() 反映真实坐标系
+            pts_base = transform_to_base(cloud.points_mm, R, t, pose6, frame=use_frame, ref=ref,
+                                         tool_offset_mm=float(tool_offset_mm),
+                                         offset_mm=offset_mm, yaw_deg=yaw_deg)
+            pts_parts.append(np.asarray(pts_base, dtype=float).reshape(-1, 3))
+            dep_parts.append(np.asarray(cloud.depth_mm, dtype=float).ravel())
+            clouds.append(cloud)
+            report.append(f"{label}｜{cloud.summary()}")
+        pts_g = np.vstack(pts_parts)
+        dep_g = np.concatenate(dep_parts)
+        merged.append((pts_g, dep_g))
+        lo, hi = pts_g.min(axis=0), pts_g.max(axis=0)
+        report.append(f"{label}｜拍照位姿 {pose_text(pose6)}｜{len(grp['files'])} 份点云合并 "
+                      f"{pts_g.shape[0]} 点｜基座系 x[{lo[0]:.2f},{hi[0]:.2f}] "
+                      f"y[{lo[1]:.2f},{hi[1]:.2f}] z[{lo[2]:.2f},{hi[2]:.2f}] m")
+
+    scene = build_scene(merged[0][0], merged[0][1], scene_out=scene_out, mesh_dir=mesh_dir,
+                        base_scene=base_scene, cart_height=cart_height, show_cart=show_cart,
+                        cart_center_mm=cart_center_mm, show_target_pad=show_target_pad,
+                        point_mm=point_mm, bands=bands, max_points=max_points,
+                        extra_groups=merged[1:])
+    report.append(scene.summary())
+    return dict(groups=groups, clouds=clouds, points_base=[m[0] for m in merged],
+                scene=scene, report=report)
 
 
 def render_preview(scene_path, out_png, *, lookat=None, distance: float = 3.4,
