@@ -34,8 +34,7 @@
 <body>
 <div id="wrap">
   <div id="bar">
-    <span class="title">数字孪生画面</span>
-    <span class="dim" id="scene"></span>
+    <span class="title">清洁机器人-数字孪生</span>
     <span style="flex:1"></span>
     <span class="dim" id="status">连接中…</span>
   </div>
@@ -56,7 +55,6 @@
 (function () {
   const stage = document.getElementById('stage');
   const statusEl = document.getElementById('status');
-  const sceneEl = document.getElementById('scene');
 
   // —— 真实相机画面（color 左上 / depth 左下）：Jetson 8890 端口 MJPEG ——
   const JETSON_IP = '__JETSON_IP__';   // 由 server.py 从 config.json 注入
@@ -99,7 +97,6 @@
       const s = await (await fetch('/status')).json();
       statusEl.textContent = `${s.fps.toFixed(0)} fps · 渲染 ${s.render_ms.toFixed(0)} ms`
         + ` · ${s.follow ? '真机跟随' : '离线'}` + (s.task ? ' · 任务中' : '');
-      if (sceneEl.textContent !== s.scene) sceneEl.textContent = s.scene;
     } catch (e) { statusEl.textContent = '离线'; }
   }, 1000);
 })();
