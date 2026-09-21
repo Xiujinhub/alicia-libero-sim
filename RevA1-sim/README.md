@@ -26,10 +26,12 @@ python demo_trajectory.py --cartesian --video runs/cart.mp4   # ⑥ 笛卡尔画
 | `convert_urdf_to_mjcf.py` | URDF → MJCF 转换的命令行入口（在 `assets/` 下生成场景三件套） |
 | `model_import.py` | 转换用的工具库：`package://` 路径修复、mesh 拷贝、MJCF 文本后处理、场景模板 |
 | `check_model.py` | 模型自检脚本，结果打印并写入 `check_model.log` |
-| `arm_core.py` | **控制核心**（不依赖界面框架）：`Camera` 轨道相机、`Motion` 运动插值、`ArmSim` 仿真/伺服/IK/`follow()`（真机跟随）、多初值 IK、笛卡尔直线规划 |
-| `robot_link.py` | **真机 ↔ 仿真 姿态链路**：状态源（HTTP 轮询 / UDP 广播接收）× 报文解析 × 映射/平滑/限速/看门狗；界面里的「真机跟随」卡片就用它，另有 `--probe / --listen / --emit-demo / --selftest` |
+| `arm_core.py` | **控制核心**（不依赖界面框架）：`Camera` 轨道相机、`Motion` 运动插值、`ArmSim` 仿真/伺服/IK/`follow()`（真机跟随）/`set_joint_limits()`、工具向量箭头 `draw_tool_arrows()` + 工具尖轨迹 `Trail`/`draw_trail()`、多初值 IK、笛卡尔直线规划 |
+| `robot_link.py` | **真机 ↔ 仿真 链路**：姿态（状态源 HTTP 轮询 / UDP 广播接收 × 报文解析 × 映射/平滑/限速/看门狗）+ **任务信号（UDP 6501 的 `motion: start/over` → `TaskListener`）**；界面里的「真机跟随」「任务信号」两张卡片就用它，另有 `--probe / --listen / --task-listen / --task-demo / --emit-demo / --selftest` |
 | `point_cloud.py` | **点云 → 机械臂场景**：读点云自带坐标系（本机是 `o2e`＝末端系；也支持相机光学系 / 16 位深度图，含自解 PNG 与畸变校正）+ 拍摄姿态 → 换算到基座系 → 生成「机械臂 + 点云 + 小车」场景（`--report / --build-scene / --png / --selftest`） |
-| `revA1_gui.py` | **交互控制台（PySide6，主推）**：关节 `−`/`+` 微调、**真机跟随（真机姿态实时映到模型）**、末端目标/IK、示教点位（点到点）、伺服参数、日志；自带 `--selftest` / `--ui-test` |
+| `revA1_gui.py` | **交互控制台（PySide6，主推）**：关节 `−`/`+` 微调、**关节限位（可保存为默认 → `config/joint_limits.json`）**、**工具 TCP 向量箭头**、**任务信号 6501 → 工具尖轨迹（勾选要画的工具，默认全不勾）**、**真机跟随（真机姿态实时映到模型）**、末端目标/IK、示教点位（点到点）、伺服参数、日志；自带 `--selftest` / `--ui-test` |
+| `revA1_config.py` | **用户配置**（只依赖标准库）：读写 `config/joint_limits.json`（按关节的限位覆盖，删文件即回 URDF 默认；`REVA1_CONFIG_DIR` 可换目录） |
+| `config/` | 用户配置目录（首次点「保存为默认」才会出现 `joint_limits.json`） |
 | `interactive_control.py` | 交互控制台入口（转发到 `revA1_gui.py`，让老的命令行继续可用） |
 | `interactive_control_tk.py` | 旧版 tkinter 界面（保留作对照/回退，逻辑同源，命令行不变） |
 | `sim_ik.py` | 末端位姿数值 IK（阻尼最小二乘）+ `drive_to` 平滑运动 / `reset_home`，也可单独当命令行 IK 用 |
@@ -132,30 +134,77 @@ python revA1_gui.py --exit-after 10            # 开窗口跑 10 秒自动退出
 3. **快捷键不能抢输入框**：`1..6`、`−`、`=` 这些在 `QDoubleSpinBox` 里就是正常输入（比如打 `-0.05`），
    所以按键处理先看焦点是不是数值框/日志框，是就原样交给控件；另外一次动作（H/R/G/F/ESC）挡掉自动重复。
 4. **QSS 的 `[prop="true"]` 选择器改完要 `unpolish/polish` 一次**才生效（例如关节高亮、IK 失败变红）。
+5. **数字控件的上/下三角 → `+` / `−`**：QSS 的箭头子控件只能引用**图片**，所以在启动时用
+   `QPainter` 画两张 12 px 的图标（`runs/ui_icons/`，是生成物）再由 `spin_buttons_qss()` 挂上
+   `::up-arrow / ::down-arrow`。只改外观：步进仍是 `stepUp()/stepDown()`（单击 = 一个 `singleStep`、
+   滚轮/键盘上下键/长按都一样），布局不用动。
+   ⚠️ 这里踩过一个 CSS 坑：写成 `QSpinBox, QDoubleSpinBox::up-button { … }` 时，`::up-button`
+   **只作用于最后一个选择器**，前一个被静默忽略 —— "改了没反应"。得逐个展开成
+   `QSpinBox::up-button, QDoubleSpinBox::up-button`。
+   ⚠️ 另一个坑：`grab()` 出来的图是**设备像素**（本机屏幕 150% → 逻辑 126×30 抓到 189×45），
+   量按钮区得乘 `devicePixelRatio()`，不然会"看起来没画"。
+5. **控件"显示不全"的几种成因（都已修）**：
+   * `setMaximumWidth(96)` 写到比控件自己的 `minimumSizeHint()`（跟字体、后缀、小数位有关）还小
+     → Qt 把控件压扁，数字被裁。现在统一走 `cap_width(w, cap)`：上限取
+     `max(想给的上限, 最小需求)`；
+   * 面板内容比可视区宽（本项目实测 **578 px > 视口 450 px**），而横向滚动条被设成 **AlwaysOff**
+     → 每行右边一截**看不见也滚不到**。现在：面板最小宽度由 `panel.minimumSizeHint()` 定，
+     `QSplitter` 尊重它；横向滚动条改成 `AsNeeded` 兜底；
+   * **窗口比屏幕大**（默认 1420×900 在 1366×768 笔记本上超出屏幕）→ 右侧/状态栏跑到屏幕外。
+     现在 `_fit_to_screen()` 按 `screen.availableGeometry()` 收一下；
+   * **行里放了弹性空格（`add_row(..., None, ...)`）时，Qt 会把输入框压到它自己的"最小尺寸"**
+     —— 实测「深度分色」那个 `QSpinBox` 只剩 **43 px**（Windows 风格下它的 `sizeHint` 会跟着
+     数值范围缩：0~8 这种一位数就只要 43 px），里面那格 13 px，**数字直接看不见**。
+     现在 `ControlPanel.floor_input_widths()` 按类型给下限（spin 84 / combo 96 / 输入行 110 px，
+     且跳过 spin box 内建的那个编辑框 —— 硬加宽它反而会把上下箭头挤出盒子）；
+   * 状态栏 7 段文字一行放不下 → 现在是"按宽度省略成 `…` + 全文在 tooltip"
+     （`_set_status()`），窗口一改大小立刻重算（`resizeEvent`）。
+   这些都由 `layout_report()` 在 `--ui-test` 里量：**任何控件宽度 < 自身最小需求 = 失败**
+   （默认尺寸 / 760×520 / 1366×768 三种尺寸各量一遍）。
 
-### 自检结果（`--selftest`，40 项全过）
+### 自检结果（`--selftest`，72 项全过）
 
 ```
 home 姿态 0.44 mm / 无自碰撞        单关节 5 下「+」J4 实测 +4.92°（其余关节 <0.27°），限位自动夹住
+home 完整姿态（3×3）与 CAPTURE_POSE 差 0.0097° ← J6 轴写反这种错只有这一项看得见
 IK 预设 4 个点最差 0.10 mm / 0.047°  不可达点 (1.30,0,0.30) → 明确「不可用」且拒绝运动
 直线规划 21 点，直线度 0.000000 mm   直线执行实际轨迹偏离直线最大 5.75 mm、到位 3.25 mm / 姿态 0.34°
 本支走不到的直线 → 明确拒绝 + 给原因，且不开始运动（不许偷偷换解支把工具甩出去）
 关节空间 P2P 到位 0.339°            急停：指令定格、停下后 0.5 s 漂移 0.01 mm
 离屏渲染 320x480 正常               目标标记目标球 + 路径胶囊 ngeom 9 → 11
+三个工具 TCP 向量：|TCP−法兰| = |v|（294.8/241.7/243.5 mm，误差 <1e-12）、都在地面上
+        箭头几何：起点 = 安装点 (vx,vy,0)、方向 = 末端工具轴、size[2] = 2·vz = 589.599 mm
+        **三根箭头互相平行**：两两夹角 0.00000°、与末端工具轴 0.00733°（改之前是 13.6°~14.9° 的扇形）
+        箭头尖仍落在各自 TCP 上（数值差 0.000019 mm；画面上离 TCP 球心 0.7 / 1.6 / 1.1 px）
+        画面上差 5142 像素（只画一根 1735）；J1 转 0.30 rad → 重心位移 19.5 px；三个都关 → 差 0 像素
+关节限位（config/joint_limits.json）：写文件 → 新场景自动加载 → 三处一起生效（J3 到 180°）
+        → follow(175°) 不再截断（URDF 那套仍截到 163.998°）→ 坏配置明确报错 → 恢复 URDF 默认删文件
+工具尖轨迹（6501 任务信号驱动）：采样间距过滤 / 点数封顶滚动丢最老的 / 清空 / 只记勾上的工具 /
+        记的就是箭头尖（= 该工具 TCP）；任务中随机械臂长出来（39 点 · 63.5 mm）、任务结束后不再加点；
+        绘制 = 相邻两点一段胶囊（38 段 · pos=中点、size[2]=半长 0.762 mm）、几何只在画面里（DECOR）
 相机 拖动/平移/推拉/预设视角 + 工具轴插值（含反向 180°）
 真机跟随（假真机 HTTP + 正运动学 pose → JointLink → ArmSim）：关节最大差 0.325°、TCP 差 4.04 mm、
         数据率 21.3 Hz、模式 follow、停止后线程退出
 点云（点云 → 场景 → ArmSim）：6 轴 + 点云几何 + 小车都在、地面 z = -1.1000 m、离地高度按场景地面算
 ```
 
-`--ui-test` 会真开窗口把**每个卡片**都点一遍（44 项，全过；加 `--no-render` 是 40 项，跳过渲染相关）：
+`--ui-test` 会真开窗口把**每个卡片**都点一遍（77 项，全过；加 `--no-render` 是 71 项，跳过渲染相关）：
 关节 ± 按钮、键盘选关节/微调、功能键不误触发、「求解 IK」结果文案、「求解并沿直线运动」到位、
 **本支到不了时拒绝且工具尖不动**、不可达点提示、记录/走到/删除点位、急停、复位、kp 滑块、
-**「作业点标记」勾选（绿圆盘藏/显）**、窗口缩放不重建渲染器、截图；
+**数字控件的上/下按钮是 `+` / `−`（图标内容 + 真控件上的像素都量：上按钮竖跨 14 px、下按钮 4 px）
+且步进逻辑不变**、
+**「关节限位」应用/保存为默认/恢复 URDF 默认（临时目录，不碰你本机的 config/）**、
+**「任务信号」卡片：默认全不勾 → 假真机发 `motion: start` → 勾上夹爪后轨迹随臂长出来（35 点）
+→ 手动「清空轨迹」后又接着记（12 点）→ 发 `motion: over` → 轨迹立刻清空（0 点）→ 「停止监听」线程退出**、
+**「作业点标记」勾选（绿圆盘藏/显）**、**「工具 TCP 向量」三个勾选框（画面里 `ngeom` 12→9→10）与箭头粗细**、
+窗口缩放不重建渲染器、截图；
+**布局体检 6 项**（默认尺寸 / 拖到 760×520 / 1366×768 笔记本尺寸各量一遍：没有控件被压到小于自身最小需求、
+面板内容不超视口、状态栏文字按「…」省略而不是切半个字）—— 这条是"控件显示不全"的回归网，
+实现见 `revA1_gui.layout_report()` / `cap_width()`。
 **真机跟随卡片与点云卡片各启停/加载清除一遍**（点云那步真的写网格、换场景、再换回来，
 用没人发的 UDP 端口，不碰真机）；
 产物在 `runs/gui_ui_test.png`（窗口截图）、`runs/gui_ui_test_view.png`（3D 画面）
-和 `runs/gui_selftest.png`（自检渲染帧）。
+和 `runs/gui_selftest.png`、`runs/tool_arrows*.png`（自检渲染帧 / 三根工具向量箭头）。
 
 > 关于中文：界面文字是中文，`pick_font()` 会从「Microsoft YaHei UI / PingFang SC / Noto Sans CJK」
 > 里挑一个系统里真有的字体；都没有才会退回默认字体。终端里的 `[gui] ...` 日志同样是中文。
@@ -201,13 +250,14 @@ IK 预设 4 个点最差 0.10 mm / 0.047°  不可达点 (1.30,0,0.30) → 明�
 ```
 qpos      = [1.7284, -2.3904, 2.1147, 1.1962, 1.7300, -1.7549] rad  (度: [99.0 -137.0 121.2 68.5 99.1 -100.5])
 tool_site = [0.1109, -0.0055, 0.3959] → 离地 0.567 m，工具轴 = [-0.063, -0.615, -0.786]
-            （工具轴前倾 38.2°；与 spec.CAPTURE_POSE 的工具轴差 0.004°）
+            （工具轴前倾 38.2°；与 spec.CAPTURE_POSE 的工具轴差 0.004°、完整姿态差 0.010°）
 ee_site   = [0.1135, 0.0208, 0.4295]
 自碰撞 0 对 · 静置 3 s 漂移 0.339° · 雅可比条件数 73.7 · 最小限位余量 42.8°
 ```
 
 > 这组关节角是真机状态接口的读数（`runs/probe.log`：把 joints 灌进模型后工具尖差 0.50 mm、
-> 工具轴差 0.00°）。独立验算：多初值 IK 搜到的同支解与它只差 0.04°。
+> 工具轴差 0.00°、**完整姿态差 0.00°**——第三项才是能发现"J6 轴写反"的那一项，
+> 详见「真机跟随」里那个 J6 的坑）。独立验算：多初值 IK 搜到的同支解与它只差 0.04°。
 > 想换成别的初始姿态：`python convert_urdf_to_mjcf.py --home <6 个关节角(rad)>`，或先用
 > `sim_ik.py` 对目标位姿求逆解。
 
@@ -279,8 +329,68 @@ home 现在是**前倾**姿态（工具轴前倾 38.2°），所以：
 ```
 
 **关节约定已现场核对**（这是能直接镜像的前提）：把真机 `joints` 灌进模型 qpos，模型 FK 出的
-`tool_site` 与真机 `pose[:3]` 差 **0.5 mm**、工具轴差 **0.00°** —— 也就是**同号同零位，不用改符号/偏置**。
+`tool_site` 与真机 `pose[:3]` 差 **0.5 mm**、工具轴差 **0.00°**、**完整姿态（3×3）差 0.00°**
+—— 也就是**同号同零位，不用改符号/偏置**。
+
+> ⚠️ **第三项（完整姿态）不能省，这里踩过一次坑**：工具尖恰在 J6 轴上、工具轴又是 J6 的旋转轴，
+> 所以 **J6 的轴/符号写反了，前两项照样全过**。真机 URDF 里 `joint1..5` 的 axis 是 `0 0 1`，
+> **唯独 `joint6` 写成 `0 0 -1`**（与固件相反）→ 表现就是**法兰上装的三个工具方位左右颠倒**
+> （位置/工具轴都看不出来）。实测（`runs/j6_before_fix.log`，修复前；`runs/probe_after_fix.log`，修复后）：
+>
+> | 真机 J6 | 模型 vs 真机的完整姿态差 | `360° − 2·|J6|` |
+> | --- | --- | --- |
+> | −107.779° | 144.443° | 144.442° ✓ |
+> | −100.550°（拍摄姿态） | 158.892° | 158.900° ✓ |
+>
+> 两次都精确满足 `q6_model = −q6_robot` → 修正是把 `joint6` 的轴翻正
+> （`revA1_spec.JOINT_AXIS_FIX`，`convert_urdf_to_mjcf.py` 生成模型时自动应用，见 `model_import.fix_joint_axis`）。
+> 修完再量：**当前姿态 0.000°、拍摄姿态 0.010°**，三个工具的方位（现在是三根**平行**箭头）
+> 也跟着对了。
+> `check_model.py` / `revA1_gui.py --selftest` / `robot_link.py --probe` 现在都盯着这一项。
 （`python robot_link.py --probe` 随时可以复现这两行。）
+
+### 跟随到限位附近"卡住"？—— 关节限位（`config/joint_limits.json`）
+
+跟随链路里唯一会**截断**目标角的地方就是关节限位（`ArmSim.follow()` 按范围 clip，
+MuJoCo 也会按 `ctrlrange` 再夹一次）。而模型范围来自 URDF：**`joint1/2/4/5/6 = ±180°，
+只有 `joint3 = ±164.0°`** —— 真机 J3 一旦超出 164°，仿真就会卡在限位上（表现：真机继续转、
+仿真姿态不动/看着更"竖直"，量级 = 超出的度数，见下表）。
+
+| 真机 J3 | 模型截断到 | 末端工具轴差 | 工具尖差 |
+| --- | --- | --- | --- |
+| 165° | 164° | 1.0° | 7 mm |
+| 170° | 164° | 6.0° | 43 mm |
+| 175° | 164° | 11.0° | 79 mm |
+| 180° | 164° | 16.0° | 114 mm |
+
+**改法（界面，两下点完）**：「关节限位」卡片 → 把 J3 改成 `-180 ~ 180` → 点「保存为默认」。
+
+* 「应用」= 立刻生效（同时改三处：`sim.lo/hi`、`model.jnt_range`、`model.actuator_ctrlrange`
+  —— 少改一处 MuJoCo 就会把 `ctrl` 再按旧范围静默夹回去）；
+* 「保存为默认」= 再写进 **`config/joint_limits.json`**（只写与 URDF 不同的项），**下次启动自动加载**；
+* 「恢复 URDF 默认」= 回 URDF 值并**删掉该文件**；文件损坏/不合法会在卡片上报错并退回 URDF（不会崩）；
+* 换场景（例如接点云）时限位会跟着带过去；`check_model.py` / `--selftest` 也会应用并打印它。
+
+```bash
+python revA1_gui.py --config-dir D:/my_cfg      # 换配置目录（= 环境变量 REVA1_CONFIG_DIR）
+cat config/joint_limits.json                    # 就是这样一个文件（手改也行）
+```
+
+```json
+{
+  "_note": "关节限位（度）。界面「关节限位」卡片写入；删掉本文件即恢复 URDF 默认。",
+  "_urdf": "revA1_spec.LIMITS（joint1/2/4/5/6 = ±180°，joint3 = ±164°）",
+  "unit": "deg",
+  "limits": { "joint3": [-180.0, 180.0] }
+}
+```
+
+> 实测（`save_joint_limits` 落盘 → 重开一个 `ArmSim` 当"下次启动"）：
+> URDF 下 `follow(175°)` 的 J3 = **163.998°**；保存后 = **175.000°**，且三处都是 180.0°；
+> 点「恢复 URDF 默认」→ 文件消失、又回到 163.998°。
+>
+> ⚠️ **别把模型放得比真机还宽**：放宽只是让仿真跟得上真机；如果真机自己也到不了，
+> 那它永远不会超限，也就不是这个原因（先看示教器上的关节范围）。
 
 ### 怎么用
 
@@ -481,7 +591,67 @@ MuJoCo 没有"点云"图元。每帧往场景里塞小几何实测很慢
 5. 点数别一上来拉满：`--points 60000` + `--point-mm 4` 已经能把小便池看得清清楚楚，
    真要全量 40 万点，网格会到几十 MB、加载几秒。
 
-## 常用命令
+## 三个工具的 TCP 向量（画面里的三根箭头）
+
+真机上同一片法兰装了 **三个工具**，TCP 标定给的是**末端系**（法兰中心为原点、+z = 工具轴 =
+模型里的 `ee_site`）里的三个向量（`revA1_spec.TOOLS`，单位 m）：
+
+| 工具 | TCP 向量 v（末端系，m） | \|v\| | 颜色（画面箭头） | home 姿态下的世界坐标 | 离地 |
+| --- | --- | --- | --- | --- | --- |
+| **夹爪**  | `-0.0023439,  0.0004872,  0.2947993` | **294.8 mm** | 蓝 | `(0.096, -0.162, 0.199)` m | 0.370 m |
+| **喷嘴1** | ` 0.0410224,  0.0454661,  0.2337835` | **241.7 mm** | 橙 | `(0.130, -0.083, 0.212)` m | 0.383 m |
+| **喷嘴2** | ` 0.0588531, -0.0091195,  0.2361271` | **243.5 mm** | 品红 | `(0.072, -0.082, 0.212)` m | 0.384 m |
+
+（这三个世界坐标是 **joint6 轴翻正之后**的数；翻正前整片扇形会绕工具轴镜像到另一边，
+而三个 TCP 之间的相对间距 57.5 / 85.3 / 87.3 mm 不变 —— 详见下面「真机跟随」里 J6 那个坑。）
+
+画面上每个工具一根箭头，**三根互相平行、而且都平行于末端姿态的工具轴**（不是"从法兰中心
+直着画到 TCP"的那种扇形）：
+
+* 起点 = **安装点** = 法兰平面上的 `(vx, vy, 0)` —— 三个工具并排装在同一片法兰上，侧偏
+  2.4 / 61.2 / 59.6 mm 就体现在这儿；
+* 方向 = **法兰 +z（末端工具轴）**；长度 = `vz` = 该工具的**轴向长度**（294.8 / 233.8 / 236.1 mm）；
+* 箭头尖 = 起点 + 方向·`vz` = `法兰 + R·v` = **该工具的 TCP**（所以尖端仍精确落在 TCP 上）；
+* 每帧按当前末端位姿重算，所以**跟着机械臂实时动**（三个 TCP 两两间距 57.5 / 85.3 / 87.3 mm 不变）。
+
+> ⚠️ 早先的版本是"**从法兰中心直接画到 TCP**"（= 把 `v` 的侧偏也算进了方向）：那样三根箭头两两
+> 夹角 **13.6°~14.9°**，画面里是**一把扇形**，跟真机（三个工具并排、**平行**装在同一片法兰上）
+> 对不上。现在按物理装法画：两两夹角 **0.00000°**、与末端工具轴 **0.00733°**（自检里有一项盯着它）。
+
+* 界面：新卡片 **「工具 TCP 向量（跟随机械臂）」**（在「关节微调」下面）
+  —— 三个勾选框（文字颜色 = 箭头颜色，可单独开关）、「箭头粗细」（杆半径 1~12 mm，
+  头部 = 2.2 倍）、下面三行实时读数（TCP 世界坐标 / 离法兰多远 / 离地）；
+* 代码：`spec.TOOLS`（数据）→ `arm_core.draw_tool_arrows()` / `ArmSim.tool_lines()` /
+  `ArmSim.tool_points()` / `ArmSim.add_tool_arrows()`；
+* **不动模型**：箭头只在 `MjvScene` 里（不进 `mjModel`、不参与碰撞/物理、也不改质量与 IK），
+  归到 `mjCAT_DECOR` 所以**不投阴影**（否则小臂/腕部会多出一片跟着动的色斑）；
+* 换成别的工具 / 工具改版：改 `spec.TOOLS` 里的数就行，界面读数与箭头自动跟着变。
+
+> ⚠️ **坑：MuJoCo 画 `mjGEOM_ARROW` 只画 `size[2]` 的一半**（沿本地 +z 从 `pos` 起）。
+> 一开始直接 `mjv_connector(法兰, TCP)` 得到 `size[2] = |v|`，画出来只有工具长度的**一半**
+> （空场景对照实验，箭长 300 mm：`size[2]` = 150/300/600 mm → 画出 75/150/300 mm，起点都在 `pos`）。
+> 所以代码里把终点放到 **2 倍**处，画出来正好是 **安装点 → TCP**；`size[2]` 因此是 `2·vz`（有注释）。
+> 自检里那三项「箭头尖离 TCP 球心 < 8 px」就是这个坑的守门人（修之前是 144~209 px）。
+
+> ⚠️ **|v| 和 URDF 里那个 42.7 mm 是两回事**：`TOOL_TIP_LOCAL_Z = 42.7 mm` 只是
+> `ee_Link.STL` 这块**法兰盘本身**的长度（旧 `tool_site` 用它）；真机装的是上表这三根
+> **长杆工具**（24~30 cm），所以 `tool_site`（IK/点云用的那个默认 TCP）与这三个 TCP
+> 差着 20~25 cm —— 要用哪个当"末端"，看你的作业定义。
+
+验证（都在自检里）：
+
+| 检查 | 结果 |
+| --- | --- |
+| TCP = 法兰原点 + R·v（三个都算一遍） | 距离 = \|v\|，误差 **< 1e-12**；home 下三个都离地 > 0.3 m、在工作中 |
+| 箭头几何 | `pos` = 安装点 `(vx, vy, 0)`、`mat[:,2]` = **末端工具轴**（法兰 +z）、`size[2]` = 2·`vz` = **589.599 mm**（MuJoCo 只画一半 → 画出来正是 294.799 mm） |
+| **三根箭头互相平行** | 两两夹角 **0.00000°**、与末端工具轴 **0.00733°**（改之前是从法兰中心画的扇形：两两 13.6°~14.9°） |
+| **箭头尖真的落在 TCP 上** | 数值上尖与 TCP 差 **1.9e-5 mm**；画面上把 TCP 用白球标出来量像素：**0.7 / 1.6 / 1.1 px**（修"只画一半"那个坑之前是 144~209 px） |
+| 画面上真的画出来了 | 与"不放箭头"那帧差 **5142 像素**；只画一根时 1735 像素 |
+| 跟随机械臂 | J1 转 0.30 rad → 箭头像素重心位移 **19.5 px** |
+| 单独开关 | 三个都关 → 画面与基线一致（差 0 像素）；只画一根 → 1735 < 5142 |
+| 三个 TCP 与真机一致 | 靠 `joint6` 轴翻正（见「真机跟随」里的 J6 坑）：完整姿态与真机差 **0.00°**，三个 TCP 间距 57.5/85.3/87.3 mm |
+| 出图 | `runs/tool_arrows.png`（全身）、`runs/tool_arrows_close.png`（近看末端） |
+
 
 ```bash
 # 换 home 姿态后重新生成模型（6 个关节角，弧度）
@@ -505,6 +675,11 @@ python robot_link.py --probe
 python robot_link.py --listen --port 6001
 python robot_link.py --selftest
 
+# 任务信号（6501）+ 工具尖轨迹：启动就监听 / 假真机发 start-stop 试
+python revA1_gui.py --task-listen --point-cloud point_cloud/urinal_o2e_stride5.json
+python robot_link.py --task-listen
+python robot_link.py --task-demo start
+
 # 点云：生成"机械臂 + 点云 + 小车"场景 / 出预览图 / 自检
 python point_cloud.py --list
 python point_cloud.py --png runs/pc.png
@@ -516,6 +691,51 @@ python viewer.py --headless --seconds 3 --out runs/h.png --camera overview_cam
 python demo_trajectory.py --cartesian --video runs/cart.mp4 --camera overview_cam
 ```
 
+## 任务信号 6501 → 工具尖轨迹
+
+真机**开始 / 结束作业**时会往 **UDP 6501** 广播一个 JSON：
+
+```json
+{"motion": "start"}      // 开始作业
+{"motion": "over"}       // 结束作业（⚠️ 结束信号是 over）
+```
+
+界面卡片「任务信号 6501 → 工具尖轨迹」收到 **start** 就开始把**勾上的**工具尖位置连成轨迹
+（随机械臂实时长出来），收到 **over** 就**立刻清空轨迹** —— 画面上不留（想手动擦也可以点「清空轨迹」）。
+
+* **勾选框默认全不勾**：一个都不勾 → 只监听，不记也不画（这是默认行为）；
+* 轨迹颜色 = 该工具箭头的颜色（蓝/橙/品红），和画面上那三根工具向量箭头对得上；
+* 记的是**工具箭头尖**（= 该工具的 TCP，见上一节）—— 所以轨迹就是"末端实际走过哪儿"；
+* 采样：两点间距 < `spec.TRAIL_MIN_STEP_M`（默认 **1.5 mm**）不记 → 工具尖停着不动时不会灌点；
+  每根最多 `spec.TRAIL_MAX_POINTS`（默认 **6000** 点 ≈ 9 m 路程），超了**滚动丢最老的**
+  （卡片读数会写"已滚动丢掉 N 点"，路程照累计）；
+* 只在画面里（`mjCAT_DECOR`：不投阴影、不进 `mjModel`、不参与碰撞/物理/IK）；
+* 换场景（接点云）时轨迹跟着带过去。
+
+### 怎么用
+
+```bash
+# 界面：卡片上「开始监听」→ 勾上要画的工具 → 真机一开始作业就会长轨迹
+python revA1_gui.py --task-listen                    # 启动就监听（默认 6501）
+python revA1_gui.py --task-listen --task-port 6551   # 换个端口试
+
+# 没有真机也能试：命令行发一条任务信号（假真机）
+python robot_link.py --task-listen                   # 只听任务信号并打印 start/over
+python robot_link.py --task-demo start               # 往 127.0.0.1:6501 发 3 包 start
+python robot_link.py --task-demo over                # 结束（真机的结束信号就是 over）
+python robot_link.py --task-demo start --task-target 127.0.0.1:6551
+```
+
+> 报文写法宽松一点（真机改版不至于把链路断掉）：大小写/前后空格、`state`/`data` 外壳、
+> `{"motion": {"state": "start"}}` 都认；**结束**除了 `over`，`stop / done / finish / end / idle`、
+> `true-false`、`1-0` 这类等价写法也一并当"结束"（见 `robot_link.MOTION_END_WORDS`）。
+> 认不出来的包只记一条错误（卡片上会写出来），**不会**乱改任务状态，也不会把界面搞崩。
+>
+> 实测（`--ui-test` + 一次**跨进程**联调）：假真机发 `{"motion": "start"}` → 卡片显示「任务中」、
+> 日志记一条"任务信号：开始任务"；勾上夹爪后机械臂走一段 → 夹爪轨迹 35 点；「清空轨迹」→ 归零后
+> 又接着记（12 点）；发 `{"motion": "over"}` → **轨迹立刻清空（0 点）**、日志记一条"任务结束 → 已清空"；
+> 「停止监听」→ 线程退出。
+
 ## 想改东西改哪里
 
 | 想改 | 去哪 |
@@ -523,10 +743,17 @@ python demo_trajectory.py --cartesian --video runs/cart.mp4 --camera overview_ca
 | 换 URDF / 换机器人 | `revA1_spec.py` 的 `URDF` / `PACKAGE_ROOT`（默认用本目录 `TB6-R5-RevA1/`），然后重跑 `convert_urdf_to_mjcf.py` |
 | 真机地址 / 端口 | `robot_link.py` 顶部 `DEFAULT_HOST` / `DEFAULT_HTTP_URL` / `DEFAULT_UDP_PORT`（界面「真机跟随」卡片里也能直接改） |
 | 跟随手感（跟多紧 / 多平滑 / 限速 / 断线策略） | 卡片上的 平滑 / 限速 / 看门狗；或 `JointLink(smooth=…, max_speed_deg=…, timeout=…, timeout_policy=…)` |
-| 真机符号 / 零位（机型不同才要动） | `JointLink(signs=…, offsets=…)`；先用 `python robot_link.py --probe` 看模型复核那两行 |
+| 真机符号 / 零位（机型不同才要动） | `JointLink(signs=…, offsets=…)`；先用 `python robot_link.py --probe` 看模型复核那三行（**完整姿态差也要 ≈0°**，只有它能发现 J6 这类"位置上看不出来"的错） |
+| 某个关节的轴写反了（URDF 的坑） | `revA1_spec.JOINT_AXIS_FIX`（当前：`joint6 → 0 0 1`），改完重跑 `convert_urdf_to_mjcf.py`；实现见 `model_import.fix_joint_axis` |
+| **每个关节的限位**（真机与 URDF 范围不一致时） | 界面「关节限位」卡片 →「保存为默认」写进 **`config/joint_limits.json`**（删掉即回 URDF）；换目录用 `--config-dir` / 环境变量 `REVA1_CONFIG_DIR`；读写逻辑在 `revA1_config.py`，写进模型在 `arm_core.apply_joint_limits()`（`lo/hi` + `jnt_range` + `ctrlrange` 三处） |
+| 界面里**控件/按钮显示不全** | `revA1_gui.cap_width()`（宽度上限绝不低于控件最小需求）、`ControlPanel.floor_input_widths()`（行里有弹性空格时输入框的下限）、`layout_report()`（`--ui-test` 的布局体检）、`_fit_to_screen()`（窗口不超屏幕）、`RevA1Window._set_status()`（状态栏按宽度省略）、`scroll.setMinimumWidth(...)`（面板最小宽度）+ 横向滚动条 `AsNeeded` |
 | 点云的小车高度 / 点数 / 点大小 / 分色 | `point_cloud.py` 顶部 `DEFAULT_CART_HEIGHT_M` / `DEFAULT_MAX_POINTS` / `DEFAULT_POINT_R_MM` / `DEFAULT_BANDS`（界面「点云」卡片上也能直接改） |
 | 小车外形 / 基座在小车上怎么摆 | `point_cloud.py` 的 `CART_SIZE_M` / `CART_TOP_SIZE_M` / `DEFAULT_CART_CENTER_MM`（界面「小车中心」= `--cart-center`） |
 | 那个"绿色圆盘"（作业点标记） | 显隐：界面「作业点标记」勾选框（运行时对任何场景生效）/ 生成时 `point_cloud.py --show-target-pad`；要挪位置改基场景 `assets/revA1_scene.xml` 的 `target_pad`（或 `model_import.SCENE_TEMPLATE`） |
+| **三个工具的 TCP 向量**（画面箭头） | `revA1_spec.py` 的 `TOOLS`（末端法兰系，m）——箭头、界面读数自动跟着变；颜色 = 每项的 `rgba`；默认粗细 = `TOOL_ARROW_R_M`（界面「箭头粗细」也能调）；要先看数就跑 `python check_model.py` 的「三个工具的 TCP」那一段 |
+| 三根箭头**怎么画**（平行 / 起点 / 长度） | `arm_core.draw_tool_arrows()`：起点 = 安装点 `(vx, vy, 0)`、方向 = 法兰 +z（末端工具轴）、长度 = `vz` —— 所以**三根互相平行、且都平行于末端姿态**，箭头尖仍落在各自 TCP；自检里「三根箭头互相平行」那一项盯着它 |
+| **任务信号**（6501 的 `motion: start/over`） | 端口 = 界面「任务信号」卡片的端口框 / `--task-port`（`robot_link.DEFAULT_TASK_PORT` = 6501）；解析在 `robot_link.parse_task_payload()`（宽容写法在 `MOTION_TRUE`/`MOTION_END_WORDS`）；接收线程 `robot_link.TaskListener`；联调用 `--task-listen` / `--task-demo` |
+| **工具尖轨迹**（采样密度 / 点数上限 / 线粗细 / 颜色） | `revA1_spec.TRAIL_MIN_STEP_M`（默认 1.5 mm）、`TRAIL_MAX_POINTS`（6000）、`TRAIL_R_M`（2 mm）；颜色 = 该工具 `TOOLS[...]["rgba"]`；实现 `arm_core.Trail` / `draw_trail()` / `ArmSim.record_trails()`，界面接线在 `revA1_gui` 的 `_build_task()` / `task_tick()` |
 | **初始姿态 / home**（= 拍摄点云时的姿态） | `revA1_spec.py` 的 `HOME_QPOS`（连带 `CAPTURE_POSE` / `TARGET_POSE` / `NEUTRAL_QPOS` / `WORK_POSE`），改完 `python convert_urdf_to_mjcf.py` 重生成场景（也可 `--home <6 个关节角(rad)>` 覆盖） |
 | 点云自带的坐标系（o2e = 末端系） | 界面「点云」卡片的「坐标系」或 `--frame auto\|cam\|end`；判定逻辑在 `point_cloud.detect_cloud_frame()`（ROI 反投影命中率 + 文件声明） |
 | IK 选哪个解 / 直线能不能换解支 | `arm_core.solve_ik_best()`（精度都够好时挑离初值最近的解）、`LINE_MAX_BRANCH_JUMP_DEG`（超过就判"这条直线走不过去"） |
@@ -537,7 +764,7 @@ python demo_trajectory.py --cartesian --video runs/cart.mp4 --camera overview_ca
 | 伺服软硬 | `revA1_spec.py` 的 `GAINS`（kp/kv/forcerange） |
 | 地面高度 | 默认自动量 `base_link` 网格最低点；要覆盖用 `--floor-z` |
 | 场景布局（地面材质/相机/灯光/目标标记） | `assets/revA1_scene.xml`（生成物，可手改；重跑转换会覆盖） |
-| 界面配色 / 控件样式 | `revA1_gui.py` 顶部的 `QSS`（一处改全局） |
+| 界面配色 / 控件样式 | `revA1_gui.py` 顶部的 `QSS`（一处改全局）+ `spin_buttons_qss()`（数字控件上/下按钮的 `+`/`−` 图标，`make_app()` 里拼上去） |
 | IK 预设点（home/前伸/侧向/低位） | `revA1_gui.py` 顶部的 `POSE_PRESETS` |
 | 相机预设视角 | `arm_core.py` 顶部的 `VIEW_PRESETS` |
 | IK 判定阈值 / 直线点距 | `arm_core.py` 顶部的 `IK_TOL_POS_M` / `IK_TOL_AXIS_RAD` / `LINE_STEP_M` |

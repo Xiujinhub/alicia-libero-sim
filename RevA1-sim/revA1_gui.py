@@ -370,6 +370,8 @@ class ArmView(QWidget):
         try:
             self.renderer.update_scene(self.sim.data, camera=self.cam.mjv)
             self._add_markers()
+            self.sim.add_tool_arrows(self.renderer.scene)   # 三个工具 TCP 向量箭头（平行、随臂动）
+            self.sim.draw_trails(self.renderer.scene)       # 工具尖轨迹（任务信号驱动）
             arr = self.renderer.render()
         except Exception as e:  # noqa: BLE001
             self.message = f"渲染失败：{e}"
@@ -516,11 +518,14 @@ class ControlPanel(QWidget):
         self.cloud_report: list[str] = []     # 点云的体检报告（卡片上显示）
         self.cloud_points = None              # 基座系点云（存图时算视角用）
         self.cloud_error = ""
+        self.task_listener: link.TaskListener | None = None   # 任务信号（6501）监听，没启动时 None
+        self.task_active = False              # 最近一包是 start 且还没收到 over → 正在记轨迹
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(2, 2, 2, 2)
         lay.setSpacing(10)
-        for builder in (self._build_joints, self._build_follow, self._build_cloud,
+        for builder in (self._build_joints, self._build_tools, self._build_follow,
+                        self._build_task, self._build_cloud,
                         self._build_cartesian, self._build_points, self._build_run,
                         self._build_log):
             lay.addWidget(builder())
@@ -585,6 +590,56 @@ class ControlPanel(QWidget):
         grid.setColumnStretch(4, 1)
         card.body.addLayout(grid)
         return card
+
+    # ------------------------------------------------------------ 1.5 工具 TCP 向量（画面箭头）
+    def _build_tools(self) -> Card:
+        card = Card("工具 TCP 向量（跟随机械臂）",
+                    "同一片法兰装了三个工具（真机 TCP 标定给的是**末端系**向量）。"
+                    "画面上每个工具一根箭头，三根互相平行、都平行于末端工具轴，箭头尖落在各自 TCP 上，"
+                    "随机械臂实时动。")
+        self.tool_boxes: dict[str, QCheckBox] = {}
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        for name in spec.tool_names():
+            r, g, b, _ = spec.TOOLS[name]["rgba"]
+            box = QCheckBox(name)
+            box.setChecked(name in self.sim.show_tools)
+            box.setStyleSheet(f"color: rgb({int(r * 255)},{int(g * 255)},{int(b * 255)});"
+                              " font-weight: bold;")
+            box.stateChanged.connect(lambda _s, n=name: self._on_tool_toggle(n))
+            self.tool_boxes[name] = box
+            row.addWidget(box)
+        row.addStretch(1)
+        card.add_row(row)
+
+        self.tool_width = QDoubleSpinBox()
+        self.tool_width.setRange(1.0, 12.0)
+        self.tool_width.setSingleStep(0.5)
+        self.tool_width.setDecimals(1)
+        self.tool_width.setValue(float(spec.TOOL_ARROW_R_M) * 1000.0)
+        self.tool_width.setSuffix(" mm")
+        self.tool_width.setMaximumWidth(110)
+        self.tool_width.setToolTip("箭头杆半径（头部 = 2.2 倍）")
+        self.tool_width.valueChanged.connect(self._on_tool_width)
+        card.add_row(QLabel("箭头粗细"), self.tool_width, None)
+
+        self.tool_label = QLabel()
+        self.tool_label.setObjectName("Mono")
+        self.tool_label.setWordWrap(True)
+        self.tool_label.setMinimumHeight(54)
+        self.tool_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        card.add(self.tool_label)
+        return card
+
+    def _on_tool_toggle(self, name: str) -> None:
+        if self.tool_boxes[name].isChecked():
+            self.sim.show_tools.add(name)
+        else:
+            self.sim.show_tools.discard(name)
+        self.refresh()
+
+    def _on_tool_width(self, value: float) -> None:
+        self.sim.tool_width_m = float(value) / 1000.0
 
     def _make_step_box(self) -> QComboBox:
         self.step_box = QComboBox()
@@ -707,6 +762,114 @@ class ControlPanel(QWidget):
         card.add(self.follow_label)
         return card
 
+    # ------------------------------------------------------------ 2.5 任务信号 6501 → 工具尖轨迹
+    def _build_task(self) -> Card:
+        card = Card("任务信号 6501 → 工具尖轨迹",
+                    "真机开始/结束作业时往 **UDP 6501** 广播 ``{\"motion\": \"start\"}`` / "
+                    "``{\"motion\": \"over\"}``。收到 start 就把勾上的工具尖连成轨迹（随机械臂长出来），"
+                    "收到 over 就立刻清空。")
+        self.t_task_port = QSpinBox()
+        self.t_task_port.setRange(1, 65535)
+        self.t_task_port.setValue(int(link.DEFAULT_TASK_PORT))
+        self.t_task_port.setMaximumWidth(96)
+        self.t_task_port.setToolTip("真机任务信号 UDP 端口")
+        card.add_row(QLabel("端口"), self.t_task_port,
+                     self._btn("开始监听", self.on_task_start, name="Primary"),
+                     self._btn("停止监听", self.on_task_stop, name="Danger"))
+
+        self.trail_boxes: dict[str, QCheckBox] = {}
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        for name in spec.tool_names():
+            r, g, b, _ = spec.TOOLS[name]["rgba"]
+            box = QCheckBox(name)
+            box.setStyleSheet(f"color: rgb({int(r * 255)},{int(g * 255)},{int(b * 255)});"
+                              " font-weight: bold;")
+            box.setToolTip("勾上后，收到 start 就记这个工具尖的轨迹")
+            self.trail_boxes[name] = box
+            row.addWidget(box)
+        row.addStretch(1)
+        card.add_row(row)
+
+        card.add_row(self._btn("清空轨迹", self.on_task_clear, name="Preset"), None)
+
+        self.task_label = QLabel()
+        self.task_label.setObjectName("Mono")
+        self.task_label.setWordWrap(True)
+        self.task_label.setMinimumHeight(80)
+        self.task_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        card.add(self.task_label)
+        return card
+
+    # ---- 任务信号 → 轨迹：按钮 / 每帧 / 显示
+    def on_task_start(self) -> None:
+        if self.task_listener is not None and self.task_listener.running:
+            self.sim.log("任务信号监听已经在跑了（要改端口先点「停止监听」）")
+            return
+        try:
+            tk = link.TaskListener(int(self.t_task_port.value()))
+            tk.start()
+        except link.RobotLinkError as exc:
+            self.sim.log(f"任务信号监听启动失败：{exc}")
+            return
+        self.task_listener = tk
+        self.sim.log(f"任务信号监听已启动：{tk.describe()}"
+                     f"（收到 start 开始记勾选工具的轨迹，over 清空）")
+        self.refresh()
+
+    def on_task_stop(self) -> None:
+        if self.task_listener is None:
+            self.sim.log("任务信号监听还没启动")
+            return
+        self.task_listener.stop()
+        self.task_listener = None
+        self.task_active = False
+        self.sim.log("任务信号监听已停止")
+        self.refresh()
+
+    def on_task_clear(self) -> None:
+        n = self.sim.clear_trails()
+        self.sim.log(f"已清空 {n} 根轨迹" if n else "没有轨迹可清")
+        self.refresh()
+
+    def task_tick(self) -> None:
+        """主循环每帧调用：收到 start 就记勾选工具的轨迹，收到 over 就清空。"""
+        tk = self.task_listener
+        if tk is None:
+            return
+        for sig in tk.drain_signals():
+            if sig.motion == link.MOTION_START:
+                self.task_active = True
+                names = [n for n, b in self.trail_boxes.items() if b.isChecked()]
+                self.sim.log(f"任务开始（{sig.src or '?'}）：开始记轨迹"
+                             + (f" {names}" if names else "（没勾工具，只监听）"))
+            elif sig.motion == link.MOTION_OVER:
+                self.task_active = False
+                self.sim.clear_trails()
+                self.sim.log("任务结束：轨迹已清空")
+        if self.task_active:
+            names = [n for n, b in self.trail_boxes.items() if b.isChecked()]
+            if names:
+                self.sim.record_trails(names)
+
+    def _task_text(self) -> str:
+        tk = self.task_listener
+        lines = []
+        if tk is None:
+            lines.append("状态：未监听（点「开始监听」接 6501 任务信号）")
+        else:
+            st = tk.stats()
+            lines.append(f"状态：{'运行中' if tk.running else '已停止'} · 端口 :{st['port']} · "
+                         f"包 {st['packets']} / 错 {st['errors']}")
+            last = st["motion"]
+            lines.append("最近：" + (link.MOTION_LABELS.get(last, last) if last else "还没收到信号")
+                         + f" · 来自 {st['last_addr'] or '—'}")
+        if self.task_active:
+            lines.append("任务中：正在记勾选工具的轨迹")
+        trails = self.sim.trail_texts()
+        lines.append("轨迹：" + ("；".join(trails) if trails else "空（收到 start 且勾了工具才会长）"))
+        return "\n".join(lines)
+
     # ---- 真机跟随：按钮 / 每帧 / 显示
     def follow_source(self) -> str:
         """当前选的数据源（``auto`` / ``http`` / ``udp``）。"""
@@ -809,6 +972,9 @@ class ControlPanel(QWidget):
             self.link.stop()
             self.link = None
             self.follow_out = None
+        if self.task_listener is not None:
+            self.task_listener.stop()
+            self.task_listener = None
 
     def _follow_text(self) -> str:
         """卡片下半部分那几行状态：转发给模块级 :func:`follow_status_text`（自检也能用）。"""
@@ -1420,6 +1586,8 @@ class ControlPanel(QWidget):
         self.bar.setValue(int(round(st["progress"] * 1000)))
         self.follow_label.setText(self._follow_text())
         self.cloud_label.setText(self._cloud_text())
+        self.tool_label.setText("\n".join(self.sim.tool_lines()))
+        self.task_label.setText(self._task_text())
 
     def nudge_selected(self, sign: float) -> None:
         """键盘 ``-`` / ``=``：给选中关节 ± 一个步长。"""
@@ -1528,6 +1696,7 @@ class RevA1Window(QMainWindow):
         dt_wall = min(t0 - self.t_last, 0.25)      # 卡顿时最多补 0.25 s，别一次算几百步
         self.t_last = t0
         self.panel.follow_tick()                   # 真机跟随：先更新目标，再推进物理
+        self.panel.task_tick()                     # 任务信号 → 工具尖轨迹（start 记 / over 清）
         if not self.paused:
             self.acc += dt_wall
             n = 0
@@ -2211,6 +2380,10 @@ def run_gui(args) -> int:
     if getattr(args, "point_cloud", ""):
         win.panel.set_cloud_file(args.point_cloud)
         win.panel.on_cloud_load()
+    if getattr(args, "task_port", 0):
+        win.panel.t_task_port.setValue(int(args.task_port))
+    if getattr(args, "task_listen", False):
+        win.panel.on_task_start()
     return QApplication.instance().exec() if not args.exit_after else _exec(win)
 
 
@@ -2251,6 +2424,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--follow-port", type=int, default=0, help="覆盖真机 UDP 广播端口")
     ap.add_argument("--point-cloud", default="",
                     help="启动时直接把这个点云接进场景（等价于点卡片里的「加载点云」）")
+    ap.add_argument("--task-listen", action="store_true",
+                    help="启动时自动开「任务信号」监听（默认 UDP 6501）")
+    ap.add_argument("--task-port", type=int, default=0, help="覆盖任务信号 UDP 端口")
     ap.add_argument("--snapshot-dir", default=str(here / "runs"), help="存图目录")
     args = ap.parse_args(argv)
 

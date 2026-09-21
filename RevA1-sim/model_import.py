@@ -210,6 +210,22 @@ def name_geoms(text: str, suffix: str = "_geom") -> str:
     return _TAG_GEOM.sub(repl, text)
 
 
+def fix_joint_axis(text: str, fixes: dict | None) -> str:
+    """把指定关节的 ``axis=`` 改成给定值（URDF 的轴写反时的显式修正）。
+
+    用途见 ``revA1_spec.JOINT_AXIS_FIX``：TB6-R5 的 URDF 把 joint6 写成 ``0 0 -1``，
+    与真机固件的 J6 正方向相反 —— 后果只体现在"绕工具轴的滚转"上（工具尖/工具轴都查不出来），
+    所以必须在生成模型时显式翻正，不能靠肉眼看模型。
+    """
+    for name, ax in (fixes or {}).items():
+        axis = " ".join(f"{float(v):g}" for v in ax)
+        pat = re.compile(rf'(<joint\s+name="{re.escape(str(name))}"[^>]*?)\baxis="[^"]*"')
+        text, n = pat.subn(lambda m, a=axis: f'{m.group(1)}axis="{a}"', text)
+        if n == 0:
+            raise ValueError(f"找不到关节 {name!r} 的 axis=，无法修正")
+    return text
+
+
 def insert_into_body(text: str, body_name: str, snippet: str) -> str:
     """把 ``snippet`` 插进名为 ``body_name`` 的 body 内部（缩进自动对齐）。"""
     stack: list[str] = []
@@ -441,6 +457,7 @@ def build_arm_mjcf(
     root_body_name: str = "base_link",
     gains: dict[str, dict] | None = None,
     sites: dict[str, str] | None = None,
+    joint_axis_fix: dict | None = None,
     exclude_distance: int = 2,
     option_xml: str = OPTION_XML,
     default_xml: str = DEFAULT_XML,
@@ -480,6 +497,10 @@ def build_arm_mjcf(
     text = set_compiler(text, angle="radian", meshdir=meshdir,
                         autolimits="true", inertiafromgeom="false")
     text = insert_after_compiler(text, option_xml + "\n\n" + default_xml)
+
+    # --- 关节轴修正（URDF 的轴写反时；见 revA1_spec.JOINT_AXIS_FIX）---
+    if joint_axis_fix:
+        text = fix_joint_axis(text, joint_axis_fix)
 
     # --- 末端 site ---
     for body_name, snippet in (sites or {}).items():

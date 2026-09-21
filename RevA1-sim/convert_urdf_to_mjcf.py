@@ -81,8 +81,15 @@ def main(argv: list[str] | None = None) -> int:
     res = mi.build_arm_mjcf(
         args.urdf, out_dir / f"{args.name}_arm.xml",
         package_root=args.package_root, model_name=args.name,
-        gains=spec.GAINS, sites=spec.SITES, verbose=True)
+        gains=spec.GAINS, sites=spec.SITES, joint_axis_fix=spec.JOINT_AXIS_FIX,
+        verbose=True)
     model = res["model"]
+    if spec.JOINT_AXIS_FIX:
+        # URDF 里 joint6 的轴写反了（0 0 -1），与真机固件相反 —— 不翻正的话
+        # 工具尖/工具轴都正常，只有"绕工具轴的滚转"是镜像的（三个工具方位会颠倒）。
+        fixed = "、".join(f"{k}→({' '.join(str(v) for v in ax)})"
+                          for k, ax in spec.JOINT_AXIS_FIX.items())
+        print(f"关节轴修正: {fixed}（URDF 原文与真机约定相反；已按实测翻正）")
 
     floor_z = args.floor_z
     if floor_z is None:

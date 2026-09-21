@@ -48,7 +48,7 @@
               <geom name="Link5_geom" type="mesh" rgba="0.77647 0.75686 0.5 1" mesh="Link5"/>
               <body name="ee_Link" pos="0 0.0543 0.0507" quat="0.707105 -0.707108 0 0">
                 <inertial pos="-2.6515e-06 -9.8103e-05 0.021947" quat="0.510385 0.489598 -0.502945 0.496837" mass="1.1773" diaginertia="0.000873069 0.000554031 0.00055272"/>
-                <joint name="joint6" range="-3.1415 3.1415" axis="0 0 -1"/>
+                <joint name="joint6" range="-3.1415 3.1415" axis="0 0 1"/>
                 <geom name="ee_Link_geom" type="mesh" rgba="0.77647 0.5 0.5 1" mesh="ee_Link"/>
                 <!-- J6 法兰中心（机械接口原点）：插工具/相机都用它 -->
                 <site name="ee_site" pos="0 0 0" size="0.012" rgba="1 0.55 0.1 1" group="3"/>

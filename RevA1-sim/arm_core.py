@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +40,7 @@ from gl_backend import configure_gl
 configure_gl()
 import mujoco  # noqa: E402  (必须在设置 MUJOCO_GL 之后)
 
+import revA1_config as cfg  # noqa: E402  (关节限位的用户配置，只依赖标准库)
 import revA1_spec as spec  # noqa: E402
 import sim_ik as ik  # noqa: E402
 
@@ -119,6 +121,207 @@ def add_marker(scene, gtype: int, size, pos, mat, rgba) -> bool:
     )
     scene.ngeom += 1
     return True
+
+
+# ---------------------------------------------------------------- 工具 TCP 向量（画面箭头）
+def ee_frame(model, data, site: str = "ee_site") -> tuple[np.ndarray, np.ndarray]:
+    """末端法兰系在世界里的位姿 ``(原点, 旋转矩阵)``；``R`` 的三列 = 法兰的 x/y/z 轴。"""
+    sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, site)
+    if sid < 0:
+        raise KeyError(f"场景里没有 site {site!r}（工具向量是相对它算的）")
+    return (np.array(data.site_xpos[sid], dtype=float),
+            np.array(data.site_xmat[sid], dtype=float).reshape(3, 3))
+
+
+def tool_points(model, data, names=None, *, site: str = "ee_site") -> dict[str, np.ndarray]:
+    """各工具 TCP 的**世界坐标** = 法兰原点 + ``R_法兰 @ v``（``v`` 见 ``spec.TOOLS``）。"""
+    p, R = ee_frame(model, data, site)
+    keys = spec.tool_names() if names is None else [n for n in names if n in spec.TOOLS]
+    return {n: p + R @ spec.tool_vector(n) for n in keys}
+
+
+def draw_tool_arrows(scene, origin, rot, names=None, *,
+                     width: float = spec.TOOL_ARROW_R_M, head_scale: float = 2.2,
+                     tip_dot: bool = False) -> int:
+    """把每个工具画成一根**箭头**，返回画了几根。
+
+    **三根箭头互相平行，而且都平行于末端姿态的工具轴**（= 法兰 ``+z``）—— 三个工具是并排装在
+    同一片法兰上的，所以：
+
+    * 起点 = 该工具在**法兰平面上的安装点** ``origin + rot @ (vx, vy, 0)``（侧偏就体现在这儿）；
+    * 方向 = ``rot @ (0, 0, 1)`` = **末端工具轴**（世界系）；长度 = ``vz`` = 该工具的**轴向长度**；
+    * 于是箭头尖 = ``起点 + 方向 · vz`` = ``origin + rot @ v`` = **该工具的 TCP**（与以前一致，
+      所以"箭头尖落在 TCP 上"那个检查仍然成立）。
+
+    （早先的版本是"从法兰中心直接画到 TCP"，也就是把 ``v`` 的侧偏也算进方向 —— 那样三根箭头的
+    方向两两差 13.6°~14.9°，画面里是**扇形**；实际三个工具是平行的，这里按物理装法画。）
+
+    * ``scene``：``mujoco.Renderer.update_scene()`` 之后的 ``MjvScene``（与 :func:`add_marker`
+      一样——只在画面上，不参与物理/碰撞，也不改模型）；
+    * 箭头用 MuJoCo 的**渲染专用**几何 ``mjGEOM_ARROW``（``mjv_connector`` 摆位：
+      ``pos`` = 起点、本地 +z 指向终点）。
+      **箭头长度 = 该工具的轴向长度、箭头尖就落在 TCP 上**（注意 MuJoCo 只画 ``size[2]`` 的一半，
+      所以这里的 ``size[2]`` 会是 ``2·vz``，见下面注释），默认不再另画端点小球
+      （``tip_dot=True`` 才会加）；
+    * 每帧重算，所以箭头**跟着机械臂走**；几何数超上限时少画不报错；
+    * 归到 ``mjCAT_DECOR``：箭头不投阴影，画面上不会在机械臂上多出跟着动的色斑。
+    """
+    if scene is None:
+        return 0
+    keys = spec.tool_names() if names is None else [n for n in names if n in spec.TOOLS]
+    origin = np.asarray(origin, dtype=float).ravel()
+    rot = np.asarray(rot, dtype=float).reshape(3, 3)
+    axis = rot @ np.array([0.0, 0.0, 1.0])          # 末端工具轴（世界系）= 三根箭头的共同方向
+    n = 0
+    for name in keys:
+        v = spec.tool_vector(name)
+        rgba = np.asarray(spec.TOOLS[name]["rgba"], dtype=np.float32)
+        vz = float(v[2])
+        if vz > 1e-6:                                # 常规：装点 → 沿工具轴 → TCP
+            start = origin + rot @ np.array([v[0], v[1], 0.0])   # 法兰平面上的安装点
+            length = vz
+        else:                                        # 退化保护（工具朝 −z 装时按老画法走）
+            start, length = origin, float(np.linalg.norm(v))
+        tip = start + axis * length                  # = origin + rot @ v（该工具的 TCP）
+        if scene.ngeom >= scene.maxgeom:
+            break
+        g = scene.geoms[scene.ngeom]
+        mujoco.mjv_initGeom(g, int(mujoco.mjtGeom.mjGEOM_ARROW), np.zeros(3), np.zeros(3),
+                            np.eye(3).reshape(-1), rgba)
+        # ⚠️ 坑（实测，别删注释）：MuJoCo 3.13 画 mjGEOM_ARROW 时**只画 size[2] 的一半**
+        # —— 沿本地 +z 从 pos 起、长度 size[2]/2。直接 mjv_connector(起点, 终点) 得到
+        # size[2]=长度，画出来只有一半（箭头尖离 TCP 差 144~209 px）。
+        # 所以终点放 2 倍处：画出来正好是 起点 → 起点+长度·ẑ = **安装点 → TCP**。
+        # 空场景对照实测（箭长 300 mm，两端用小球标尺量像素）：size[2] = 150/300/600 mm
+        # → 画出 75/150/300 mm，且起点始终在 pos 上。这个约定由自检里
+        # "箭头尖到 TCP 的像素距离" 那一项守着（MuJoCo 若改行为会立刻被抓出来）。
+        mujoco.mjv_connector(g, int(mujoco.mjtGeom.mjGEOM_ARROW), float(width),
+                             start, start + 2.0 * (tip - start))
+        # mjv_connector 把头部半径也设成杆粗，看着不像箭头 → 单独放大头
+        g.size[1] = float(width) * float(head_scale)
+        # 归到"装饰"类：这样箭头**不投阴影**（实测带上阴影时，画面上会在小臂/腕部多出
+        # 一大片跟着动的色斑；改成 DECOR 后差异像素的纵向范围正好等于箭头长度）。
+        g.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
+        scene.ngeom += 1
+        n += 1
+        if tip_dot and scene.ngeom < scene.maxgeom:
+            d = scene.geoms[scene.ngeom]
+            mujoco.mjv_initGeom(d, int(mujoco.mjtGeom.mjGEOM_SPHERE),
+                                np.full(3, float(width) * 1.4), tip,
+                                np.eye(3).reshape(-1), rgba)
+            d.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
+            scene.ngeom += 1
+    return n
+
+
+# ---------------------------------------------------------------- 工具尖轨迹（任务信号驱动）
+class Trail:
+    """一根工具尖轨迹（世界系折线）：按最小间距采样、点数封顶、可清空。
+
+    只存点；画的时候交给 :func:`draw_trail`（一串短胶囊、``mjCAT_DECOR``，不投阴影、
+    不参与物理）。注意它跟路径规划里的 ``Motion`` / ``PlannedLine`` 是两回事 ——
+    那些是"准备要走的关节路点"，这个是"已经走过了的末端痕迹"（真机开始作业时由 6501 的
+    ``motion: start`` 触发记录，见 ``robot_link.TaskListener``）。
+
+    * ``min_step_m``：两个点比它还近就不记（工具尖停着不动时不会每秒灌几百个点）；
+    * ``max_points``：满了自动丢最老的点（滚动窗口，长时间作业也不会把内存/画面撑爆）；
+    * ``length_m``：**累计路程**（被丢掉的点也算过，用来显示"走了多远"）。
+    """
+
+    def __init__(self, name: str, *, rgba=(1.0, 1.0, 1.0, 1.0),
+                 min_step_m: float = spec.TRAIL_MIN_STEP_M,
+                 max_points: int = spec.TRAIL_MAX_POINTS):
+        self.name = str(name)
+        self.rgba = tuple(float(v) for v in rgba)
+        self.min_step_m = max(float(min_step_m), 0.0)
+        self.max_points = max(int(max_points), 2)
+        self._pts: deque = deque(maxlen=self.max_points)
+        self.length_m = 0.0
+        self.dropped = 0                     # 被滚动窗口丢掉的点数（显示"轨迹被截过"用）
+
+    def __len__(self) -> int:
+        return len(self._pts)
+
+    @property
+    def points(self) -> np.ndarray:
+        """所有采样点（``(N,3)``；没点时是 ``(0,3)``）。"""
+        return np.asarray(self._pts, dtype=float).reshape(-1, 3)
+
+    def add(self, p) -> bool:
+        """记一个点；离上一个点不够远（或完全没动）就不记，返回是否真的记了。"""
+        q = np.asarray(p, dtype=float).ravel()
+        if self._pts:
+            d = float(np.linalg.norm(q - np.asarray(self._pts[-1], dtype=float)))
+            if d < self.min_step_m:
+                return False
+            self.length_m += d
+            if len(self._pts) == self.max_points:
+                self.dropped += 1
+        self._pts.append((float(q[0]), float(q[1]), float(q[2])))
+        return True
+
+    def clear(self) -> int:
+        n = len(self._pts)
+        self._pts.clear()
+        self.length_m = 0.0
+        self.dropped = 0
+        return n
+
+    def text(self) -> str:
+        return (f"{self.name}  {len(self._pts)} 点 · 路程 {self.length_m:.3f} m"
+                + (f"（已滚动丢掉 {self.dropped} 点）" if self.dropped else ""))
+
+
+def draw_trail(scene, trail: Trail, *, width: float = spec.TRAIL_R_M) -> int:
+    """把一根轨迹画出来：相邻两点之间一段**胶囊**，返回画了几段。
+
+    只在画面上（``mjCAT_DECOR``：不投阴影、不参与物理、不进 ``mjModel``），每帧重画 →
+    轨迹随机械臂一点点长出来。
+    """
+    if scene is None or len(trail) < 2:
+        return 0
+    pts = trail.points
+    rgba = np.asarray(trail.rgba, dtype=np.float32)
+    n = 0
+    for i in range(len(pts) - 1):
+        if scene.ngeom >= scene.maxgeom:
+            break
+        a, b = pts[i], pts[i + 1]
+        if float(np.linalg.norm(b - a)) < 1e-9:
+            continue
+        g = scene.geoms[scene.ngeom]
+        mujoco.mjv_initGeom(g, int(mujoco.mjtGeom.mjGEOM_CAPSULE), np.zeros(3), np.zeros(3),
+                            np.eye(3).reshape(-1), rgba)
+        mujoco.mjv_connector(g, int(mujoco.mjtGeom.mjGEOM_CAPSULE), float(width), a, b)
+        g.category = int(mujoco.mjtCatBit.mjCAT_DECOR)
+        scene.ngeom += 1
+        n += 1
+    return n
+
+
+# ---------------------------------------------------------------- 关节限位（用户配置）
+def apply_joint_limits(model, limits=None) -> dict[str, tuple[float, float]]:
+    """把每个关节的限位写进**模型**，返回生效值（**度**）。
+
+    ``limits``：``{关节名: (最小°, 最大°)}``；没给的关节用 URDF 默认（``spec.LIMITS``）。
+
+    ⚠️ **三处必须一起改，少一处就白改**：
+
+    * ``model.jnt_range`` —— MuJoCo 的关节限位（``sim_ik`` 的迭代边界也读它）；
+    * ``model.actuator_ctrlrange`` —— 不改的话 MuJoCo 会把 ``data.ctrl`` 再按旧范围静默夹一次
+      （位置伺服就是这样：写进去的目标角会被夹回旧范围，表现成"卡在限位上"）；
+    * 调用方的 ``lo/hi``（``ArmSim`` 的由 :meth:`ArmSim.set_joint_limits` 负责）——
+      ``follow()`` / ``set_joint()`` / ``start_p2p()`` 用的是它。
+    """
+    eff = cfg.effective(limits)
+    for jn, (lo_deg, hi_deg) in eff.items():
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jn)
+        aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"act_{jn}")
+        if jid >= 0:
+            model.jnt_range[jid] = (np.radians(lo_deg), np.radians(hi_deg))
+        if aid >= 0:
+            model.actuator_ctrlrange[aid] = (np.radians(lo_deg), np.radians(hi_deg))
+    return eff
 
 
 # ---------------------------------------------------------------- IK 结果
@@ -401,7 +604,11 @@ class ArmSim:
     """
 
     def __init__(self, scene=spec.SCENE_XML, *, kp_scale: float = 1.0,
-                 gravity: bool = True, move_seconds: float = 1.5, log_scene: bool = True):
+                 gravity: bool = True, move_seconds: float = 1.5, log_scene: bool = True,
+                 joint_limits="auto", limits_path=None):
+        """``joint_limits``：``"auto"`` = 读 ``config/joint_limits.json``（界面就是这条路）；
+        ``None`` = 只用 URDF 默认；也可以直接给 ``{关节名: (最小°, 最大°)}``（给脚本/自检用）。
+        ``limits_path``：指定配置文件路径（默认 :func:`revA1_config.limits_path`）。"""
         self.scene = Path(scene)
         self.model = mujoco.MjModel.from_xml_path(str(scene))
         self.data = mujoco.MjData(self.model)
@@ -415,6 +622,20 @@ class ArmSim:
         self.set_gravity(gravity)
         self.lo = np.array([spec.LIMITS[j][0] for j in spec.JOINTS])
         self.hi = np.array([spec.LIMITS[j][1] for j in spec.JOINTS])
+        # 关节限位：URDF 默认 → 可被 config/joint_limits.json 覆盖（见 revA1_config / 界面「关节限位」卡片）
+        self.limits_path = Path(limits_path) if limits_path else cfg.limits_path()
+        self.limits_error = ""
+        self.limits: dict[str, tuple[float, float]] = cfg.urdf_limits()
+        self.limits_source = "URDF"
+        saved = None
+        if joint_limits == "auto":
+            try:
+                saved = cfg.load_limits(self.limits_path)
+            except cfg.ConfigError as exc:
+                self.limits_error = str(exc)
+        elif isinstance(joint_limits, dict):
+            saved = joint_limits
+        self.set_joint_limits(saved, source=("config" if saved else "URDF"), log_it=False)
         self.floor_z = self._read_floor_z()
         self.mode = "joint"
         self.cmd = np.array(spec.HOME_QPOS, dtype=float)
@@ -425,6 +646,9 @@ class ArmSim:
         self.last_plan: PlannedLine | None = None
         self.ik_target: tuple[np.ndarray, np.ndarray | None, bool] | None = None
         self.path_points: np.ndarray | None = None
+        self.show_tools: set[str] = set(spec.tool_names())      # 画哪几个工具的 TCP 向量箭头
+        self.tool_width_m = float(spec.TOOL_ARROW_R_M)          # 箭头杆半径[m]
+        self.trails: dict[str, Trail] = {}                      # 工具尖轨迹（任务信号驱动，见 record_trails）
         self.hidden_geoms: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self.messages: list[str] = []
         self.sim_time = 0.0
@@ -432,6 +656,11 @@ class ArmSim:
         if log_scene:
             self.log(f"模型已加载：{self.scene.name}（{self.model.nu} 个位置伺服，"
                      f"dt = {self.dt * 1000:.0f} ms，home 姿态已就位）")
+            if self.limits_error:
+                self.log(f"关节限位：{self.limits_path} 读不了（{self.limits_error}）→ 用 URDF 默认")
+            elif self.limits_source == "config":
+                self.log(f"关节限位：{self.limits_path.name} 已加载 —— {cfg.describe(self.limits)}"
+                         "（界面「关节限位」卡片可改）")
 
     # ---------------------------------------------------------------- 读
     def _read_floor_z(self) -> float:
@@ -469,6 +698,80 @@ class ArmSim:
         这样界面上显示的"离地"才还是真的离地。
         """
         return float(self.tip()[2] - self.floor_z)
+
+    # ---------------------------------------------------------------- 工具（TCP 向量）
+    def ee_pose(self) -> tuple[np.ndarray, np.ndarray]:
+        """末端法兰（``ee_site``）在世界里的位姿 ``(原点, 旋转矩阵)``。"""
+        return ee_frame(self.model, self.data)
+
+    def tool_points(self, names=None) -> dict[str, np.ndarray]:
+        """各工具 TCP 的**世界坐标**（默认三个都给；顺序 = ``spec.TOOLS``）。"""
+        return tool_points(self.model, self.data, names)
+
+    def tool_lines(self) -> list[str]:
+        """每个工具一行文字：TCP 世界坐标 / 离法兰多远 / 离地多高（界面直接拿去显示）。"""
+        out = []
+        for name, q in self.tool_points().items():
+            v = spec.tool_vector(name)
+            out.append(f"{name}  TCP ({q[0]:+.3f}, {q[1]:+.3f}, {q[2]:+.3f}) m"
+                       f" · 离法兰 {float(np.linalg.norm(v)) * 1000:5.1f} mm"
+                       f" · 离地 {q[2] - self.floor_z:.3f} m")
+        return out
+
+    def add_tool_arrows(self, scene, names=None, *, width: float | None = None,
+                        tip_dot: bool = False) -> int:
+        """按 :attr:`show_tools` 在当前末端位姿下画工具箭头（每帧调 → 跟着臂动）。
+
+        三根箭头**互相平行、都平行于末端工具轴**（法兰 +z）：从法兰平面上的**安装点**
+        （``(vx, vy, 0)``）沿工具轴画到各自 **TCP**（长度 = 该工具的轴向长度 ``vz``）。
+        默认不加端点小球。返回画了几根。``names`` 给了就用它（忽略 :attr:`show_tools`），
+        方便单独出图。
+        """
+        p, R = self.ee_pose()
+        use = sorted(self.show_tools, key=spec.tool_names().index) if names is None else names
+        return draw_tool_arrows(scene, p, R, use,
+                                width=self.tool_width_m if width is None else float(width),
+                                tip_dot=tip_dot)
+
+    # ---------------------------------------------------------------- 工具尖轨迹
+    def trail(self, name: str, *, create: bool = True) -> Trail | None:
+        """取某个工具的轨迹（``create=True`` 时没有就建，颜色 = 该工具箭头颜色）。"""
+        if name not in spec.TOOLS:
+            raise KeyError(f"没有这个工具：{name!r}（只认 {spec.tool_names()}）")
+        t = self.trails.get(name)
+        if t is None and create:
+            t = Trail(name, rgba=spec.TOOLS[name]["rgba"])
+            self.trails[name] = t
+        return t
+
+    def record_trails(self, names=None) -> int:
+        """把当前各工具的 **TCP**（= 画面上那根箭头的尖）记进轨迹，返回真新增的点数。
+
+        界面在"任务中"（收到 6501 的 ``motion: start``）时每帧调它；收到 ``stop`` 就不再调，
+        轨迹自然停住。``names=None`` = 三个工具都记；一般传"界面上勾选的那几个"。
+        """
+        n = 0
+        for name, p in self.tool_points(names).items():
+            t = self.trail(name)
+            if t is not None and t.add(p):
+                n += 1
+        return n
+
+    def draw_trails(self, scene, names=None) -> int:
+        """把（非空的）轨迹画到画面上，返回画了几段；``names=None`` = 全部。"""
+        use = list(self.trails) if names is None else [n for n in names if n in self.trails]
+        return sum(draw_trail(scene, self.trails[n]) for n in use)
+
+    def clear_trails(self, names=None) -> int:
+        """清空轨迹（``names=None`` = 全清），返回清了几根。"""
+        use = list(self.trails) if names is None else [n for n in names if n in self.trails]
+        for n in use:
+            self.trails[n].clear()
+        return len(use)
+
+    def trail_texts(self) -> list[str]:
+        """界面显示用：每根轨迹一行（点数 / 路程）；没记过的工具不出现。"""
+        return [self.trails[n].text() for n in spec.tool_names() if n in self.trails]
 
     def geom_names(self) -> list[str]:
         """场景里所有 geom 的名字（没名字的给 ``geom<id>``）。"""
@@ -536,6 +839,51 @@ class ArmSim:
     def set_gravity(self, on: bool) -> None:
         self.gravity_on = bool(on)
         self.model.opt.gravity[:] = (0.0, 0.0, -9.81) if self.gravity_on else (0.0, 0.0, 0.0)
+
+    # ---------------------------------------------------------------- 关节限位
+    def set_joint_limits(self, limits=None, *, source: str = "应用",
+                         log_it: bool = True) -> dict[str, tuple[float, float]]:
+        """换一套关节限位（``{关节名: (最小°, 最大°)}``；``None`` = 全回 URDF 默认）。
+
+        同时改三处（少一处就白改，见 :func:`apply_joint_limits`）：``self.lo/hi``、
+        ``model.jnt_range``、``model.actuator_ctrlrange``；当前目标角 ``cmd`` 会夹回新范围。
+        返回生效值（度）。值不合法抛 :class:`revA1_config.ConfigError`（原状不动）。
+        """
+        eff = apply_joint_limits(self.model, limits)       # 可能抛 ConfigError（调用方接住）
+        self.lo = np.array([np.radians(eff[j][0]) for j in spec.JOINTS])
+        self.hi = np.array([np.radians(eff[j][1]) for j in spec.JOINTS])
+        cmd = getattr(self, "cmd", None)                    # __init__ 里调得比 cmd 早，这里要容错
+        if cmd is not None:
+            self.cmd = np.clip(np.asarray(cmd, dtype=float), self.lo, self.hi)
+        self.limits = dict(eff)
+        self.limits_source = str(source)
+        if log_it:
+            self.log(f"关节限位（{source}）：{cfg.describe(eff)}")
+        return dict(eff)
+
+    def joint_limits(self) -> dict[str, tuple[float, float]]:
+        """当前生效的关节限位（度）。"""
+        return dict(self.limits)
+
+    def save_joint_limits(self, limits=None, *, log_it: bool = True) -> Path:
+        """把限位存进 ``config/joint_limits.json``（只写与 URDF 不同的项）并立即生效。"""
+        eff = self.set_joint_limits(limits, source="保存为默认", log_it=False)
+        path = cfg.save_limits(eff, self.limits_path)
+        self.limits_source = "config"
+        if log_it:
+            self.log(f"关节限位：已保存到 {path} —— {cfg.describe(eff)}（下次启动自动加载）")
+        return path
+
+    def reset_joint_limits(self, *, log_it: bool = True) -> tuple[dict, bool]:
+        """回 URDF 默认（并删掉配置文件）。返回 ``(生效值, 是否删掉了文件)``。"""
+        eff = self.set_joint_limits(None, source="URDF", log_it=False)
+        removed = False
+        if self.limits_path.exists():
+            removed = cfg.clear_limits(self.limits_path)
+        if log_it:
+            self.log("关节限位：已恢复 URDF 默认（joint3 ±164°，其余 ±180°）"
+                     + ("，配置文件已删除" if removed else ""))
+        return eff, removed
 
     def set_joint(self, i: int, q_rad: float, *, log_it: bool = False) -> float:
         """单关节：把第 i 个关节的**目标角**直接设过去（界面上的 −/+ 按钮走这里）。

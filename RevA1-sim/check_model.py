@@ -122,6 +122,17 @@ def check_home(model: mujoco.MjModel, data: mujoco.MjData, floor_z: float) -> No
     got_axis = ik.tool_axis(model, data, "tool_site")
     dev = float(np.degrees(np.arccos(np.clip(np.dot(expect_axis, got_axis), -1, 1))))
     log(f"  期望工具轴= {fmt(expect_axis)}（spec.CAPTURE_POSE）偏差 {dev:.3f}°")
+    # ⚠️ 只看工具尖 + 工具轴**不够**：它们对 J6 的符号/零位不敏感（工具尖恰在 J6 轴上、
+    #    工具轴又是 J6 的旋转轴）。这里把完整 3×3 姿态也对一遍 —— 当年 URDF 把 joint6 的轴
+    #    写成 0 0 -1（与真机固件相反）就是这一项抓出来的（差值 158.9°，而前两项全过）。
+    R_home = np.array(data.site_xmat[ik.site_id(model, "ee_site")], dtype=float).reshape(3, 3)
+    R_cap = spec.pose_matrix(spec.CAPTURE_POSE)[0]
+    full = float(np.degrees(np.arccos(np.clip(
+        (np.trace(R_home.T @ R_cap) - 1.0) / 2.0, -1.0, 1.0))))
+    log(f"  完整姿态偏差= {full:.4f}°（含绕工具轴滚转；与 spec.CAPTURE_POSE 的 3×3 比）")
+    if full > 1.0:
+        warn(f"home 与 CAPTURE_POSE 的完整姿态差 {full:.2f}°：多半有某个关节的轴/零位写反了"
+             "（J6 这类错在工具尖/工具轴上都看不出来）→ 看 revA1_spec.JOINT_AXIS_FIX")
     log(f"  重力力矩  = {fmt(data.qfrc_bias[:6], 1)} Nm")
     log(f"  自碰撞对数= {data.ncon}")
 
@@ -190,6 +201,39 @@ def check_stability(model: mujoco.MjModel, data: mujoco.MjData) -> None:
         warn(f"静置漂移 {drift.max():.2f}° > 0.5°，建议加大 kp 或减小负载")
     if peak.max() > 2.0:
         warn(f"过程中抖了 {peak.max():.2f}°，检查 kv/armature/damping")
+
+
+# ============================================================================ 3b
+def check_tools(model: mujoco.MjModel, data: mujoco.MjData, floor_z: float) -> None:
+    """三个工具（夹爪 / 喷嘴1 / 喷嘴2）的 TCP 向量：在 home 姿态下算一遍世界坐标。
+
+    TCP 向量定义在 ``revA1_spec.TOOLS``（末端法兰系，m），画面上的箭头 = 法兰原点 + R·v。
+    """
+    log("\n--- 三个工具的 TCP（home 姿态，末端法兰系向量 → 世界坐标）---")
+    if not ik.reset_home(model, data):
+        mujoco.mj_forward(model, data)
+    sid = ik.site_id(model, "ee_site")
+    p = np.array(data.site_xpos[sid], dtype=float)
+    R = np.array(data.site_xmat[sid], dtype=float).reshape(3, 3)
+    log(f"  法兰原点 ee_site = {fmt(p, 4)} m   （|RᵀR−I| = "
+        f"{float(np.abs(R.T @ R - np.eye(3)).max()):.1e}）")
+    pts = {}
+    for name in spec.tool_names():
+        v = spec.tool_vector(name)
+        q = p + R @ v
+        pts[name] = q
+        log(f"  {name:5s} v = {fmt(v, 4)} m  |v| = {float(np.linalg.norm(v)) * 1000:6.1f} mm"
+            f"  →  世界 {fmt(q, 4)} m  离地 {q[2] - floor_z:.3f} m")
+        if abs(float(np.linalg.norm(q - p)) - float(np.linalg.norm(v))) > 1e-12:
+            warn(f"{name} 的 TCP 离法兰距离与 |v| 不一致（旋转矩阵不正交？）")
+        if q[2] <= floor_z:
+            warn(f"{name} 的 TCP 在 home 姿态下低于地面（{q[2] - floor_z:.3f} m），检查标定向量")
+    names = spec.tool_names()
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            log(f"  {a} ↔ {b} 间距 = {float(np.linalg.norm(pts[a] - pts[b])) * 1000:.1f} mm")
+    log("  说明：箭头/小球只在**画面**上（mjGEOM_ARROW，不进 mjModel、不参与物理）；"
+        "界面「工具 TCP 向量」卡片可单独开关、调粗细。")
 
 
 # ============================================================================ 4
@@ -313,6 +357,24 @@ def main(argv: list[str] | None = None) -> int:
     data = mujoco.MjData(model)
     log("场景编译成功 [OK]")
 
+    # 用户配置里的关节限位（config/joint_limits.json）也要生效 —— 否则这里报的
+    # "工作空间 / 限位余量" 和界面里看到的不是一回事（界面「关节限位」卡片可改）。
+    try:
+        import revA1_config as cfg
+        saved = cfg.load_limits()
+        if saved:
+            eff = cfg.effective(saved)                      # 度 → 弧度写进模型
+            for jn in spec.JOINTS:
+                jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, jn)
+                if jid >= 0:
+                    model.jnt_range[jid] = (np.radians(eff[jn][0]), np.radians(eff[jn][1]))
+            log(f"关节限位    : 已应用 {cfg.limits_path()} —— {cfg.describe(saved)}")
+        else:
+            log(f"关节限位    : URDF 默认（没有 {cfg.limits_path()}）"
+                f"：joint3 ±164°，其余 ±180°")
+    except Exception as exc:  # noqa: BLE001
+        log(f"关节限位    : 配置文件读不了（{exc}）→ 用 URDF 默认")
+
     # 地面高度直接问场景里的 floor geom（比 spec 里的常数更准）
     gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
     floor_z = float(model.geom_pos[gid][2]) if gid >= 0 else spec.FLOOR_Z
@@ -321,6 +383,7 @@ def main(argv: list[str] | None = None) -> int:
 
     dump_structure(model)
     check_home(model, data, floor_z)
+    check_tools(model, data, floor_z)
     check_stability(model, data)
     check_workspace(model, data, floor_z, args.samples)
     check_reach(model, data, floor_z)

@@ -48,8 +48,13 @@
 （HTTP 与 UDP 同时开，哪路新用哪路）。
 
 把 ``joints`` 直接灌进模型 qpos 后 FK 出来的 ``tool_site`` 与真机 ``pose[:3]`` 实测差 0.5 mm，
-用 ``pose[3:6]``（外旋 XYZ 欧拉角）算出的工具轴与模型工具轴完全一致
-——**所以真机与仿真的关节约定同号，关节角可以直接镜像**（``--probe`` 会现场复核这件事）。
+用 ``pose[3:6]``（外旋 XYZ 欧拉角）算出的工具轴与模型工具轴完全一致，**完整姿态（3×3）也只有 0.00°**
+—— 也就是**同号同零位，关节角可以直接镜像**（``--probe`` 会把这三项都打出来复核）。
+
+⚠️ 第三项（完整姿态）不能省：工具尖恰在 J6 轴上、工具轴又是 J6 的旋转轴，所以 **J6 符号/零位
+写反在位置和工具轴上完全看不出来**。实测踩过一次：URDF 把 joint6 的轴写成 ``0 0 -1``，
+与真机固件相反 → 前两项 0.5 mm / 0.00° 全过，完整姿态却差 144~159°（表现为法兰上装的三个工具
+方位左右颠倒）。修正在 ``revA1_spec.JOINT_AXIS_FIX``。
 
 为什么格式要"猜"
 ----------------
@@ -127,6 +132,7 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_HOST = "192.168.66.169"
 DEFAULT_HTTP_URL = f"http://{DEFAULT_HOST}:8080/api/state"
 DEFAULT_UDP_PORT = 6001           # 真机实测：往 255.255.255.255:6001 广播状态（~96 Hz）
+DEFAULT_TASK_PORT = 6501          # 真机实测：往 6501 广播**任务信号**（motion: start / stop）
 DEFAULT_HTTP_HZ = 30.0            # HTTP 轮询频率（真机的状态流 ~30 Hz，再快没意义）
 HTTP_TIMEOUT = 1.0
 RECV_BUFFER = 65535
@@ -144,6 +150,24 @@ MODES = ("absolute", "relative")
 MODE_LABELS = ("绝对（完全镜像真机）", "相对（只镜像增量）")
 TIMEOUT_POLICIES = ("hold", "home")
 TIMEOUT_LABELS = ("保持不动（推荐）", "回 home")
+
+# ------------------------------------------------------------------ 任务信号（6501）
+# 真机在**开始 / 结束作业**时往 6501 广播一个 JSON：``{"motion": "start"}`` / ``{"motion": "over"}``。
+# 界面拿它当"开始记轨迹 / 收到结束就清空轨迹"的开关（见 revA1_gui 的「任务信号 → 轨迹」卡片）。
+MOTION_START = "start"
+MOTION_OVER = "over"              # ⚠️ 真机的结束信号是 **over**（不是 stop）
+MOTION_LABELS = {MOTION_START: "开始任务", MOTION_OVER: "结束任务"}
+# 真机各版本/各写法都接住一点（大小写、空格、true/1、run/idle 之类）：这些值都归到上面两个
+MOTION_TRUE = ("start", "started", "starting", "run", "running", "on", "true", "1",
+               "begin", "play", "work", "working", "go")
+MOTION_END_WORDS = ("over", "stop", "stopped", "stopping", "done", "finish", "finished",
+                    "complete", "completed", "off", "false", "0", "end", "idle",
+                    "pause", "paused", "reset")
+MOTION_KEYS = ("motion", "motionstate", "motion_state")
+MOTION_FALLBACK_RE = re.compile(
+    r"[\"']?motion[\"']?\s*[:=]\s*[\"']?(over|start|stop|started|stopped|run|idle|on|off|"
+    r"true|false|done|finish|end|complete|1|0)",
+    re.I)
 
 PREVIEW_BYTES = 72                # 界面上显示多少字节的原始包
 # 带 "state" / "data" 外壳的 JSON（真机 HTTP 用 state，UDP 广播用 data）：往里再挖一层
@@ -748,6 +772,268 @@ class UdpStateSource(StateSource):
             self.sock = None
 
 
+# =============================================================== 任务信号（6501）
+def _motion_from_obj(obj) -> str | None:
+    """在 JSON（可能带 ``state``/``data`` 外壳、可能嵌套）里找任务状态那个字段。"""
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            name = str(key).lower().replace("-", "").replace(" ", "")
+            if name in MOTION_KEYS:
+                if isinstance(val, (str, int, float, bool)):
+                    return str(val)
+                if isinstance(val, dict):                     # {"motion": {"state": "start"}}
+                    for k2 in ("state", "value", "motion", "status", "action"):
+                        if isinstance(val.get(k2), (str, int, float, bool)):
+                            return str(val[k2])
+            if isinstance(val, (dict, list)):                 # 往里再挖一层
+                got = _motion_from_obj(val)
+                if got is not None:
+                    return got
+    elif isinstance(obj, list):
+        for item in obj:
+            got = _motion_from_obj(item)
+            if got is not None:
+                return got
+    return None
+
+
+def parse_task_payload(data: bytes) -> tuple[str, str]:
+    """一包**任务信号** → ``(motion, 原文预览)``，``motion`` ∈ {``start``, ``stop``}。
+
+    真机约定：JSON 里 ``motion: start`` = 开始作业、``motion: over`` = 结束作业。
+    这里对写法宽松一点（真机改版不至于就让链路断掉）：
+
+    * 大小写/前后空格都行；``state``/``data`` 外壳、``{"motion": {"state": "start"}}`` 也认；
+    * **结束**除了 ``over``，``stop / done / finish / end / idle / true-false / 1-0`` 这类等价写法
+      也一并当"结束"（见 :data:`MOTION_END_WORDS`）；
+    * 整包 JSON 里找不到 ``motion`` 时，再用正则从原文里捞一次（例如 ``motion=start``）。
+
+    认不出来抛 :class:`RobotLinkError`（上层只记一条错误，不崩、不改状态）。
+    """
+    raw = preview_bytes(data)
+    text = bytes(data).decode("utf-8", "replace") if looks_text(data) else ""
+    value = None
+    if text:
+        try:
+            value = _motion_from_obj(json.loads(text))
+        except ValueError:
+            value = None
+        if value is None:
+            hit = MOTION_FALLBACK_RE.search(text)
+            value = hit.group(1) if hit else None
+    if value is None:
+        raise RobotLinkError(f"不是任务信号（没有 motion 字段）：{raw}")
+    word = value.strip().strip("\"'").lower()
+    if word in MOTION_TRUE:
+        return MOTION_START, raw
+    if word in MOTION_END_WORDS:
+        return MOTION_OVER, raw
+    raise RobotLinkError(f"motion 的值认不出来：{value!r}（只认 start / over）：{raw}")
+
+
+@dataclass
+class TaskSignal:
+    """一帧任务信号（:class:`TaskListener` 收到的那一包）。"""
+
+    motion: str                       # "start" / "stop"
+    raw: str = ""
+    stamp: float = 0.0                # time.perf_counter()（算新鲜度用）
+    wall: float = 0.0                 # time.time()（日志打时间戳用）
+    src: str = ""                     # 发广播的那个地址 ip:port
+    seq: int = 0
+
+    def label(self) -> str:
+        return MOTION_LABELS.get(self.motion, self.motion)
+
+    def summary(self) -> str:
+        return f"任务信号：{self.label()}（来自 {self.src or '?'}）· {self.raw}"
+
+
+class TaskListener:
+    """听真机的**任务信号**广播（默认 UDP :data:`DEFAULT_TASK_PORT` = 6501，JSON）。
+
+    ``{"motion": "start"}`` = 开始作业（界面就开始把勾上的工具尖连成轨迹），
+    ``{"motion": "over"}`` = 结束作业（界面收到就把轨迹**清空**，画面不留）。
+
+    和 :class:`UdpStateSource` 一样是"后台线程 + 线程安全的最新值"，但**只记状态、不碰模型**：
+    界面每帧问 :meth:`is_running`。收不到 / 认不出的包只记一条错误，绝不会把界面搞崩。
+    """
+
+    kind = "task"
+
+    def __init__(self, port: int = DEFAULT_TASK_PORT, *, host: str = "", mcast: str = ""):
+        self.port = int(port)
+        if not (0 < self.port < 65536):
+            raise RobotLinkError(f"任务信号端口要在 1..65535：{port}")
+        self.host = str(host or "")
+        self.mcast = str(mcast or "")
+        self.sock: socket.socket | None = None
+        self.last_addr = ""
+        self.packets = 0
+        self.errors = 0
+        self.starts = 0
+        self.stops = 0
+        self.last_error = ""
+        self._seq = 0
+        self._latest: TaskSignal | None = None
+        self._pending: deque = deque(maxlen=64)     # 还没被界面取走的信号（start/stop 各一条）
+        self._stamps: deque = deque(maxlen=RATE_SAMPLES)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # ---------------------------------------------------------- 生命周期
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._guarded_run, name="revA1-task",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 1.5) -> None:
+        self._stop.set()
+        t, self._thread = self._thread, None
+        if t is not None and t.is_alive():
+            t.join(timeout)
+        if self.sock is not None:              # 兜底：超时窗口内还没退就硬关
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+
+    @property
+    def running(self) -> bool:
+        return bool(self._thread is not None and self._thread.is_alive())
+
+    def _guarded_run(self) -> None:
+        try:
+            self._run()
+        except Exception as exc:  # noqa: BLE001
+            self.fail(f"线程异常：{type(exc).__name__}: {exc}")
+
+    def _open(self) -> socket.socket:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        except OSError:
+            pass
+        s.bind((self.host, self.port))
+        if self.mcast:
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                         socket.inet_aton(self.mcast) + socket.inet_aton("0.0.0.0"))
+        s.settimeout(SOCKET_TIMEOUT)
+        return s
+
+    def _run(self) -> None:
+        self.sock = self._open()
+        try:
+            while not self._stop.is_set():
+                try:
+                    data, addr = self.sock.recvfrom(RECV_BUFFER)
+                except socket.timeout:
+                    continue
+                except OSError as exc:
+                    if self._stop.is_set():
+                        break
+                    self.fail(f"socket: {exc}")
+                    continue
+                self._recv_one(data, addr)
+        finally:
+            if self.sock is not None:
+                self.sock.close()
+                self.sock = None
+
+    def _recv_one(self, data: bytes, addr) -> None:
+        try:
+            motion, raw = parse_task_payload(data)
+        except RobotLinkError as exc:
+            self.fail(f"{addr[0]}:{addr[1]} {exc}")
+            return
+        self.publish(TaskSignal(motion=motion, raw=raw, stamp=time.perf_counter(),
+                                wall=time.time(), src=f"{addr[0]}:{addr[1]}"))
+
+    # ---------------------------------------------------------- 数据
+    def publish(self, sig: TaskSignal) -> None:
+        with self._lock:
+            self._seq += 1
+            sig.seq = self._seq
+            self.packets += 1
+            self._stamps.append(sig.stamp)
+            self._latest = sig
+            self.last_addr = sig.src
+            if sig.motion == MOTION_START:
+                self.starts += 1
+            else:
+                self.stops += 1
+            self._pending.append(sig)               # 界面/自检用 drain_signals() 取走
+
+    def fail(self, msg: str) -> None:
+        with self._lock:
+            self.errors += 1
+            self.last_error = msg
+
+    def latest(self) -> TaskSignal | None:
+        with self._lock:
+            return self._latest
+
+    def state(self) -> str:
+        """最近一次信号是 ``start`` 还是 ``stop``（从没收到过 = ``""``）。"""
+        with self._lock:
+            return "" if self._latest is None else self._latest.motion
+
+    def is_running(self) -> bool:
+        """现在是不是"任务中"（最近一包是 start、还没收到 stop）。没收到过 = ``False``。"""
+        return self.state() == MOTION_START
+
+    def age(self) -> float:
+        """距最近一包多久[s]（从没收到过 = ``inf``）。"""
+        with self._lock:
+            if self._latest is None:
+                return float("inf")
+            return max(time.perf_counter() - self._latest.stamp, 0.0)
+
+    def rate_hz(self) -> float:
+        with self._lock:
+            if len(self._stamps) < 2:
+                return 0.0
+            span = self._stamps[-1] - self._stamps[0]
+            return 0.0 if span <= 1e-6 else (len(self._stamps) - 1) / float(span)
+
+    def drain_signals(self) -> list[TaskSignal]:
+        """把还没被取走的信号取走（**每条只出现一次**）。
+
+        界面用它分派：``start`` → 开始记轨迹，``stop`` → 清空轨迹（画面上不留）。
+        """
+        with self._lock:
+            out = list(self._pending)
+            self._pending.clear()
+            return out
+
+    def drain_events(self) -> list[str]:
+        """同 :meth:`drain_signals`，但取成一行行中文（联调 / 自检打印用）。"""
+        return [s.summary() for s in self.drain_signals()]
+
+    def stats(self) -> dict:
+        with self._lock:                      # ⚠️ 锁里不要再调 self.state()/self.latest()
+            motion = "" if self._latest is None else self._latest.motion
+            return dict(kind=self.kind, port=self.port, packets=self.packets,
+                        errors=self.errors, starts=self.starts, stops=self.stops,
+                        motion=motion, last_error=self.last_error,
+                        last_addr=self.last_addr, running=self.running)
+
+    def endpoint(self) -> str:
+        who = f"{self.host or '0.0.0.0'}:{self.port}"
+        if self.mcast:
+            return f"{who} + 组播 {self.mcast}"
+        return f"{who} ← {self.last_addr or '（还没收到包）'}"
+
+    def describe(self) -> str:
+        return f"任务信号 UDP 监听 :{self.port}"
+
+
 # =============================================================== 链路总入口
 @dataclass
 class FollowOut:
@@ -1082,6 +1368,31 @@ def emit_demo(target: str = f"127.0.0.1:{DEFAULT_UDP_PORT}", *, fmt: str = "json
     return sent
 
 
+def send_task_signal(target: str = f"127.0.0.1:{DEFAULT_TASK_PORT}",
+                     motion: str = MOTION_START, *, times: int = 1, hz: float = 10.0,
+                     broadcast: bool = False) -> int:
+    """往 ``host:port`` 发 ``{"motion": ...}``（**模拟真机**，联调 / 自检用），返回发了几包。
+
+    ``motion`` 接受 ``start`` / ``over``（真机用法），也接受 ``stop`` 这种等价写法 ——
+    ``python robot_link.py --task-demo over`` 就是它，不开界面也能先确认"界面对任务信号的反应"。
+    """
+    host, port = split_target(target, DEFAULT_TASK_PORT)
+    word = str(motion).strip().lower()
+    if word not in (MOTION_START, MOTION_OVER, "stop"):
+        raise RobotLinkError(f"motion 只能是 start / over（stop 也认）：{motion!r}")
+    body = json.dumps({"motion": word}).encode("utf-8")
+    dst = ("255.255.255.255" if broadcast else host, int(port))
+    sent = 0
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for i in range(max(int(times), 1)):
+            s.sendto(body, dst)
+            sent += 1
+            if hz > 0 and i + 1 < times:
+                time.sleep(1.0 / float(hz))
+    return sent
+
+
 class FakeStateServer:
     """假真机：在本地起一个 HTTP 服务，模仿真机的 ``/api/state``（自检 / 界面演示用）。
 
@@ -1163,7 +1474,12 @@ def free_udp_port() -> int:
 def fk_diff(q_rad, pose, *, scene=None):
     """用 MuJoCo 正运动学复核"真机关节角 ↔ 真机 pose"是不是同一套约定。
 
-    返回 ``(工具尖位置误差[m], 工具轴夹角[°])``；没装 mujoco / 没模型时返回 ``None``。
+    返回 ``(工具尖位置误差[m], 工具轴夹角[°], 完整姿态夹角[°])``；没装 mujoco / 没模型时返回 ``None``。
+
+    ⚠️ 第三项（完整姿态）**必须有**：工具尖恰在 J6 轴上、工具轴又是 J6 的旋转轴，所以
+    "J6 符号/零位写反"这种错在位置和工具轴上都看不出来（实测：URDF 把 joint6 的轴写成
+    ``0 0 -1``，与真机固件相反 → 前两项 0.5 mm / 0.00° 全过，第三项却是 144~159°）。
+    修正在 ``revA1_spec.JOINT_AXIS_FIX``。
     """
     try:
         import mujoco                                        # noqa: PLC0415
@@ -1176,10 +1492,13 @@ def fk_diff(q_rad, pose, *, scene=None):
         data.qpos[:JOINTS_N] = np.asarray(q_rad, dtype=float).ravel()
         mujoco.mj_forward(model, data)
         sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, "tool_site")
+        R_model = data.site_xmat[sid].reshape(3, 3)
         dpos = float(np.linalg.norm(data.site_xpos[sid] - np.asarray(pose[:3], dtype=float)))
         dax = math.degrees(math.acos(float(np.clip(
-            data.site_xmat[sid].reshape(3, 3)[:, 2] @ euler_xyz_to_axis(*pose[3:6]), -1.0, 1.0))))
-        return dpos, dax
+            R_model[:, 2] @ euler_xyz_to_axis(*pose[3:6]), -1.0, 1.0))))
+        R_pose = spec.euler_xyz_matrix(*pose[3:6])           # 外旋 XYZ（与真机 pose 同一约定）
+        cos = float(np.clip((np.trace(R_model.T @ R_pose) - 1.0) / 2.0, -1.0, 1.0))
+        return dpos, dax, math.degrees(math.acos(cos))
     except Exception:  # noqa: BLE001
         return None
 
@@ -1209,8 +1528,9 @@ def probe_once(url: str = DEFAULT_HTTP_URL, *, timeout: float = 2.0, with_fk: bo
             print("  模型复核    : 跳过（没装 mujoco / 找不到模型）")
         else:
             print(f"  模型复核    : 把 joints 灌进模型 qpos 后，工具尖差 "
-                  f"{diff[0] * 1000:.2f} mm、工具轴差 {diff[1]:.2f}°"
-                  f"（<5 mm / <2° 说明关节约定同号，可以直接镜像）")
+                  f"{diff[0] * 1000:.2f} mm、工具轴差 {diff[1]:.2f}°、完整姿态差 {diff[2]:.2f}°"
+                  f"（<5 mm / <2° / <2° 说明关节约定同号，可以直接镜像；"
+                  f"第三项专盯 J6 符号/零位这种\"位置上看不出来\"的错）")
     print("-" * 78)
     return st
 
@@ -1442,9 +1762,10 @@ def run_selftest(args) -> int:
                 if diff is None:
                     print("  [SKIP] 模型复核（没装 mujoco / 找不到模型）")
                 else:
-                    check("模型复核：真机 joints 与 pose 是同一套约定（<5 mm / <2°）",
-                          diff[0] < 5e-3 and diff[1] < 2.0,
-                          f"工具尖差 {diff[0] * 1000:.2f} mm / 工具轴差 {diff[1]:.2f}°")
+                    check("模型复核：真机 joints 与 pose 是同一套约定（<5 mm / <2° / <2°）",
+                          diff[0] < 5e-3 and diff[1] < 2.0 and diff[2] < 2.0,
+                          f"工具尖差 {diff[0] * 1000:.2f} mm / 工具轴差 {diff[1]:.2f}°"
+                          f" / 完整姿态差 {diff[2]:.2f}°")
         except Exception as exc:  # noqa: BLE001
             print(f"  [SKIP] 真机 {url} 现在读不到（{type(exc).__name__}: {exc}）")
         # 真机也在 UDP 上广播（本机实测 :6001，~96 Hz）
@@ -1463,11 +1784,78 @@ def run_selftest(args) -> int:
                 if live.pose is not None:
                     diff = fk_diff(live.q_rad, live.pose)
                     if diff is not None:
-                        check("模型复核（UDP 包）：joints 与 pose 是同一套约定",
-                              diff[0] < 5e-3 and diff[1] < 2.0,
-                              f"工具尖差 {diff[0] * 1000:.2f} mm / 工具轴差 {diff[1]:.2f}°")
+                        check("模型复核（UDP 包）：joints 与 pose 是同一套约定（含完整姿态）",
+                              diff[0] < 5e-3 and diff[1] < 2.0 and diff[2] < 2.0,
+                              f"工具尖差 {diff[0] * 1000:.2f} mm / 工具轴差 {diff[1]:.2f}°"
+                              f" / 完整姿态差 {diff[2]:.2f}°")
         except OSError as exc:
             print(f"  [SKIP] 真机 UDP 收不了（端口被占？）：{exc}")
+
+    # 9) 任务信号（6501）：解析 + 真·UDP 监听回环
+    cases = [
+        (b'{"motion": "start"}', MOTION_START), (b'{"motion": "over"}', MOTION_OVER),
+        (b'{"motion":"OVER"}', MOTION_OVER), (b'{"motion": "stop"}', MOTION_OVER),
+        (b'{"motion": true}', MOTION_START), (b'{"motion": false}', MOTION_OVER),
+        (b'{"data": {"motion": {"state": "start"}}}', MOTION_START),
+        (b"motion=start", MOTION_START), (b"motion=over", MOTION_OVER),
+        (b'{"motion": "idle"}', MOTION_OVER),
+    ]
+    wrong = []
+    for raw, want in cases:
+        try:
+            got = parse_task_payload(raw)[0]
+        except RobotLinkError:
+            got = "（报错）"
+        if got != want:
+            wrong.append(f"{raw!r}→{got}")
+    check("任务信号解析：motion start/over（大小写、外壳、stop/done/idle 等等价写法都认）",
+          not wrong, "；".join(wrong) or f"{len(cases)} 种写法全对")
+
+    loud = []
+    for raw in (b'{"foo": 1}', b'{"motion": "welding"}', b"garbage"):
+        try:
+            parse_task_payload(raw)
+            loud.append(repr(raw))
+        except RobotLinkError:
+            pass
+    check("任务信号解析：不是任务信号的包 → 明确报错（不会被当成 start/over）",
+          not loud, "；".join(loud) or "3 种坏包都拦住")
+
+    port = free_udp_port()
+    tk = TaskListener(port)
+    tk.start()
+    time.sleep(0.2)
+    ok0 = tk.state() == "" and not tk.is_running() and tk.running
+    n_start = send_task_signal(f"127.0.0.1:{port}", MOTION_START, times=2, hz=50.0)
+    time.sleep(0.35)
+    ok1 = (tk.state() == MOTION_START and tk.is_running() and tk.latest() is not None
+           and tk.stats()["starts"] >= 1)
+    n_stop = send_task_signal(f"127.0.0.1:{port}", MOTION_OVER)
+    time.sleep(0.35)
+    ok2 = tk.state() == MOTION_OVER and not tk.is_running()
+    sigs = tk.drain_signals()                            # 界面就是用它分派 start/over 的
+    kinds = [s.motion for s in sigs]
+    ok3 = (kinds.count(MOTION_START) >= 1 and kinds.count(MOTION_OVER) == 1
+           and all(s.summary() for s in sigs)
+           and not tk.drain_signals() and not tk.drain_events())   # 取一次就空了
+    tk.stop()
+    check("任务信号监听：UDP 回环收到 start/over（状态 / 计数 / 信号各对）",
+          ok0 and n_start == 2 and ok1 and n_stop == 1 and ok2 and ok3 and not tk.running,
+          f"初始 {ok0} · start×{n_start}→{ok1} · over→{ok2} · 取到 {len(sigs)} 条信号"
+          f"（start {kinds.count(MOTION_START)} / over {kinds.count(MOTION_OVER)}）"
+          f" · 线程已退 {not tk.running}")
+
+    tk2 = TaskListener(free_udp_port())
+    tk2.start()
+    time.sleep(0.15)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:     # 发一个认不出的包
+        s.sendto(b'{"hello": "world"}', ("127.0.0.1", tk2.port))
+    time.sleep(0.3)
+    st2 = tk2.stats()
+    tk2.stop()
+    check("任务信号监听：垃圾包只记一条错误、不乱改状态（errors +1、motion 仍是空）",
+          st2["errors"] == 1 and st2["motion"] == "" and "motion" in st2["last_error"],
+          f"errors={st2['errors']} · motion={st2['motion']!r} · {st2['last_error'][:46]}")
 
     print("-" * 78)
     if fails:
@@ -1512,6 +1900,37 @@ def run_emit_demo(args) -> int:
     return 0
 
 
+def run_task_listen(args) -> int:
+    """只听**任务信号**（默认 6501）：收到 start/over 就打一行（Ctrl+C 退出）。"""
+    tk = TaskListener(int(args.task_port), host=args.host, mcast=args.mcast)
+    tk.start()
+    print(f"{tk.describe()}（Ctrl+C 退出）")
+    print(f"来源：{tk.endpoint()}")
+    last_err = ""
+    try:
+        while True:
+            time.sleep(0.15)
+            for line in tk.drain_events():
+                print(f"[{time.strftime('%H:%M:%S')}] {line}")
+            st = tk.stats()
+            if st["last_error"] and st["last_error"] != last_err:
+                last_err = st["last_error"]
+                print(f"[{time.strftime('%H:%M:%S')}] 警告：{last_err}")
+    except KeyboardInterrupt:
+        print("\n退出")
+    finally:
+        tk.stop()
+    return 0
+
+
+def run_task_demo(args) -> int:
+    """模拟真机发一条任务信号（``--task-demo start|over``）。"""
+    n = send_task_signal(args.task_target, args.task_demo, times=3, hz=20.0)
+    print(f"往 {args.task_target} 发了 {n} 包 {{\"motion\": \"{args.task_demo}\"}}"
+          f"（界面里点过「开始监听」或跑 --task-listen 就能收到）")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="真机 ↔ 仿真 姿态链路（HTTP 状态接口 / UDP 广播 → 6 个关节角）",
@@ -1520,6 +1939,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--probe", action="store_true", help="读一次真机状态，并复核它与模型的约定")
     ap.add_argument("--listen", action="store_true", help="持续接收并打印（联调）")
     ap.add_argument("--emit-demo", action="store_true", help="模拟真机发报文（联调）")
+    ap.add_argument("--task-listen", action="store_true",
+                    help=f"只听**任务信号**（默认 UDP {DEFAULT_TASK_PORT}）并打印 start/over")
+    ap.add_argument("--task-demo", default="", choices=("", MOTION_START, MOTION_OVER, "stop"),
+                    help="模拟真机发一条任务信号（start / over；配合 --task-listen 或界面）")
+    ap.add_argument("--task-port", type=int, default=DEFAULT_TASK_PORT,
+                    help="任务信号 UDP 端口")
+    ap.add_argument("--task-target", default=f"127.0.0.1:{DEFAULT_TASK_PORT}",
+                    help="--task-demo 的发送目标 host:port")
     ap.add_argument("--source", default="auto", choices=SOURCES, help="数据源（--listen 用）")
     ap.add_argument("--url", default=DEFAULT_HTTP_URL, help="真机 HTTP 状态接口")
     ap.add_argument("--port", type=int, default=DEFAULT_UDP_PORT, help="UDP 监听端口")
@@ -1538,6 +1965,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.selftest:
         return run_selftest(args)
+    if args.task_demo:
+        return run_task_demo(args)
+    if args.task_listen:
+        return run_task_listen(args)
     if args.emit_demo:
         return run_emit_demo(args)
     if args.listen:
