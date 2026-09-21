@@ -3,7 +3,7 @@
 
 画面里包含机械臂、点云、三个工具 TCP 向量箭头、工具尖轨迹（任务信号驱动），
 但**不含**任何控制机械臂的控件（关节微调 / IK / 真机跟随按钮等）——网页端只看画面，
-可以拖动旋转 / 滚轮缩放 / 双击复位视角。
+可以左键旋转 / 中键平移 / 滚轮缩放 / 双击复位视角。
 
 运行（在 ``RevA1-sim`` 目录下，或在任意位置直接跑本脚本）：
 
@@ -214,6 +214,9 @@ class Viewer:
     def reset_view(self) -> None:
         self.cam.reset()
 
+    def pan(self, dx, dy) -> None:
+        self.cam.pan(float(dx), float(dy))
+
     def shutdown(self) -> None:
         self._running = False
         if self.link is not None:
@@ -250,6 +253,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(v.status())
             elif path == "/cam/orbit":
                 v.orbit(qs.get("dx", ["0"])[0], qs.get("dy", ["0"])[0])
+                self._send_empty()
+            elif path == "/cam/pan":
+                v.pan(qs.get("dx", ["0"])[0], qs.get("dy", ["0"])[0])
                 self._send_empty()
             elif path == "/cam/zoom":
                 v.zoom(qs.get("n", ["0"])[0])

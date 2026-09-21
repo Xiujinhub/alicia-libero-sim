@@ -44,7 +44,7 @@ IK 为什么以前"用不动"
     python revA1_gui.py --ui-test           # 真建窗口 → 脚本化点一遍控件 → 存图 → 退出
     python revA1_gui.py --exit-after 10     # 开窗口跑 10 秒自动退出（自动化/截图用）
 
-鼠标（画面区域）：左键拖动=转视角，右键拖动=平移，滚轮=推拉，双击=视角复位。
+鼠标（画面区域）：左键拖动=转视角，中键拖动=平移，滚轮=推拉，双击=视角复位。
 键盘：空格=暂停，H=回 home，R=复位，G=重力，1..6=选关节，``-``/``=``=微调一个步长，
 Ctrl+S=存图，ESC=退出。
 """
@@ -505,14 +505,14 @@ class ArmView(QWidget):
         font.setPointSizeF(max(font.pointSizeF() - 1.0, 8.0))
         p.setFont(font)
         p.setPen(QColor("#8ea3b6"))
-        p.drawText(12, self.height() - 12, "左键旋转 · 右键平移 · 滚轮缩放 · 双击复位视角")
+        p.drawText(12, self.height() - 12, "左键旋转 · 中键平移 · 滚轮缩放 · 双击复位视角")
         if self.renderer is not None:
             p.drawText(self.width() - 100, 22, f"{self.fps:5.1f} fps")
 
     # ------------------------------------------------------------ 鼠标
     def mousePressEvent(self, ev) -> None:  # noqa: N802
         btn = ev.button()
-        if btn in (Qt.LeftButton, Qt.RightButton):
+        if btn in (Qt.LeftButton, Qt.MiddleButton):
             self._drag = (1 if btn == Qt.LeftButton else 2,
                           float(ev.position().x()), float(ev.position().y()))
 
@@ -1760,7 +1760,7 @@ class RevA1Window(QMainWindow):
         self.st_track = QLabel()
         self.st_follow = QLabel()
         self.st_perf = QLabel()
-        self.st_hint = QLabel("左键旋转 · 右键平移 · 滚轮缩放 · 空格暂停 · H 回 home · "
+        self.st_hint = QLabel("左键旋转 · 中键平移 · 滚轮缩放 · 空格暂停 · H 回 home · "
                               "F 真机跟随 · 1..6 选关节 · −/= 微调")
         self.st_hint.setObjectName("Hint")
         bar.addWidget(self.st_hint, 1)
@@ -2464,7 +2464,7 @@ def run_gui(args) -> int:
     win.show()
     print(f"关节顺序 : {spec.JOINTS}")
     print(f"home qpos: {np.round(spec.HOME_QPOS, 4)}")
-    print("鼠标     : 左键拖动=转视角  右键拖动=平移  滚轮=推拉  双击=复位视角")
+    print("鼠标     : 左键拖动=转视角  中键拖动=平移  滚轮=推拉  双击=复位视角")
     print("键盘     : 空格=暂停  H=回 home  R=复位  G=重力  F=真机跟随  1..6=选关节  "
           "−/=±一个步长  Ctrl+S=存图  ESC=退出")
     print("面板     : ① 关节 −/+ 微调  ② 真机跟随（UDP 广播 / HTTP 状态）  ③ 点云（相机 → 机械臂）"

@@ -570,9 +570,9 @@ SCENE_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
 
   <worldbody>
     <light name="key_light" pos="1.2 -1.2 2.4" dir="-0.4 0.4 -1" directional="true"
-           diffuse="0.6 0.6 0.6" specular="0.25 0.25 0.25" castshadow="true"/>
+           diffuse="0.6 0.6 0.6" specular="0.25 0.25 0.25" castshadow="false"/>
     <light name="fill_light" pos="-1.4 1.4 1.6" dir="0.45 -0.45 -1" directional="true"
-           diffuse="0.3 0.3 0.35"/>
+           diffuse="0.3 0.3 0.35" castshadow="false"/>
 
     <!-- 地面：正好在机器人的安装底面高度 -->
     <geom name="floor" type="plane" pos="0 0 {floor_z}" size="4 4 0.1"

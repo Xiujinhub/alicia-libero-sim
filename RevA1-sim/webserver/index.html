@@ -33,7 +33,7 @@
   </div>
   <div id="stage">
     <img id="stream" src="/stream" alt="MuJoCo 画面">
-    <div id="hint">左键拖动旋转 · 滚轮缩放 · 双击复位视角</div>
+    <div id="hint">左键旋转 · 中键平移 · 滚轮缩放 · 双击复位视角</div>
   </div>
 </div>
 <script>
@@ -42,10 +42,13 @@
   const statusEl = document.getElementById('status');
   const sceneEl = document.getElementById('scene');
 
-  // —— 视角：拖动旋转 / 滚轮缩放 / 双击复位 ——
-  let dragging = false, lastX = 0, lastY = 0;
+  // —— 视角：左键旋转 / 中键平移 / 滚轮缩放 / 双击复位 ——
+  let dragging = 0, lastX = 0, lastY = 0;   // 0=无 1=左键旋转 2=中键平移
   stage.addEventListener('mousedown', (e) => {
-    dragging = true; lastX = e.clientX; lastY = e.clientY;
+    if (e.button === 0) dragging = 1;        // 左键 = 旋转
+    else if (e.button === 1) dragging = 2;   // 中键 = 平移
+    else return;
+    lastX = e.clientX; lastY = e.clientY;
     stage.classList.add('dragging');
     e.preventDefault();
   });
@@ -53,10 +56,11 @@
     if (!dragging) return;
     const dx = e.clientX - lastX, dy = e.clientY - lastY;
     lastX = e.clientX; lastY = e.clientY;
-    fetch(`/cam/orbit?dx=${dx}&dy=${dy}`).catch(() => {});
+    const api = dragging === 1 ? '/cam/orbit' : '/cam/pan';
+    fetch(`${api}?dx=${dx}&dy=${dy}`).catch(() => {});
   });
   window.addEventListener('mouseup', () => {
-    dragging = false; stage.classList.remove('dragging');
+    dragging = 0; stage.classList.remove('dragging');
   });
   stage.addEventListener('wheel', (e) => {
     e.preventDefault();
