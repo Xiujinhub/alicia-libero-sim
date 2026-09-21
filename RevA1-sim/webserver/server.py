@@ -50,7 +50,16 @@ import point_cloud as pc  # noqa: E402
 import revA1_spec as spec  # noqa: E402
 import robot_link as link  # noqa: E402
 
-INDEX_HTML = (HERE / "index.html").read_text(encoding="utf-8")
+def _load_config() -> dict:
+    """读 ``config/config.json``（缺文件/损坏时返回空 dict）。"""
+    try:
+        return json.loads((ROOT / "config" / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+INDEX_HTML = (HERE / "index.html").read_text(encoding="utf-8").replace(
+    "__JETSON_IP__", str(_load_config().get("jetson_ip") or link.DEFAULT_HOST))
 
 
 class Viewer:
