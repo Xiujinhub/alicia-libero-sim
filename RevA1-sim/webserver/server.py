@@ -26,6 +26,9 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import os
+import socket
+import subprocess
 import sys
 import threading
 import time
@@ -98,7 +101,7 @@ class Viewer:
         # 任务信号（可选）：start 记轨迹 / over 清空
         self.task_listener = None
         self.task_active = False
-        # 要记录轨迹的工具（默认只记喷嘴1；喷嘴2、夹爪默认关闭）
+        # 要记录轨迹的工具（默认喷嘴1 + 刷子；喷嘴2、夹爪默认关闭）
         self.trail_names = [t.strip() for t in str(args.trail_tools).split(",")
                             if t.strip() in spec.TOOLS]
         if args.task_listen:
@@ -329,6 +332,59 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(0.01)
 
 
+def _is_private_ip(ip: str) -> bool:
+    """RFC1918 私网段判断（10/8、172.16/12、192.168/16），用于过滤虚拟网卡的假 IP。"""
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        a, b = int(parts[0]), int(parts[1])
+    except ValueError:
+        return False
+    return a == 10 or (a == 172 and 16 <= b <= 31) or (a == 192 and b == 168)
+
+
+def _lan_ips() -> list[str]:
+    """探测本机局域网 IPv4 地址（跳过 127.x 回环和虚拟网卡假 IP）。"""
+    ips: list[str] = []
+    # 1) UDP connect 到公网地址，拿到系统实际出网网卡的 IP（不真正发包）
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("8.8.8.8", 80))
+        ip = probe.getsockname()[0]
+        probe.close()
+        if ip and not ip.startswith("127."):
+            ips.append(ip)
+    except OSError:
+        pass
+    # 2) 兜底：枚举 hostname 解析出的所有私网 IPv4（多网卡 / 上面失败时）
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip not in ips and _is_private_ip(ip):
+                ips.append(ip)
+    except OSError:
+        pass
+    return ips
+
+
+def _allow_firewall(port: int) -> bool:
+    """放行 Windows 防火墙入站 TCP 端口（需管理员权限；非 Windows 视为无需处理）。"""
+    if os.name != "nt":
+        return True
+    rule = f"RevA1-sim web {port}"
+    add = ["netsh", "advfirewall", "firewall", "add", "rule",
+           f"name={rule}", "dir=in", "action=allow", "protocol=TCP",
+           f"localport={port}"]
+    show = ["netsh", "advfirewall", "firewall", "show", "rule", f"name={rule}"]
+    try:
+        subprocess.run(add, capture_output=True, timeout=15, check=False)
+        out = subprocess.run(show, capture_output=True, timeout=15, check=False)
+        return out.returncode == 0 and b"Allow" in out.stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="RevA1-sim 网页画面复刻（MJPEG 流，只看画面、无控制控件）",
@@ -356,15 +412,21 @@ def main(argv=None) -> int:
                     help="真机 UDP 广播端口")
     ap.add_argument("--task-listen", action="store_true", help="监听 6501 任务信号驱动轨迹")
     ap.add_argument("--task-port", type=int, default=link.DEFAULT_TASK_PORT, help="任务信号 UDP 端口")
-    ap.add_argument("--trail-tools", default="喷嘴1",
-                    help="要记录轨迹的工具（逗号分隔，可选 夹爪/喷嘴1/喷嘴2；默认只记喷嘴1）")
+    ap.add_argument("--trail-tools", default="刷子",
+                    help="要记录轨迹的工具（逗号分隔，可选 夹爪/喷嘴1/喷嘴2/刷子；默认刷子）")
     args = ap.parse_args(argv)
 
     viewer = Viewer(args)
     Handler.viewer = viewer
     server = ThreadingHTTPServer((args.host, args.port), Handler)
 
-    print(f"RevA1-sim 网页画面：http://127.0.0.1:{args.port}/")
+    print(f"RevA1-sim 网页画面（本机）：http://127.0.0.1:{args.port}/")
+    for ip in _lan_ips():
+        print(f"局域网访问：http://{ip}:{args.port}/")
+    if not _allow_firewall(args.port):
+        print("（提示）未自动放行防火墙，其它电脑若访问不了，请以管理员身份执行：")
+        print(f"  netsh advfirewall firewall add rule name=\"RevA1-sim web {args.port}\" "
+              f"dir=in action=allow protocol=TCP localport={args.port}")
     print(f"场景：{viewer.sim.scene}")
     print(f"渲染：{args.width}x{args.height} @ {args.fps:.0f} fps"
           + (" · 真机跟随" if viewer.link else "")
