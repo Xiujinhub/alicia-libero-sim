@@ -1,0 +1,5 @@
+{
+    "_comment": "RevA1-sim 全局配置：路径 + 默认配置。相对路径以 RevA1-sim/ 为基准。",
+    "point_cloud_dir": "point_cloud",
+    "point_cloud_file": "point_cloud/urinal_9_o2e_real_safe.json"
+}

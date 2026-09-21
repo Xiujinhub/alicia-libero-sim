@@ -86,9 +86,12 @@ class Viewer:
                                        port=args.follow_port)
             self.link.start()
 
-        # 任务信号（可选）：start 记轨迹 / over 清空（记录全部三个工具的 TCP）
+        # 任务信号（可选）：start 记轨迹 / over 清空
         self.task_listener = None
         self.task_active = False
+        # 要记录轨迹的工具（默认只记喷嘴1；喷嘴2、夹爪默认关闭）
+        self.trail_names = [t.strip() for t in str(args.trail_tools).split(",")
+                            if t.strip() in spec.TOOLS]
         if args.task_listen:
             self.task_listener = link.TaskListener(args.task_port)
             self.task_listener.start()
@@ -151,7 +154,7 @@ class Viewer:
                             self.task_active = False
                             self.sim.clear_trails()
                     if self.task_active:
-                        self.sim.record_trails()
+                        self.sim.record_trails(self.trail_names)
 
                 # 推进物理（按真实时间补步，最多 80 步防雪崩）
                 acc += dt_wall
@@ -344,6 +347,8 @@ def main(argv=None) -> int:
                     help="真机 UDP 广播端口")
     ap.add_argument("--task-listen", action="store_true", help="监听 6501 任务信号驱动轨迹")
     ap.add_argument("--task-port", type=int, default=link.DEFAULT_TASK_PORT, help="任务信号 UDP 端口")
+    ap.add_argument("--trail-tools", default="喷嘴1",
+                    help="要记录轨迹的工具（逗号分隔，可选 夹爪/喷嘴1/喷嘴2；默认只记喷嘴1）")
     args = ap.parse_args(argv)
 
     viewer = Viewer(args)
@@ -355,6 +360,8 @@ def main(argv=None) -> int:
     print(f"渲染：{args.width}x{args.height} @ {args.fps:.0f} fps"
           + (" · 真机跟随" if viewer.link else "")
           + (" · 任务信号轨迹" if viewer.task_listener else ""))
+    if viewer.task_listener:
+        print(f"轨迹工具：{'、'.join(viewer.trail_names)}")
     print("Ctrl+C 退出。")
     try:
         server.serve_forever()

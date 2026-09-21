@@ -78,8 +78,28 @@ except Exception:  # noqa: BLE001
     pass
 
 HERE = Path(__file__).resolve().parent
+CONFIG_FILE = HERE / "config" / "config.json"
+
+
+def _load_config() -> dict:
+    """读 ``config/config.json``；文件不存在或损坏时返回空 dict（全部回退默认值）。"""
+    try:
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+_CONFIG = _load_config()
+
+
+def _cfg_path(key: str, default: str) -> Path:
+    """取 config 里的路径（相对 RevA1-sim 根；缺省/为空用 ``default``）。"""
+    p = Path(str(_CONFIG.get(key) or default))
+    return p if p.is_absolute() else (HERE / p)
+
+
 CALIB_DIR = HERE / "xml"
-CLOUD_DIR = HERE / "point_cloud"
+CLOUD_DIR = _cfg_path("point_cloud_dir", "point_cloud")
 ASSETS = HERE / "assets"
 MESH_DIR = ASSETS / "meshes"          # 必须和场景的 <compiler meshdir="meshes"> 对上
 BASE_SCENE = ASSETS / "revA1_scene.xml"
@@ -795,7 +815,10 @@ def list_clouds() -> list[Path]:
 
 
 def default_cloud() -> Path:
-    """没指定文件时挑一个：优先带 ``o2e`` 的（那就是现成的 3D 点），否则第一个。"""
+    """没指定文件时挑一个：config.json 里配的优先，否则优先带 ``o2e`` 的，再否则第一个。"""
+    cfg_file = _cfg_path("point_cloud_file", "")
+    if cfg_file.is_file():
+        return cfg_file
     files = list_clouds()
     if not files:
         raise PointCloudError(f"{CLOUD_DIR} 里没有点云文件（*.json / *.npy）")
