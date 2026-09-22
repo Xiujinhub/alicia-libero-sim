@@ -116,6 +116,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import numpy as np
@@ -126,22 +127,50 @@ except Exception:  # noqa: BLE001
     pass
 
 HERE = Path(__file__).resolve().parent
+CONFIG_FILE = HERE / "config" / "config.json"
+
+
+def _load_config() -> dict:
+    """读 ``config/config.json``（缺文件 / 损坏时返回空 dict）。"""
+    try:
+        return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+_CONFIG = _load_config()
 
 # ------------------------------------------------------------------ 默认参数
-# 本机实测真机（TB6-R5-RevA1）的状态接口：nginx 的 H5 在 80，状态在 8080。
-DEFAULT_HOST = "192.168.66.169"
+# 真机地址**一律读 config.json 的 ``jetson_ip``**（不再是写死的 IP）：跟随的 TCP 连接目标、
+# HTTP 状态接口、界面「地址」框默认值都由它派生；只有配置文件缺失 / 该项为空时才退回
+# 本机实测的 192.168.66.169。状态端口按实测：nginx 的 H5 在 80、状态在 8080。
+DEFAULT_HOST = str(_CONFIG.get("jetson_ip") or "").strip() or "192.168.66.169"
 DEFAULT_HTTP_URL = f"http://{DEFAULT_HOST}:8080/api/state"
 DEFAULT_UDP_PORT = 6001           # 真机实测：往 255.255.255.255:6001 广播状态（~96 Hz）
+DEFAULT_TCP_PORT = 6001           # 真机状态流的 TCP 端口（原来是同端口的 UDP 广播 → 改走 TCP）
 DEFAULT_TASK_PORT = 6501          # 真机实测：往 6501 广播**任务信号**（motion: start / stop）
+DEFAULT_TASK_BASE = f"http://{DEFAULT_HOST}:8080"   # 任务信号 HTTP 基址（…/api/task/status + …/api/task/events）
+DEFAULT_TASK_HZ = 5.0             # 任务状态 HTTP 轮询频率[Hz]（起停翻转，不用太快）
+TASK_HTTP_GRACE = 3.0             # status 兜底：与当前判断不一致要"持续"这么久才动手[s]
+TASK_MOTION_FRESH_MS = 5000       # 首帧采纳"运动事件快照"的新鲜度上限[ms]（更老的当历史，不响应）
+# /api/task/status 的**终态**：中途失败 / 被取消时真机**不发 over**，要拿它复位（文档明确要求）
+TASK_STATUS_TERMINAL = ("failed", "cancelled", "canceled", "done", "stopped", "error")
+# 真机 /api/task/events 里的事件名（本机实测：task_started / task_done）
+TASK_EVENT_START = ("task_started", "task_start", "started")
+TASK_EVENT_DONE = ("task_done", "task_over", "task_finished", "task_stopped")
+# 真机 /api/task/status 的 state.status（本机实测：idle / running / done / …）
+TASK_STATUS_ON = ("running", "run", "busy")
+TASK_STATUS_OFF = ("idle", "done", "failed", "cancelled", "canceled", "stopped", "error")
 DEFAULT_HTTP_HZ = 30.0            # HTTP 轮询频率（真机的状态流 ~30 Hz，再快没意义）
-HTTP_TIMEOUT = 1.0
+HTTP_TIMEOUT = 5.0                # 单次 HTTP 请求超时[s]（对齐 clean-robot vue 端的 5 s）
 RECV_BUFFER = 65535
 SOCKET_TIMEOUT = 0.2              # 接收线程的阻塞上限，用来定期看退出标志
 RATE_SAMPLES = 24                 # 算数据率时回看的最近多少个包
 JOINTS_N = 6
 
-SOURCES = ("auto", "http", "udp")
-SOURCE_LABELS = ("自动（HTTP + UDP，谁新用谁）", "HTTP 状态接口", "UDP 广播")
+SOURCES = ("http", "tcp", "auto", "udp")
+SOURCE_LABELS = ("HTTP 状态接口（默认）", "TCP 状态流（连真机）",
+                 "自动（HTTP + TCP + UDP，谁新用谁）", "UDP 广播")
 FORMATS = ("auto", "json", "csv", "f64", "f32", "i16")
 FORMAT_LABELS = ("自动", "JSON", "CSV/文本", "float64×6", "float32×6", "int16×6")
 UNITS = ("auto", "deg", "rad")
@@ -772,6 +801,220 @@ class UdpStateSource(StateSource):
             self.sock = None
 
 
+def _json_frame_end(buf) -> int:
+    """若 ``buf`` 从某个 JSON 值开始，返回它的**结束位置**（不含）；还没收全返回 0。"""
+    n = len(buf)
+    i = 0
+    while i < n and buf[i] in b" \t\r\n":
+        i += 1
+    if i >= n or buf[i] not in b"{[":
+        return 0
+    depth = 0
+    in_str = esc = False
+    for j in range(i, n):
+        ch = buf[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == 0x5C:                 # 反斜杠
+                esc = True
+            elif ch == 0x22:                 # 双引号
+                in_str = False
+            continue
+        if ch == 0x22:
+            in_str = True
+        elif ch in (0x7B, 0x5B):             # { [
+            depth += 1
+        elif ch in (0x7D, 0x5D):             # } ]
+            depth -= 1
+            if depth == 0:
+                return j + 1
+    return 0
+
+
+def _bin_frame_size(fmt: str) -> int:
+    """定长二进制报文一帧多少字节（``auto`` 按 6×float64 = 48 B 猜）。"""
+    return {"f64": 48, "f32": 24, "i16": 12}.get(fmt, 48)
+
+
+def split_stream_frames(buf, *, fmt: str = "auto") -> list[bytes]:
+    """从 TCP **字节流**缓冲里切出完整报文（传 ``bytearray`` 会被就地消费）、半包留着。
+
+    真机推流的写法基本跑不出这三种：
+
+    * **JSON**：``{"joints":[…]}`` 或直接数组，一个包一个值；连着来几个（粘包）也能切开
+      —— 按括号配平找边界，**不依赖换行**；
+    * **行文本**：换行分隔（JSON 或 CSV，一行一帧）；
+    * **定长二进制**：6×float64(48B) / 6×float32(24B) / 6×int16(12B)，按 ``fmt`` 定长切。
+    """
+    if not isinstance(buf, bytearray):
+        buf = bytearray(buf)                             # 不能就地消费，但能正确切帧
+    out: list[bytes] = []
+    while buf:
+        i = 0                                            # 跳过帧间空白 / 换行
+        while i < len(buf) and buf[i] in b" \t\r\n":
+            i += 1
+        if i:
+            del buf[:i]
+        if not buf:
+            break
+        if buf[0] in (0x7B, 0x5B):                       # { [ → JSON
+            end = _json_frame_end(buf)
+            if end == 0:
+                break                                    # 半包：等下一批数据
+            out.append(bytes(buf[:end]))
+            del buf[:end]
+            continue
+        nl = buf.find(b"\n")                             # 行分隔文本
+        if nl >= 0:
+            out.append(bytes(buf[:nl + 1]))
+            del buf[:nl + 1]
+            continue
+        size = _bin_frame_size(fmt)                      # 定长二进制
+        if len(buf) >= size:
+            out.append(bytes(buf[:size]))
+            del buf[:size]
+            continue
+        break
+    return out
+
+
+class TcpStateSource(StateSource):
+    """TCP 状态流源：**主动连**真机的 TCP 端口，收它推过来的状态流。
+
+    和 :class:`UdpStateSource` 的区别：TCP 是**连接**（断了要重连），而且是**字节流**
+    （会粘包 / 半包），所以这里自带分帧缓冲（见 :func:`split_stream_frames`）：
+    换行分隔的 JSON、连着几个 JSON、定长二进制都认，半包留到下一批再拼。
+    """
+
+    kind = "tcp"
+
+    def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_TCP_PORT, *,
+                 fmt: str = "auto", unit: str = "auto", order=None,
+                 i16_scale: float = 0.01, connect_timeout: float = 1.5,
+                 retry: float = 1.0):
+        super().__init__(unit=unit, order=order, i16_scale=i16_scale)
+        if not str(host).strip():
+            raise RobotLinkError("TCP 地址不能为空（真机 IP）")
+        self.host = str(host).strip()
+        self.port = int(port)
+        if not (0 < self.port < 65536):
+            raise RobotLinkError(f"TCP 端口要在 1..65535：{port}")
+        self.fmt = fmt if fmt in FORMATS else "auto"
+        self.connect_timeout = float(max(connect_timeout, 0.1))
+        self.retry = float(max(retry, 0.05))
+        self.sock: socket.socket | None = None
+        self.connected = False
+        self.connects = 0
+        self.drops = 0
+        self._fail_key = ""
+
+    def endpoint(self) -> str:
+        state = "已连接" if self.connected else ("重连中" if self.connects else "未连接")
+        return (f"tcp://{self.host}:{self.port}（{state}"
+                f"，连上 {self.connects} 次 / 掉线 {self.drops} 次）")
+
+    def describe(self) -> str:
+        return f"TCP 连接 {self.host}:{self.port}（格式 {self.fmt}）"
+
+    def stats(self) -> dict:
+        out = super().stats()
+        out.update(connected=self.connected, connects=self.connects, drops=self.drops)
+        return out
+
+    def _fail_once(self, key: str, msg: str) -> None:
+        """同一条错误只记一次（断线时每秒都会失败一次，别把错误数刷爆）。"""
+        if self._fail_key != key:
+            self._fail_key = key
+            self.fail(msg)
+
+    def _connect(self) -> bool:
+        try:
+            s = socket.create_connection((self.host, self.port), timeout=self.connect_timeout)
+        except OSError as exc:
+            self._fail_once("connect", f"连不上 {self.host}:{self.port}：{exc}")
+            return False
+        s.settimeout(SOCKET_TIMEOUT)
+        try:
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)   # 小包别攒着发
+        except OSError:
+            pass
+        self.sock = s
+        self.connected = True
+        self.connects += 1
+        self._fail_key = ""
+        return True
+
+    def _drop(self, why: str) -> None:
+        """断线：关掉 socket，等下一轮重连（错误只记一次）。"""
+        self.drops += 1
+        self.connected = False
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+        self._fail_once(f"drop:{why}", f"连接断开：{why}")
+
+    def _recv_frame(self, frame: bytes) -> None:
+        """一帧完整报文 → :class:`RobotState`（认不出来只记错误，不断连接）。"""
+        if not frame.strip():
+            return
+        if is_heartbeat(frame):
+            self.heartbeat()                      # 真机的存活心跳，不算错误
+            return
+        if looks_text(frame) and self.fmt in ("auto", "json"):
+            try:                                  # 真机推的就是这种 JSON：一次拿到 joints/pose/...
+                st = parse_http_state(frame, unit=self.unit, order=self.order)
+                self.publish(st, raw_note=st.note)
+                return
+            except RobotLinkError:
+                pass                              # 不是那形状 → 交给通用解析
+        try:
+            q, tag, note = parse_joint_payload(frame, self.fmt, self.unit,
+                                               order=self.order, i16_scale=self.i16_scale)
+        except RobotLinkError as exc:
+            self.fail(str(exc))
+            return
+        self.publish(RobotState(q_rad=q, unit=tag, raw=preview_bytes(frame), note=note),
+                     raw_note=note)
+
+    def _run(self) -> None:
+        buf = bytearray()
+        while not self._stop.is_set():
+            if self.sock is None:                 # 没连上（或刚掉线）→ 连一次，失败等会儿再试
+                if not self._connect():
+                    self._stop.wait(self.retry)
+                    continue
+                buf.clear()
+            try:
+                data = self.sock.recv(RECV_BUFFER)
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                if self._stop.is_set():
+                    break
+                self._drop(f"{type(exc).__name__}: {exc}")
+                continue
+            if not data:
+                self._drop("对端关闭了连接")
+                continue
+            buf.extend(data)
+            for frame in split_stream_frames(buf, fmt=self.fmt):
+                self._recv_frame(frame)
+
+    def stop(self, timeout: float = 1.5) -> None:
+        super().stop(timeout)
+        if self.sock is not None:            # 兜底：recv 还堵着就把 socket 关掉
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+        self.connected = False
+
+
 # =============================================================== 任务信号（6501）
 def _motion_from_obj(obj) -> str | None:
     """在 JSON（可能带 ``state``/``data`` 外壳、可能嵌套）里找任务状态那个字段。"""
@@ -1034,6 +1277,439 @@ class TaskListener:
         return f"任务信号 UDP 监听 :{self.port}"
 
 
+class HttpTaskSource:
+    """HTTP 任务信号源：轮询真机 ``/api/task/status`` + ``/api/task/events``，产出与 UDP 广播
+    等价的 ``start`` / ``over`` 信号（对外接口与 :class:`TaskListener` 一致）。
+
+    * ``/api/task/events`` 里的 ``task_started`` / ``task_done`` 是**精确边沿**（和真机 UDP 的
+      ``motion: start / over`` 一一对应）；
+    * ``/api/task/status`` 的 ``state.status``（``idle / running / done / …``）当**兜底**：
+      监听时任务已经在跑、或某条事件被事件缓冲冲掉，也能认出来。兜底要求"与当前判断不一致"
+      **持续** :data:`TASK_HTTP_GRACE` 秒才动手，且"转为任务中"还要求 ``task_id`` 是**新**的
+      —— 免得被 status 相对事件的滞后骗出假 start。
+    """
+
+    kind = "task-http"
+
+    def __init__(self, base: str = DEFAULT_TASK_BASE, *, hz: float = DEFAULT_TASK_HZ,
+                 timeout: float = HTTP_TIMEOUT, grace: float = TASK_HTTP_GRACE):
+        self.base = str(base or DEFAULT_TASK_BASE).rstrip("/")
+        self.motion_url = f"{self.base}/api/task/motion"
+        self.status_url = f"{self.base}/api/task/status"
+        self.events_url = f"{self.base}/api/task/events"
+        self.hz = float(max(hz, 0.2))
+        self.period = 1.0 / self.hz
+        self.timeout = float(max(timeout, 0.2))
+        self.grace = float(max(grace, 0.0))
+        self.packets = 0
+        self.errors = 0
+        self.starts = 0
+        self.stops = 0
+        self.last_error = ""
+        self.last_status = ""
+        self.task_id = None
+        self.last_seq = None                    # /api/task/motion 的 seq（判重/增量用）
+        self.last_addr = ""                     # /api/task/motion 的 from（最近收包来源）
+        self._motion_ok: bool | None = None     # None=还没试过；False=该接口没有（老版 web_server）
+        self._on: bool | None = None            # 当前判断（None = 还没判过）
+        self._last_fps: list | None = None      # 上一轮见过的事件指纹（None = 还没取过一轮）
+        self._done_tid = None                   # 最近一次"结束"时的 task_id
+        self._mismatch_since: float | None = None
+        self._fail_key = ""
+        self._latest: TaskSignal | None = None
+        self._pending: deque = deque(maxlen=64)
+        self._seq = 0
+        self._stamps: deque = deque(maxlen=RATE_SAMPLES)
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    # ---------------------------------------------------------- 生命周期
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._guarded_run, name="revA1-task-http",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self, timeout: float = 1.5) -> None:
+        self._stop.set()
+        t, self._thread = self._thread, None
+        if t is not None and t.is_alive():
+            t.join(timeout)
+
+    @property
+    def running(self) -> bool:
+        return bool(self._thread is not None and self._thread.is_alive())
+
+    def describe(self) -> str:
+        mode = ("运动事件快照 /api/task/motion"
+                if self._motion_ok is not False else "退回 /api/task/events（老版无 motion 接口）")
+        return f"任务信号 HTTP {self.base} {mode} @ {self.hz:.0f} Hz"
+
+    def endpoint(self) -> str:
+        return f"{self.base}（status={self.last_status or '—'} · task_id={self.task_id}）"
+
+    def _guarded_run(self) -> None:
+        try:
+            self._run()
+        except Exception as exc:  # noqa: BLE001
+            self.fail(f"线程异常：{type(exc).__name__}: {exc}")
+
+    # ---------------------------------------------------------- 取数
+    def _get_json(self, url: str):
+        with urlopen(url, timeout=self.timeout) as fp:      # noqa: S310 (局域网 http)
+            return json.loads(fp.read().decode("utf-8", "replace"))
+
+    def _fail_once(self, msg: str) -> None:
+        """同一条错误只记一次（轮询失败每轮都来，别把错误数刷爆）。"""
+        if self._fail_key != msg:
+            self._fail_key = msg
+            self.fail(msg)
+
+    def _poll_once(self) -> tuple[dict | None, str, object, list[dict]]:
+        """一轮：**运动事件快照**（主）+ 事件序列（老版兜底）+ status（复位用）。
+
+        某一路取不到就跳过那一路（不抛给线程）；``/api/task/motion`` 返回 **404** 说明这版
+        web_server 还没有这个接口 → 从此走 :data:`events` 兜底，**不算错误**。
+        """
+        motion, status, tid, events = None, "", None, []
+        if self._motion_ok is not False:                     # ① 主通道：运动事件快照
+            try:
+                obj = self._get_json(self.motion_url)
+                if isinstance(obj, dict):
+                    motion = obj
+                    self._motion_ok = True
+                    self._fail_key = ""
+            except HTTPError as exc:
+                if exc.code == 404:
+                    self._motion_ok = False                  # 老版 web_server → 退回事件序列
+                else:
+                    self._fail_once(f"读 {self.motion_url} 失败：HTTP {exc.code}")
+            except Exception as exc:  # noqa: BLE001
+                self._fail_once(f"读 {self.motion_url} 失败：{type(exc).__name__}: {exc}")
+        try:                                                 # ② status：复位 / 补 start 用
+            obj = self._get_json(self.status_url)
+            inner = obj.get("state") if isinstance(obj, dict) else None
+            if isinstance(inner, dict):
+                status = str(inner.get("status") or "").strip().lower()
+                tid = inner.get("task_id")
+            self._fail_key = ""
+        except Exception as exc:  # noqa: BLE001
+            self._fail_once(f"读 {self.status_url} 失败：{type(exc).__name__}: {exc}")
+        if self._motion_ok is False:                          # ③ 只有没有 motion 接口时才拉事件序列
+            try:
+                obj = self._get_json(self.events_url)
+                items = obj.get("events") if isinstance(obj, dict) else None
+                if isinstance(items, list):
+                    events = [e for e in items if isinstance(e, dict)]
+                self._fail_key = ""
+            except Exception as exc:  # noqa: BLE001
+                self._fail_once(f"读 {self.events_url} 失败：{type(exc).__name__}: {exc}")
+        return motion, status, tid, events
+
+    # ---------------------------------------------------------- 判断
+    @staticmethod
+    def _fp(ev: dict) -> tuple:
+        return (ev.get("event"), ev.get("module"), ev.get("step"), ev.get("ts"), ev.get("msg"))
+
+    def _new_events(self, events: list[dict]) -> list[dict]:
+        """滚动序列里挑出**上次没见过的**（按尾部对齐；对不上就整段当旧的，不重放历史）。"""
+        fps = [self._fp(e) for e in events]
+        if self._last_fps is None:               # 第一轮：当前这些当历史，不重放
+            self._last_fps = fps
+            return []
+        prev, self._last_fps = self._last_fps, fps
+        if not prev:                             # 上一轮序列还是空的 → 现在这些都是新的
+            return list(events)
+        last, idx = prev[-1], -1
+        for i in range(len(fps) - 1, -1, -1):    # 从后往前找上一轮的最后一条
+            if fps[i] == last:
+                idx = i
+                break
+        return list(events[idx + 1:]) if idx >= 0 else []
+
+
+    def _advance(self, motion: dict | None, status: str, tid, events: list[dict]) -> None:
+        """把"运动事件快照（主）+ 事件序列（兜底）+ status（复位/补 start）"合成一轮判断。
+
+        对照 task_worker 文档的语义边界：
+
+        * ``motion`` 的 **``seq`` 是去重后自增的有效事件序号** → 只认 seq 变化（判重/增量），
+          这样 dry-run（不广播、接口停在旧事件）与 web_server 重启（``motion=null``）都不会误触发；
+        * 首帧只把 ``age_ms`` 足够新的事件当"刚发生"采纳，老的一律当历史；
+        * **中途失败 / 被取消不发 ``over``** → 用 ``/api/task/status`` 的**终态**（failed/cancelled/…）
+          立即复位（文档明确要求，别指望 ``over``）；注意**不要**拿"非 running"当收尾 ——
+          motion 刚到时 status 可能还停在 ``idle``，那样会把刚开始的轨迹立刻清掉；
+        * ``over`` 只表示**轨迹跑完**（后面还有 hold / 回位 / 关视觉），所以它以"停止记录 + 清空"
+          处理，不当"整个任务完成"。
+        """
+        if status:
+            self.last_status = status
+        self.task_id = tid
+        now = time.perf_counter()
+        target: bool | None = None
+        why = ""
+
+        # ① 主通道：运动事件快照（seq 变了才算一次新事件）
+        if motion is not None:
+            seq = motion.get("seq")
+            mv = str(motion.get("motion") or "").strip().lower()
+            age = motion.get("age_ms")
+            self.last_addr = str(motion.get("from") or self.base)
+            if mv in (MOTION_START, MOTION_OVER):
+                if self.last_seq is None:
+                    fresh = isinstance(age, (int, float)) and float(age) <= TASK_MOTION_FRESH_MS
+                    if fresh and mv == MOTION_START:     # 启动时任务正在跑 → 接着记（over 只当历史）
+                        target = True
+                        why = f"motion={mv} seq={seq} age={age}ms（首帧采纳）"
+                elif seq is not None and seq != self.last_seq:
+                    target = mv == MOTION_START
+                    why = f"motion={mv} seq={seq}"
+            if seq is not None:
+                self.last_seq = seq
+
+        # ② 兜底：老版 web_server 没有 /api/task/motion → 用事件序列的边沿
+        if target is None and self._motion_ok is False:
+            new = self._new_events(events)
+            started = any(str(e.get("event") or "").lower() in TASK_EVENT_START for e in new)
+            done = any(str(e.get("event") or "").lower() in TASK_EVENT_DONE for e in new)
+            if started or done:
+                target = bool(started) and not done      # 一轮里同时有 started+done（任务很短）→ 结束
+                why = f"events={[e.get('event') for e in new]}"
+
+        # ③ status 终态：失败 / 取消不会发 over → 立即复位（文档明确要求）
+        if target is None and status in TASK_STATUS_TERMINAL and self._on is True:
+            target, why = False, f"status={status}（终态复位）"
+
+        if target is not None:
+            self._mismatch_since = None
+        elif status in TASK_STATUS_ON:                   # 监听时任务已在跑 / 漏了 start → 兜底补
+            if self._on is not True and tid is not None and tid != self._done_tid:
+                self._mismatch_since = self._mismatch_since or now
+                if now - self._mismatch_since >= self.grace:
+                    target = True
+                    why = f"status={status} task_id={tid}（兜底补 start）"
+            else:
+                self._mismatch_since = None
+        else:
+            self._mismatch_since = None
+
+        if target is None or target == self._on:
+            return
+        if target:
+            self._on = True
+            self._emit(MOTION_START, why)
+        else:
+            self._on = False
+            self._done_tid = tid
+            self._emit(MOTION_OVER, why)
+
+    def _emit(self, motion: str, why: str) -> None:
+        self.publish(TaskSignal(motion=motion, raw=f"HTTP {why}", stamp=time.perf_counter(),
+                                wall=time.time(), src=f"http {self.base}"))
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            t0 = time.perf_counter()
+            motion, status, tid, events = self._poll_once()
+            if motion is not None or status or events:
+                with self._lock:
+                    self._advance(motion, status, tid, events)
+            self._stop.wait(max(self.period - (time.perf_counter() - t0), 0.0))
+
+    # ---------------------------------------------------------- 数据（与 TaskListener 同名）
+    def publish(self, sig: TaskSignal) -> None:
+        with self._lock:
+            self._seq += 1
+            sig.seq = self._seq
+            self.packets += 1
+            self._stamps.append(sig.stamp)
+            self._latest = sig
+            if sig.motion == MOTION_START:
+                self.starts += 1
+            else:
+                self.stops += 1
+            self._pending.append(sig)
+
+    def fail(self, msg: str) -> None:
+        with self._lock:
+            self.errors += 1
+            self.last_error = msg
+
+    def latest(self) -> TaskSignal | None:
+        with self._lock:
+            return self._latest
+
+    def state(self) -> str:
+        with self._lock:
+            return "" if self._latest is None else self._latest.motion
+
+    def is_running(self) -> bool:
+        return self.state() == MOTION_START
+
+    def age(self) -> float:
+        with self._lock:
+            if self._latest is None:
+                return float("inf")
+            return max(time.perf_counter() - self._latest.stamp, 0.0)
+
+    def rate_hz(self) -> float:
+        with self._lock:
+            if len(self._stamps) < 2:
+                return 0.0
+            span = self._stamps[-1] - self._stamps[0]
+            return 0.0 if span <= 1e-6 else (len(self._stamps) - 1) / float(span)
+
+    def drain_signals(self) -> list[TaskSignal]:
+        with self._lock:
+            out = list(self._pending)
+            self._pending.clear()
+            return out
+
+    def drain_events(self) -> list[str]:
+        return [s.summary() for s in self.drain_signals()]
+
+    def stats(self) -> dict:
+        with self._lock:
+            motion = "" if self._latest is None else self._latest.motion
+            return dict(kind=self.kind, port=0, packets=self.packets, errors=self.errors,
+                        starts=self.starts, stops=self.stops, motion=motion,
+                        last_error=self.last_error, last_addr=self.last_addr or self.base,
+                        running=self.running,
+                        mode=("motion" if self._motion_ok else
+                              ("events" if self._motion_ok is False else "?")),
+                        seq=self.last_seq, status=self.last_status)
+
+
+class TaskLink:
+    """任务信号总入口：**UDP 广播（6501）+ HTTP 轮询（``/api/task/*``）双通道，谁先到用谁**。
+
+    真机两边都在发（本机实测：UDP 6501 广播 ``motion: start / over``；HTTP ``/api/task/events``
+    里也有 ``task_started / task_done``），所以两个都听；同一次"开始 / 结束"只**上报一次**
+    （按状态去重）—— 既不会重复记轨迹，也不会重复清空。
+
+    对外接口与 :class:`TaskListener` 完全一致（``start / stop / running / drain_signals /
+    stats / describe``），界面和网页端换一行构造就行。
+    """
+
+    kind = "task"
+
+    def __init__(self, port: int = DEFAULT_TASK_PORT, *, base: str = DEFAULT_TASK_BASE,
+                 host: str = "", mcast: str = "", hz: float = DEFAULT_TASK_HZ,
+                 udp: bool = False, http: bool = True):
+        """默认**只走 HTTP**（``/api/task/motion``，web_server 已把 UDP 广播去重后缓存）。
+
+        按 task_worker 的分层约定，前端不该直接 bind 6501；需要时把 ``udp=True`` 打开，
+        就变成"UDP 广播 + HTTP 谁先到用谁"（重复信号会自动去重）。
+        """
+        if not (udp or http):
+            raise RobotLinkError("任务信号至少要开一条通道（udp / http）")
+        self.port = int(port)
+        self.base = str(base or DEFAULT_TASK_BASE)
+        self.sources: list = []
+        if udp:
+            self.sources.append(TaskListener(self.port, host=host, mcast=mcast))
+        if http:
+            self.sources.append(HttpTaskSource(self.base, hz=hz))
+        self.starts = 0
+        self.stops = 0
+        self._on: bool | None = None
+        self._latest: TaskSignal | None = None
+        self._lock = threading.RLock()
+
+    # ---------------------------------------------------------- 生命周期
+    def start(self) -> None:
+        for src in self.sources:
+            src.start()
+
+    def stop(self, timeout: float = 1.5) -> None:
+        for src in self.sources:
+            src.stop(timeout)
+
+    @property
+    def running(self) -> bool:
+        return any(src.running for src in self.sources)
+
+    def describe(self) -> str:
+        """一行说明（日志/界面用）：列出真正开着的那几条通道。"""
+        parts = []
+        for src in self.sources:
+            if src.kind == "task":
+                parts.append(f"UDP :{self.port}")
+            else:
+                ep = ("/api/task/motion" if getattr(src, "_motion_ok", None) is not False
+                      else "/api/task/events（老版回退）")
+                parts.append(f"HTTP {self.base}{ep}")
+        return "任务信号 " + " ＋ ".join(parts)
+
+    def endpoint(self) -> str:
+        return " ＋ ".join(s.endpoint() for s in self.sources)
+
+    # ---------------------------------------------------------- 取信号（合并 + 去重）
+    def drain_signals(self) -> list[TaskSignal]:
+        """两条通道的信号合并后**去重**取走（同一次开始/结束只出现一次）。"""
+        got: list[TaskSignal] = []
+        for src in self.sources:
+            got.extend(src.drain_signals())
+        got.sort(key=lambda s: s.stamp)
+        out: list[TaskSignal] = []
+        with self._lock:
+            for sig in got:
+                if sig.motion == MOTION_START:
+                    if self._on:                      # 已经在任务中 → 另一条通道的重复信号
+                        continue
+                    self._on = True
+                    self.starts += 1
+                else:
+                    if self._on is False:             # 已经结束过 → 重复信号
+                        continue
+                    self._on = False
+                    self.stops += 1
+                self._latest = sig
+                out.append(sig)
+        return out
+
+    def drain_events(self) -> list[str]:
+        return [s.summary() for s in self.drain_signals()]
+
+    def latest(self) -> TaskSignal | None:
+        with self._lock:
+            return self._latest
+
+    def state(self) -> str:
+        with self._lock:
+            return "" if self._latest is None else self._latest.motion
+
+    def is_running(self) -> bool:
+        return self.state() == MOTION_START
+
+    def age(self) -> float:
+        with self._lock:
+            if self._latest is None:
+                return float("inf")
+            return max(time.perf_counter() - self._latest.stamp, 0.0)
+
+    def rate_hz(self) -> float:
+        return max((s.rate_hz() for s in self.sources), default=0.0)
+
+    def stats(self) -> dict:
+        with self._lock:
+            motion = "" if self._latest is None else self._latest.motion
+            last_addr = "" if self._latest is None else self._latest.src
+            starts, stops = self.starts, self.stops
+        errs = [s.last_error for s in self.sources if s.last_error]
+        mode = next((s.stats().get("mode") for s in self.sources if s.kind == "task-http"), None)
+        return dict(kind=self.kind, port=self.port,
+                    packets=sum(s.packets for s in self.sources),
+                    errors=sum(s.errors for s in self.sources),
+                    starts=starts, stops=stops, motion=motion,
+                    last_error=errs[-1] if errs else "", last_addr=last_addr or self.base,
+                    running=self.running, mode=mode,
+                    channels=[s.kind for s in self.sources])
+
+
 # =============================================================== 链路总入口
 @dataclass
 class FollowOut:
@@ -1061,9 +1737,10 @@ class JointLink:
     ``source``：
 
     =========  ==========================================================
-    ``http``   HTTP 轮询 ``http_url``（真机实测接口，最稳）
+    ``http``   HTTP 轮询 ``http_url``（**默认**：``GET /api/state``，与 clean-robot 的 vue 端同一套）
+    ``tcp``    主动连 ``tcp_host:tcp_port`` 收状态流（断线自动重连）
     ``udp``    监听 ``port`` 上的 UDP 广播/组播（格式自动识别）
-    ``auto``   两个一起开，每帧用**最新的那一路**（真机在哪条路上发都能跟）
+    ``auto``   HTTP + TCP + UDP 一起开，每帧用**最新的那一路**
     =========  ==========================================================
 
     用法（界面里就是这么写的）::
@@ -1076,8 +1753,9 @@ class JointLink:
             sim.follow(out.q_rad)
     """
 
-    def __init__(self, *, source: str = "auto", http_url: str = DEFAULT_HTTP_URL,
+    def __init__(self, *, source: str = "http", http_url: str = DEFAULT_HTTP_URL,
                  http_hz: float = DEFAULT_HTTP_HZ, port: int = DEFAULT_UDP_PORT,
+                 tcp_host: str = DEFAULT_HOST, tcp_port: int = DEFAULT_TCP_PORT,
                  host: str = "", fmt: str = "auto", unit: str = "auto",
                  i16_scale: float = 0.01, order=None, signs=None, offsets=None,
                  mode: str = "absolute", max_speed_deg: float = 0.0, smooth: float = 0.0,
@@ -1092,6 +1770,8 @@ class JointLink:
         self.http_url = str(http_url).strip()
         self.http_hz = float(max(http_hz, 1.0))
         self.port = int(port)
+        self.tcp_host = str(tcp_host or "").strip() or DEFAULT_HOST
+        self.tcp_port = int(tcp_port)
         self.host = str(host or "")
         self.mcast = str(mcast or "")
         self.fmt = fmt if fmt in FORMATS else "auto"
@@ -1126,6 +1806,9 @@ class JointLink:
         out: list[StateSource] = []
         if self.source in ("http", "auto"):
             out.append(HttpStateSource(self.http_url, hz=self.http_hz, **common))
+        if self.source in ("tcp", "auto"):
+            out.append(TcpStateSource(self.tcp_host, self.tcp_port, fmt=self.fmt,
+                                      i16_scale=self.i16_scale, **common))
         if self.source in ("udp", "auto"):
             out.append(UdpStateSource(self.port, host=self.host, fmt=self.fmt,
                                       i16_scale=self.i16_scale, mcast=self.mcast, **common))
@@ -1869,6 +2552,7 @@ def run_selftest(args) -> int:
 def run_listen(args) -> int:
     """没有界面时的联调：把收到的包按行打印（Ctrl+C 退出）。"""
     lk = JointLink(source=args.source, http_url=args.url, http_hz=args.hz, port=args.port,
+                   tcp_host=args.tcp_host, tcp_port=args.tcp_port,
                    host=args.host, fmt=args.format, unit=args.unit,
                    i16_scale=args.i16_scale, mcast=args.mcast)
     lk.start()
@@ -1902,7 +2586,8 @@ def run_emit_demo(args) -> int:
 
 def run_task_listen(args) -> int:
     """只听**任务信号**（默认 6501）：收到 start/over 就打一行（Ctrl+C 退出）。"""
-    tk = TaskListener(int(args.task_port), host=args.host, mcast=args.mcast)
+    tk = TaskLink(int(args.task_port), base=args.task_base, host=args.host, mcast=args.mcast,
+                  udp=bool(getattr(args, "task_udp", False)))
     tk.start()
     print(f"{tk.describe()}（Ctrl+C 退出）")
     print(f"来源：{tk.endpoint()}")
@@ -1940,15 +2625,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--listen", action="store_true", help="持续接收并打印（联调）")
     ap.add_argument("--emit-demo", action="store_true", help="模拟真机发报文（联调）")
     ap.add_argument("--task-listen", action="store_true",
-                    help=f"只听**任务信号**（默认 UDP {DEFAULT_TASK_PORT}）并打印 start/over")
+                    help=f"只听**任务信号**（默认 HTTP /api/task/motion；UDP {DEFAULT_TASK_PORT} 可选）")
+    ap.add_argument("--task-base", default=DEFAULT_TASK_BASE, help="任务信号 HTTP 基址")
+    ap.add_argument("--task-udp", action="store_true",
+                    help=f"同时把 UDP {DEFAULT_TASK_PORT} 广播也收上（双通道，谁先到用谁）")
     ap.add_argument("--task-demo", default="", choices=("", MOTION_START, MOTION_OVER, "stop"),
                     help="模拟真机发一条任务信号（start / over；配合 --task-listen 或界面）")
     ap.add_argument("--task-port", type=int, default=DEFAULT_TASK_PORT,
                     help="任务信号 UDP 端口")
     ap.add_argument("--task-target", default=f"127.0.0.1:{DEFAULT_TASK_PORT}",
                     help="--task-demo 的发送目标 host:port")
-    ap.add_argument("--source", default="auto", choices=SOURCES, help="数据源（--listen 用）")
+    ap.add_argument("--source", default="http", choices=SOURCES, help="数据源（--listen 用）")
     ap.add_argument("--url", default=DEFAULT_HTTP_URL, help="真机 HTTP 状态接口")
+    ap.add_argument("--tcp-host", default=DEFAULT_HOST, help="真机 TCP 状态流地址（--source tcp）")
+    ap.add_argument("--tcp-port", type=int, default=DEFAULT_TCP_PORT, help="真机 TCP 状态流端口")
     ap.add_argument("--port", type=int, default=DEFAULT_UDP_PORT, help="UDP 监听端口")
     ap.add_argument("--host", default="", help="UDP 绑定地址（默认全部网卡）")
     ap.add_argument("--mcast", default="", help="组播地址（可选，如 239.0.0.1）")

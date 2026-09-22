@@ -56,6 +56,7 @@ import math
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import numpy as np
 
@@ -790,14 +791,16 @@ class ControlPanel(QWidget):
 
     # ------------------------------------------------------------ 2. 真机跟随（真机 → 仿真）
     def _build_follow(self) -> Card:
-        card = Card("真机跟随（UDP 广播 / HTTP 状态）",
-                    "真机把姿态发出来（本机实测：往 **UDP 6001** 广播，约 96 Hz；也开着 HTTP 状态接口），"
-                    "点「启动跟随」就把它的 6 个关节角实时搬到模型上。下面几行是现场体检："
-                    "延迟、包率，以及**真机 TCP ↔ 仿真工具尖**的误差。")
+        card = Card("真机跟随（HTTP 状态接口 / TCP / UDP）",
+                    "真机把姿态发出来，点「启动跟随」就把它的 6 个关节角实时搬到模型上。"
+                    "默认走 **HTTP**：每帧 `GET http://<真机>:8080/api/state` 取 "
+                    "`state.joints / state.pose`（与 clean-robot 的 vue 端同一套）。"
+                    "下面几行是现场体检：延迟、包率，以及**真机 ↔ 仿真工具尖**的误差。")
         self.f_source = QComboBox()
         self.f_source.addItems(link.SOURCE_LABELS)
-        self.f_source.setCurrentIndex(link.SOURCES.index("auto"))
-        self.f_source.setToolTip("自动 = HTTP 与 UDP 同时开，哪路新用哪路（推荐）")
+        self.f_source.setCurrentIndex(link.SOURCES.index("http"))
+        self.f_source.setToolTip("默认 HTTP：轮询真机 /api/state（最稳）\n"
+                                 "自动 = HTTP + TCP + UDP 同时开，哪路新用哪路")
         self.f_source.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.f_source.setMaximumWidth(180)
         self.f_fmt = QComboBox()
@@ -807,18 +810,19 @@ class ControlPanel(QWidget):
         card.add_row(QLabel("数据源"), self.f_source, QLabel("报文"), self.f_fmt)
 
         self.f_url = QLineEdit(link.DEFAULT_HTTP_URL)
-        self.f_url.setToolTip("真机 HTTP 状态接口（本机实测 http://192.168.66.169:8080/api/state）")
+        self.f_url.setToolTip("真机地址：HTTP 源拿它当轮询地址；\n"
+                              "TCP 源只取里面的**主机名**（如 192.168.66.169）")
         self.f_url.setMinimumWidth(150)
-        card.add_row(QLabel("HTTP"), self.f_url)
+        card.add_row(QLabel("地址"), self.f_url)
 
         self.f_port = NumBox()
         self.f_port.setRange(1, 65535)
-        self.f_port.setValue(int(link.DEFAULT_UDP_PORT))
-        self.f_port.setToolTip("真机 UDP 广播端口（本机实测往 6001 发）")
+        self.f_port.setValue(int(link.DEFAULT_TCP_PORT))
+        self.f_port.setToolTip("真机状态端口：TCP 源连它 / UDP 源监听它（真机原来往 6001 广播）")
         self.f_unit = QComboBox()
         self.f_unit.addItems(link.UNIT_LABELS)
         self.f_unit.setToolTip("报文里的角度单位；自动 = |角| > 7 当度，否则当弧度")
-        card.add_row(QLabel("UDP 端口"), self.f_port, QLabel("单位"), self.f_unit)
+        card.add_row(QLabel("状态端口"), self.f_port, QLabel("单位"), self.f_unit)
 
         self.f_mode = QComboBox()
         self.f_mode.addItems(link.MODE_LABELS)
@@ -866,16 +870,21 @@ class ControlPanel(QWidget):
 
     # ------------------------------------------------------------ 2.5 任务信号 6501 → 工具尖轨迹
     def _build_task(self) -> Card:
-        card = Card("任务信号 6501 → 工具尖轨迹",
-                    "真机开始/结束作业时往 **UDP 6501** 广播 ``{\"motion\": \"start\"}`` / "
-                    "``{\"motion\": \"over\"}``。收到 start 就把勾上的工具尖连成轨迹（随机械臂长出来），"
-                    "收到 over 就立刻清空。")
+        card = Card("任务信号 → 工具尖轨迹（HTTP /api/task/motion）",
+                    "真机跑作业时广播 ``{\"motion\": \"start\"}`` / ``{\"motion\": \"over\"}``（UDP 6501），"
+                    "web_server 收下、**按 seq 去重**后缓存，用 ``GET /api/task/motion`` 暴露出来。"
+                    "这里轮询这个快照：**``seq`` 一变就是一次新事件**（start 开始记轨迹、over 停止并清空）；"
+                    "中途失败/取消不发 over，所以再用 ``/api/task/status`` 的终态兜底复位。")
         self.t_task_port = NumBox()
         self.t_task_port.setRange(1, 65535)
         self.t_task_port.setValue(int(link.DEFAULT_TASK_PORT))
         self.t_task_port.setMaximumWidth(96)
-        self.t_task_port.setToolTip("真机任务信号 UDP 端口")
-        card.add_row(QLabel("端口"), self.t_task_port,
+        self.t_task_port.setToolTip("UDP 广播端口（只有勾上「UDP 也听」时才用；默认走 HTTP）")
+        self.t_task_udp = QCheckBox("UDP 也听")
+        self.t_task_udp.setChecked(False)
+        self.t_task_udp.setToolTip("按 task_worker 的分层约定，默认只轮询 web_server 的 "
+                                   "/api/task/motion；勾上则同时 bind 6501 收广播（谁先到用谁）")
+        card.add_row(QLabel("端口"), self.t_task_port, self.t_task_udp,
                      self._btn("开始监听", self.on_task_start, name="Primary"),
                      self._btn("停止监听", self.on_task_stop, name="Danger"))
 
@@ -909,14 +918,15 @@ class ControlPanel(QWidget):
             self.sim.log("任务信号监听已经在跑了（要改端口先点「停止监听」）")
             return
         try:
-            tk = link.TaskListener(int(self.t_task_port.value()))
+            tk = link.TaskLink(int(self.t_task_port.value()),
+                               udp=bool(self.t_task_udp.isChecked()))
             tk.start()
         except link.RobotLinkError as exc:
             self.sim.log(f"任务信号监听启动失败：{exc}")
             return
         self.task_listener = tk
         self.sim.log(f"任务信号监听已启动：{tk.describe()}"
-                     f"（收到 start 开始记勾选工具的轨迹，over 清空）")
+                     f"（收到 start 开始记勾选工具的轨迹，over 清空；两条通道按先到的算）")
         self.refresh()
 
     def on_task_stop(self) -> None:
@@ -958,11 +968,16 @@ class ControlPanel(QWidget):
         tk = self.task_listener
         lines = []
         if tk is None:
-            lines.append("状态：未监听（点「开始监听」接 6501 任务信号）")
+            lines.append("状态：未监听（点「开始监听」：UDP 6501 ＋ HTTP /api/task/* 双通道）")
         else:
             st = tk.stats()
-            lines.append(f"状态：{'运行中' if tk.running else '已停止'} · 端口 :{st['port']} · "
-                         f"包 {st['packets']} / 错 {st['errors']}")
+            mode = {"motion": "HTTP /api/task/motion",
+                    "events": "HTTP /api/task/events（老版回退）"}.get(st.get("mode"), "HTTP")
+            udp_on = "task" in (st.get("channels") or [])
+            lines.append(f"状态：{'运行中' if tk.running else '已停止'} · {mode}"
+                         + (f" ＋ UDP :{st['port']}" if udp_on else ""))
+            lines.append(f"计数：包 {st['packets']} / 错 {st['errors']} · "
+                         f"开始 {st['starts']} / 结束 {st['stops']}")
             last = st["motion"]
             lines.append("最近：" + (link.MOTION_LABELS.get(last, last) if last else "还没收到信号")
                          + f" · 来自 {st['last_addr'] or '—'}")
@@ -974,14 +989,26 @@ class ControlPanel(QWidget):
 
     # ---- 真机跟随：按钮 / 每帧 / 显示
     def follow_source(self) -> str:
-        """当前选的数据源（``auto`` / ``http`` / ``udp``）。"""
+        """当前选的数据源（``tcp`` / ``auto`` / ``http`` / ``udp``）。"""
         return link.SOURCES[self.f_source.currentIndex()]
 
+    def follow_tcp_host(self) -> str:
+        """TCP 源连哪台机器：取「地址」框里的主机名（填 URL 也行），空的就用默认真机 IP。"""
+        url = self.f_url.text().strip()
+        if url and "://" not in url:
+            url = "tcp://" + url
+        return urlsplit(url).hostname or link.DEFAULT_HOST
+
     def follow_config(self) -> dict:
-        """把卡片上的控件读成 :class:`robot_link.JointLink` 的构造参数。"""
+        """把卡片上的控件读成 :class:`robot_link.JointLink` 的构造参数。
+
+        「状态端口」框 TCP / UDP 共用：TCP 源拿它当**连接端口**，UDP 源拿它当**监听端口**。
+        """
         return dict(source=self.follow_source(),
                     http_url=self.f_url.text().strip(),
                     port=int(self.f_port.value()),
+                    tcp_host=self.follow_tcp_host(),
+                    tcp_port=int(self.f_port.value()),
                     fmt=link.FORMATS[self.f_fmt.currentIndex()],
                     unit=link.UNITS[self.f_unit.currentIndex()],
                     mode=link.MODES[self.f_mode.currentIndex()],
@@ -997,7 +1024,7 @@ class ControlPanel(QWidget):
         cfg = self.follow_config()
         self.follow_error = ""
         if cfg["source"] in ("http", "auto") and not cfg["http_url"]:
-            self.follow_error = "HTTP 地址是空的（或者把数据源改成「UDP 广播」）"
+            self.follow_error = "HTTP 地址是空的（或者把数据源改成「TCP 状态流」）"
             self.link = None
         else:
             try:

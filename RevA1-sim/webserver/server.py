@@ -96,7 +96,9 @@ class Viewer:
         if args.follow:
             self.link = link.JointLink(source=args.follow_source,
                                        http_url=args.follow_url,
-                                       port=args.follow_port)
+                                       port=args.follow_port,
+                                       tcp_host=args.follow_tcp_host,
+                                       tcp_port=args.follow_tcp_port)
             self.link.start()
 
         # 任务信号（可选）：start 记轨迹 / over 清空
@@ -106,7 +108,10 @@ class Viewer:
         self.trail_names = [t.strip() for t in str(args.trail_tools).split(",")
                             if t.strip() in spec.TOOLS]
         if args.task_listen:
-            self.task_listener = link.TaskListener(args.task_port)
+            # 触发源：HTTP /api/task/motion（web_server 已把 UDP 广播按 seq 去重后缓存）；
+            # 需要时 --task-udp 再把 6501 广播也收上（双通道，谁先到用谁、自动去重）
+            self.task_listener = link.TaskLink(args.task_port, base=args.task_base,
+                                              udp=bool(args.task_udp))
             self.task_listener.start()
 
         # 帧缓冲（线程安全）
@@ -150,7 +155,23 @@ class Viewer:
         return scene
 
     # ------------------------------------------------------------------ 渲染循环
+    def _grow_framebuffer(self) -> None:
+        """按需放大离屏 framebuffer。
+
+        MuJoCo 默认 ``vis.global_.offwidth/offheight`` 只有 1280×960，渲染尺寸一旦超过它，
+        ``mujoco.Renderer`` 会直接抛 ``Image width ... > framebuffer width``。这里**只放大、
+        不缩小**（场景 XML 里特意开大的值不动），够这次渲染就行。
+        """
+        g = self.sim.model.vis.global_
+        w, h = int(self.width), int(self.height)
+        if w > int(g.offwidth) or h > int(g.offheight):
+            g.offwidth = max(int(g.offwidth), w)
+            g.offheight = max(int(g.offheight), h)
+            print(f"[web] 离屏 framebuffer 放大到 {int(g.offwidth)}x{int(g.offheight)}"
+                  f"（渲染 {w}x{h}；MuJoCo 默认 1280×960）")
+
     def _loop(self):
+        self._grow_framebuffer()
         self.renderer = mujoco.Renderer(self.sim.model, self.height, self.width)
         acc = 0.0
         last = time.perf_counter()
@@ -402,12 +423,12 @@ def main(argv=None) -> int:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument("--host", default="0.0.0.0", help="监听地址")
     ap.add_argument("--port", type=int, default=8080, help="监听端口")
-    ap.add_argument("--width", type=int, default=1280, help="渲染宽度[px]")
-    ap.add_argument("--height", type=int, default=600, help="渲染高度[px]")
+    ap.add_argument("--width", type=int, default=4320, help="渲染宽度[px]")
+    ap.add_argument("--height", type=int, default=1920, help="渲染高度[px]")
     ap.add_argument("--fps", type=float, default=30.0, help="渲染/推流帧率上限")
     ap.add_argument("--distance", type=float, default=2.5, help="相机距离[m]")
-    ap.add_argument("--azimuth", type=float, default=135.0, help="相机方位角[deg]")
-    ap.add_argument("--elevation", type=float, default=-25.0, help="相机仰角[deg]")
+    ap.add_argument("--azimuth", type=float, default=175.0, help="相机方位角[deg]")
+    ap.add_argument("--elevation", type=float, default=-45.0, help="相机仰角[deg]")
     ap.add_argument("--lookat", nargs=3, type=float, default=None,
                     help="相机看向点（x y z，米；默认 = 工具尖）")
     ap.add_argument("--point-cloud", action="store_true",
@@ -417,12 +438,24 @@ def main(argv=None) -> int:
     ap.add_argument("--point-mm", type=float, default=4.0, help="点云每个点的尺寸[mm]")
     ap.add_argument("--bands", type=int, default=6, help="点云按深度分几带颜色")
     ap.add_argument("--follow", action="store_true", help="启动真机跟随（真机姿态实时映到模型）")
-    ap.add_argument("--follow-source", default="auto", choices=("auto", "http", "udp"))
-    ap.add_argument("--follow-url", default=link.DEFAULT_HTTP_URL, help="真机 HTTP 状态接口")
+    ap.add_argument("--follow-source", default="http", choices=link.SOURCES,
+                    help="跟随的数据源（默认 http：轮询真机 /api/state，和 clean-robot 的 vue 端一样）")
+    ap.add_argument("--follow-url", default=link.DEFAULT_HTTP_URL,
+                    help="真机 HTTP 状态接口（GET /api/state）")
+    ap.add_argument("--follow-tcp-host", default=link.DEFAULT_HOST,
+                    help="真机 TCP 状态流地址（默认取 config.json 的 jetson_ip）")
+    ap.add_argument("--follow-tcp-port", type=int, default=link.DEFAULT_TCP_PORT,
+                    help="真机 TCP 状态流端口")
     ap.add_argument("--follow-port", type=int, default=link.DEFAULT_UDP_PORT,
-                    help="真机 UDP 广播端口")
-    ap.add_argument("--task-listen", action="store_true", help="监听 6501 任务信号驱动轨迹")
-    ap.add_argument("--task-port", type=int, default=link.DEFAULT_TASK_PORT, help="任务信号 UDP 端口")
+                    help="真机 UDP 广播端口（--follow-source udp/auto 用）")
+    ap.add_argument("--task-listen", action="store_true",
+                    help="监听任务信号驱动轨迹（HTTP /api/task/motion；默认不碰 UDP）")
+    ap.add_argument("--task-port", type=int, default=link.DEFAULT_TASK_PORT,
+                    help="任务信号 UDP 端口（只在 --task-udp 时用）")
+    ap.add_argument("--task-base", default=link.DEFAULT_TASK_BASE,
+                    help="任务信号 HTTP 基址（…/api/task/motion + …/api/task/status）")
+    ap.add_argument("--task-udp", action="store_true",
+                    help="再把 UDP 广播也收上（双通道，重复信号自动去重）")
     ap.add_argument("--trail-tools", default="刷子",
                     help="要记录轨迹的工具（逗号分隔，可选 夹爪/喷嘴1/喷嘴2/刷子；默认刷子）")
     args = ap.parse_args(argv)
@@ -443,6 +476,7 @@ def main(argv=None) -> int:
           + (" · 真机跟随" if viewer.link else "")
           + (" · 任务信号轨迹" if viewer.task_listener else ""))
     if viewer.task_listener:
+        print(viewer.task_listener.describe())
         print(f"轨迹工具：{'、'.join(viewer.trail_names)}")
     print("Ctrl+C 退出。")
     try:
