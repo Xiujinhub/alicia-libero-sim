@@ -21,7 +21,7 @@
                -webkit-user-drag:none; pointer-events:none; }
   #hint { position:absolute; right:12px; bottom:12px; color:var(--dim);
           font-size:clamp(10px, 0.8vw, 12px); pointer-events:none; }
-  .cam { position:absolute; width:clamp(160px, 20vw, 460px); aspect-ratio:4/3;
+  .cam { position:absolute; width:clamp(240px, min(26vw, 44vh), 720px); aspect-ratio:4/3;
          background:#000; border:1px solid var(--accent); border-radius:6px;
          overflow:hidden; box-shadow:0 2px 10px rgba(0,0,0,0.55);
          pointer-events:none; z-index:2; }
@@ -69,7 +69,8 @@
 
   // —— 显示自适应：窗口比例接近画面比例就铺满（cover），差得多就完整显示（contain） ——
   // 画面比例取自 <img> 的自然尺寸（= 服务端 --width/--height 渲染出来的帧），渲染尺寸不变。
-  const FIT_TOLERANCE = 0.15;        // 比例相差 ≤15% 视为"接近" → 铺满（几乎不裁）
+  const FIT_TOLERANCE = 0.35;        // 比例相差 ≤35% 就"铺满"（16:9/16:10 屏都会铺满）；
+                                     // 只有极窄/极宽/竖屏（差 >35%）才退回完整显示，免得裁太多
   let fitNow = '';
   function applyFit() {
     const w = streamImg.naturalWidth, h = streamImg.naturalHeight;
