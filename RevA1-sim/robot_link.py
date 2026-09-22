@@ -151,16 +151,11 @@ DEFAULT_TCP_PORT = 6001           # 真机状态流的 TCP 端口（原来是同
 DEFAULT_TASK_PORT = 6501          # 真机实测：往 6501 广播**任务信号**（motion: start / stop）
 DEFAULT_TASK_BASE = f"http://{DEFAULT_HOST}:8080"   # 任务信号 HTTP 基址（…/api/task/status + …/api/task/events）
 DEFAULT_TASK_HZ = 5.0             # 任务状态 HTTP 轮询频率[Hz]（起停翻转，不用太快）
-TASK_HTTP_GRACE = 3.0             # status 兜底：与当前判断不一致要"持续"这么久才动手[s]
-TASK_MOTION_FRESH_MS = 5000       # 首帧采纳"运动事件快照"的新鲜度上限[ms]（更老的当历史，不响应）
 # /api/task/status 的**终态**：中途失败 / 被取消时真机**不发 over**，要拿它复位（文档明确要求）
 TASK_STATUS_TERMINAL = ("failed", "cancelled", "canceled", "done", "stopped", "error")
 # 真机 /api/task/events 里的事件名（本机实测：task_started / task_done）
 TASK_EVENT_START = ("task_started", "task_start", "started")
 TASK_EVENT_DONE = ("task_done", "task_over", "task_finished", "task_stopped")
-# 真机 /api/task/status 的 state.status（本机实测：idle / running / done / …）
-TASK_STATUS_ON = ("running", "run", "busy")
-TASK_STATUS_OFF = ("idle", "done", "failed", "cancelled", "canceled", "stopped", "error")
 DEFAULT_HTTP_HZ = 30.0            # HTTP 轮询频率（真机的状态流 ~30 Hz，再快没意义）
 HTTP_TIMEOUT = 5.0                # 单次 HTTP 请求超时[s]（对齐 clean-robot vue 端的 5 s）
 RECV_BUFFER = 65535
@@ -1282,17 +1277,17 @@ class HttpTaskSource:
     等价的 ``start`` / ``over`` 信号（对外接口与 :class:`TaskListener` 一致）。
 
     * ``/api/task/events`` 里的 ``task_started`` / ``task_done`` 是**精确边沿**（和真机 UDP 的
-      ``motion: start / over`` 一一对应）；
-    * ``/api/task/status`` 的 ``state.status``（``idle / running / done / …``）当**兜底**：
-      监听时任务已经在跑、或某条事件被事件缓冲冲掉，也能认出来。兜底要求"与当前判断不一致"
-      **持续** :data:`TASK_HTTP_GRACE` 秒才动手，且"转为任务中"还要求 ``task_id`` 是**新**的
-      —— 免得被 status 相对事件的滞后骗出假 start。
+      ``motion: start / over`` 一一对应）—— 只在**没有** ``/api/task/motion`` 的老版 web_server 上用；
+    * **只有这两个事件才触发起停**：``seq`` 变了才算一次新事件；首帧只做基线（历史事件一律不采纳），
+      所以"没收到 start，轨迹不会自己长出来"；
+    * ``/api/task/status`` **只用来复位**（终态 ``failed / cancelled / …``）：中途失败/取消不发 over，
+      这时得把轨迹收掉；它**不**用来"补 start"。
     """
 
     kind = "task-http"
 
     def __init__(self, base: str = DEFAULT_TASK_BASE, *, hz: float = DEFAULT_TASK_HZ,
-                 timeout: float = HTTP_TIMEOUT, grace: float = TASK_HTTP_GRACE):
+                 timeout: float = HTTP_TIMEOUT):
         self.base = str(base or DEFAULT_TASK_BASE).rstrip("/")
         self.motion_url = f"{self.base}/api/task/motion"
         self.status_url = f"{self.base}/api/task/status"
@@ -1300,7 +1295,6 @@ class HttpTaskSource:
         self.hz = float(max(hz, 0.2))
         self.period = 1.0 / self.hz
         self.timeout = float(max(timeout, 0.2))
-        self.grace = float(max(grace, 0.0))
         self.packets = 0
         self.errors = 0
         self.starts = 0
@@ -1313,8 +1307,6 @@ class HttpTaskSource:
         self._motion_ok: bool | None = None     # None=还没试过；False=该接口没有（老版 web_server）
         self._on: bool | None = None            # 当前判断（None = 还没判过）
         self._last_fps: list | None = None      # 上一轮见过的事件指纹（None = 还没取过一轮）
-        self._done_tid = None                   # 最近一次"结束"时的 task_id
-        self._mismatch_since: float | None = None
         self._fail_key = ""
         self._latest: TaskSignal | None = None
         self._pending: deque = deque(maxlen=64)
@@ -1432,41 +1424,34 @@ class HttpTaskSource:
 
 
     def _advance(self, motion: dict | None, status: str, tid, events: list[dict]) -> None:
-        """把"运动事件快照（主）+ 事件序列（兜底）+ status（复位/补 start）"合成一轮判断。
+        """把"运动事件快照（主）+ 事件序列（老版兜底）+ status 终态复位"合成一轮判断。
 
         对照 task_worker 文档的语义边界：
 
-        * ``motion`` 的 **``seq`` 是去重后自增的有效事件序号** → 只认 seq 变化（判重/增量），
-          这样 dry-run（不广播、接口停在旧事件）与 web_server 重启（``motion=null``）都不会误触发；
-        * 首帧只把 ``age_ms`` 足够新的事件当"刚发生"采纳，老的一律当历史；
+        * **只有事件才触发起停**：``motion`` 的 ``seq`` 一变才算一次新事件（判重/增量），
+          dry-run（不广播、接口停在旧事件）与 web_server 重启（``motion=null``）都不会误触发；
+        * **首帧只做基线**（历史事件一律不采纳）—— 所以"没收到 start，轨迹不会自己长出来"；
         * **中途失败 / 被取消不发 ``over``** → 用 ``/api/task/status`` 的**终态**（failed/cancelled/…）
-          立即复位（文档明确要求，别指望 ``over``）；注意**不要**拿"非 running"当收尾 ——
-          motion 刚到时 status 可能还停在 ``idle``，那样会把刚开始的轨迹立刻清掉；
+          立即复位（文档明确要求，别指望 ``over``）；status **不**用来"补 start"，也不拿
+          "非 running"当收尾（motion 刚到时 status 可能还停在 ``idle``，那样会把刚开始的轨迹清掉）；
         * ``over`` 只表示**轨迹跑完**（后面还有 hold / 回位 / 关视觉），所以它以"停止记录 + 清空"
           处理，不当"整个任务完成"。
         """
         if status:
             self.last_status = status
         self.task_id = tid
-        now = time.perf_counter()
         target: bool | None = None
         why = ""
 
-        # ① 主通道：运动事件快照（seq 变了才算一次新事件）
+        # ① 主通道：运动事件快照（只有 seq 变了才算一次新事件；首帧只做基线）
         if motion is not None:
             seq = motion.get("seq")
             mv = str(motion.get("motion") or "").strip().lower()
-            age = motion.get("age_ms")
             self.last_addr = str(motion.get("from") or self.base)
-            if mv in (MOTION_START, MOTION_OVER):
-                if self.last_seq is None:
-                    fresh = isinstance(age, (int, float)) and float(age) <= TASK_MOTION_FRESH_MS
-                    if fresh and mv == MOTION_START:     # 启动时任务正在跑 → 接着记（over 只当历史）
-                        target = True
-                        why = f"motion={mv} seq={seq} age={age}ms（首帧采纳）"
-                elif seq is not None and seq != self.last_seq:
-                    target = mv == MOTION_START
-                    why = f"motion={mv} seq={seq}"
+            if (self.last_seq is not None and seq is not None and seq != self.last_seq
+                    and mv in (MOTION_START, MOTION_OVER)):
+                target = mv == MOTION_START
+                why = f"motion={mv} seq={seq}"
             if seq is not None:
                 self.last_seq = seq
 
@@ -1483,19 +1468,6 @@ class HttpTaskSource:
         if target is None and status in TASK_STATUS_TERMINAL and self._on is True:
             target, why = False, f"status={status}（终态复位）"
 
-        if target is not None:
-            self._mismatch_since = None
-        elif status in TASK_STATUS_ON:                   # 监听时任务已在跑 / 漏了 start → 兜底补
-            if self._on is not True and tid is not None and tid != self._done_tid:
-                self._mismatch_since = self._mismatch_since or now
-                if now - self._mismatch_since >= self.grace:
-                    target = True
-                    why = f"status={status} task_id={tid}（兜底补 start）"
-            else:
-                self._mismatch_since = None
-        else:
-            self._mismatch_since = None
-
         if target is None or target == self._on:
             return
         if target:
@@ -1503,7 +1475,6 @@ class HttpTaskSource:
             self._emit(MOTION_START, why)
         else:
             self._on = False
-            self._done_tid = tid
             self._emit(MOTION_OVER, why)
 
     def _emit(self, motion: str, why: str) -> None:
